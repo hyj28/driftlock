@@ -12,9 +12,12 @@
   checkpoints with integrity verification; no-change, action-loop, error-spike, and
   reward-stall heuristics; optional structured LLM judge; shared agent/judge token
   accounting and step/rollback budgets; signal-window-aware rollback selection;
-  unit tests.
-- **Next:** add a remote-environment snapshot backend and Harbor/Terminus-2 adapter,
-  then run the week-1 LHTB smoke tests before selecting experiment tasks.
+  sync/async checkpoint backends; host-side archive snapshots for Harbor-compatible
+  POSIX remote environments with canonical-path validation and retained recovery
+  archives; SHA-256-verified host fallback and exact failed-restore recovery; unit
+  tests.
+- **Next:** add the Terminus-2 conversation-state codec and checkpoint-boundary agent
+  adapter, then run the week-1 LHTB smoke tests before selecting experiment tasks.
 
 ---
 

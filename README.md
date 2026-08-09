@@ -152,6 +152,39 @@ the runner selects the newest checkpoint from before the earliest triggered sign
 window, avoiding a superficially recent snapshot that already contains the loop,
 stall, or error spike.
 
+### Remote and Harbor environments
+
+`RemoteArchiveCheckpointStore` implements the same interface over the three methods
+POSIX Harbor environments already expose: `exec`, `upload_file`, and
+`download_file`. It requires Linux-style `sh`, `tar`, `find`, `rm`, `cp -a`,
+`realpath`, `sha256sum`, `mkfifo`, and `tee`; Windows containers are not supported.
+Archives and agent state are persisted on the host. Remote cleanup failures emit a
+warning instead of being silently treated as success.
+
+```python
+from driftlock import RemoteArchiveCheckpointStore
+
+store = RemoteArchiveCheckpointStore(
+    harbor_environment,
+    remote_workspace="/app",
+    store_dir="./runs/checkpoints",  # keep outside agent-visible mounts
+    user="root",
+)
+```
+
+Restore validates canonical paths remotely, rejects staging directories that resolve
+or mount inside the workspace, and downloads a pre-restore recovery archive to the
+host—and verifies it against the remote SHA-256—before changing live files. It
+preserves the workspace-root inode, but child directories are recreated: a Harbor
+adapter must use `before_restore` to move tmux panes parked in a child directory back
+to the workspace root before applying the snapshot. On an ordinary copy failure, an
+exact pre-restore tree is rebuilt from the untouched remote backup (or a separately
+named, checksum-verified host fallback). Recovery hashes and extracts the same
+archive byte stream before mutating the live tree, so a changed archive is rejected.
+Recovery archives are retained on failure, timeout, or cancellation; other staging
+artifacts are cleaned after ordinary failures. The configured workspace cannot be
+`/`.
+
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
 report actual billed tokens in `StepOutcome.tokens`, including failed model calls.
@@ -171,7 +204,7 @@ uv run ruff check .
 ## Repo layout
 
 ```
-src/driftlock/   # checkpoint store, judges, heuristics, runner
+src/driftlock/   # local/remote checkpoint stores, judges, heuristics, runner
 tests/           # unit and integration-style local tests
 PLAN.md          # full working plan, risk register, phase gates
 README.md        # this file

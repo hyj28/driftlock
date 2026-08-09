@@ -8,7 +8,7 @@ import os
 import shutil
 import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -30,9 +30,11 @@ class CheckpointStore(Protocol):
         step: int,
         parent_id: str | None = None,
         label: str | None = None,
-    ) -> Checkpoint: ...
+    ) -> Checkpoint | Awaitable[Checkpoint]: ...
 
-    def restore(self, checkpoint: Checkpoint) -> dict[str, Any]: ...
+    def restore(
+        self, checkpoint: Checkpoint
+    ) -> dict[str, Any] | Awaitable[dict[str, Any]]: ...
 
 
 class DirectoryCheckpointStore:
