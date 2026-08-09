@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets — API keys never land in git
+.env
+.env.*
+!.env.example
+*.key
+
+# Experiment artifacts (large; keep out of git, publish summaries instead)
+runs/
+trajectories/
+logs/
+*.jsonl
+results/raw/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
