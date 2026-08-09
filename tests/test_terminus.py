@@ -44,6 +44,7 @@ class RuntimeCall:
     state: TerminusConversationState | None
     prompt: str
     tokens_remaining: int | None
+    rollback_feedback: str | None = None
 
 
 class FakeBoundaryRuntime:
@@ -55,10 +56,17 @@ class FakeBoundaryRuntime:
         instruction: str,
         *,
         plan: str,
+        rollback_feedback: str | None,
         tokens_remaining: int | None,
     ) -> TerminusBoundary:
         self.calls.append(
-            RuntimeCall("start", None, f"{instruction}|{plan}", tokens_remaining)
+            RuntimeCall(
+                "start",
+                None,
+                f"{instruction}|{plan}",
+                tokens_remaining,
+                rollback_feedback,
+            )
         )
         return _boundary(episode=1, next_prompt="terminal one", tokens=11)
 
@@ -155,6 +163,20 @@ def test_conversation_codec_rejects_non_json_and_unknown_schema() -> None:
             {"terminus_2": {"schema_version": 2, "started": False}}
         )
 
+    with pytest.raises(TerminusStateError, match="string object keys"):
+        TerminusConversationState(
+            messages=(
+                {
+                    "role": "user",
+                    "content": "task",
+                    1: "key would be coerced by json.dumps",
+                },
+            ),
+            next_prompt="",
+            pending_completion=False,
+            episode=1,
+        )
+
 
 def test_state_bridge_restores_only_semantic_state() -> None:
     codec = TerminusConversationCodec()
@@ -216,6 +238,56 @@ async def test_step_adapter_adds_feedback_only_after_rollback() -> None:
     )
 
 
+async def test_step_adapter_passes_feedback_when_rollback_reaches_initial_state() -> (
+    None
+):
+    runtime = FakeBoundaryRuntime()
+    adapter = TerminusStepAdapter(runtime)
+
+    await adapter(
+        _context(
+            adapter.initial_state(),
+            rollback_feedback="choose a different implementation strategy",
+        )
+    )
+
+    assert runtime.calls[0].operation == "start"
+    assert runtime.calls[0].rollback_feedback == (
+        "choose a different implementation strategy"
+    )
+
+
+async def test_step_adapter_surfaces_parser_error_as_its_own_episode() -> None:
+    class ParserErrorRuntime(FakeBoundaryRuntime):
+        async def start(
+            self,
+            instruction: str,
+            *,
+            plan: str,
+            rollback_feedback: str | None,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            return TerminusBoundary(
+                conversation=_conversation(
+                    episode=1,
+                    next_prompt="fix the malformed JSON response",
+                ),
+                action="malformed model response",
+                error="parser rejected the response",
+                tokens=17,
+            )
+
+    adapter = TerminusStepAdapter(ParserErrorRuntime())
+
+    outcome = await adapter(_context(adapter.initial_state()))
+
+    assert outcome.error == "parser rejected the response"
+    assert outcome.tokens == 17
+    assert adapter.codec.decode(outcome.state).next_prompt == (
+        "fix the malformed JSON response"
+    )
+
+
 async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
     class SkippingRuntime(FakeBoundaryRuntime):
         async def start(
@@ -223,6 +295,7 @@ async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
             instruction: str,
             *,
             plan: str,
+            rollback_feedback: str | None,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
             return _boundary(episode=2, next_prompt="late", tokens=1)

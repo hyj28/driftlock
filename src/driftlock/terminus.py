@@ -9,7 +9,6 @@ it atomically with the workspace.
 from __future__ import annotations
 
 import copy
-import json
 from collections.abc import Mapping, MutableSequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -55,7 +54,11 @@ class TerminusConversationState:
 
 @dataclass(frozen=True, slots=True)
 class TerminusBoundary:
-    """One completed Terminus episode and its driftlock observations."""
+    """One billed Terminus episode and its driftlock observations.
+
+    Parser-error responses are episodes too.  A runtime must return them with
+    ``error`` populated even though no terminal command was executed.
+    """
 
     conversation: TerminusConversationState
     action: str
@@ -73,13 +76,20 @@ class TerminusBoundary:
 
 
 class TerminusBoundaryRuntime(Protocol):
-    """A Terminus fork that yields after exactly one complete episode."""
+    """A Terminus fork that yields after exactly one billed episode.
+
+    ``start`` may be called again after rollback to the initial checkpoint.  It
+    must reset semantic conversation state while keeping physical usage counters
+    and trajectory audit data monotonic.  Both methods must enforce the supplied
+    provider token ceiling and report actual usage in the returned boundary.
+    """
 
     async def start(
         self,
         instruction: str,
         *,
         plan: str,
+        rollback_feedback: str | None,
         tokens_remaining: int | None,
     ) -> TerminusBoundary: ...
 
@@ -238,6 +248,7 @@ class TerminusStepAdapter:
             boundary = await self.runtime.start(
                 context.goal,
                 plan=context.plan,
+                rollback_feedback=context.rollback_feedback,
                 tokens_remaining=context.tokens_remaining,
             )
             expected_episode = 1
@@ -310,9 +321,22 @@ def _validate_messages(messages: tuple[Mapping[str, Any], ...]) -> None:
 
 
 def _validate_json(value: Any) -> None:
-    try:
-        json.dumps(value, allow_nan=False)
-    except (TypeError, ValueError) as error:
-        raise TerminusStateError(
-            "Terminus checkpoint state must be strict JSON"
-        ) from error
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise TerminusStateError("Terminus checkpoint state must be strict JSON")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json(item)
+        return
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TerminusStateError(
+                "Terminus checkpoint state must use string object keys"
+            )
+        for item in value.values():
+            _validate_json(item)
+        return
+    raise TerminusStateError("Terminus checkpoint state must be strict JSON")
