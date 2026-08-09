@@ -55,6 +55,7 @@ class LocalRemoteEnvironment:
 class PartialApplyFailureEnvironment(LocalRemoteEnvironment):
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
+        self.failed_once = False
 
     async def exec(
         self,
@@ -63,8 +64,12 @@ class PartialApplyFailureEnvironment(LocalRemoteEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> LocalExecResult:
-        if "cp -a" in command:
+        if "cp -a" in command and not self.failed_once:
+            self.failed_once = True
             (self.workspace / "important.txt").unlink(missing_ok=True)
+            (self.workspace / "checkpoint-only.txt").write_text(
+                "partial", encoding="utf-8"
+            )
             return LocalExecResult(1, "", "injected copy failure")
         return await super().exec(
             command,
@@ -104,6 +109,44 @@ class CancelApplyEnvironment(LocalRemoteEnvironment):
         if "cp -a" in command:
             self.apply_started.set()
             await asyncio.Future()
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+
+class TruncatedRecoveryDownloadEnvironment(LocalRemoteEnvironment):
+    def __init__(self) -> None:
+        self.download_count = 0
+
+    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+        self.download_count += 1
+        if self.download_count == 2:
+            Path(target_path).write_bytes(b"")
+            return
+        await super().download_file(source_path, target_path)
+
+
+class CorruptRemoteBackupFailureEnvironment(LocalRemoteEnvironment):
+    def __init__(self, workspace: Path, remote_tmp: Path) -> None:
+        self.workspace = workspace
+        self.remote_tmp = remote_tmp
+        self.failed_once = False
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if "cp -a" in command and not self.failed_once:
+            self.failed_once = True
+            (self.workspace / "important.txt").unlink(missing_ok=True)
+            for backup in self.remote_tmp.glob("*backup.tar.gz"):
+                backup.write_bytes(b"corrupt")
+            return LocalExecResult(1, "", "injected apply and backup failure")
         return await super().exec(
             command,
             timeout_sec=timeout_sec,
@@ -190,8 +233,63 @@ async def test_failed_restore_recovers_and_retains_host_backup(tmp_path: Path) -
         await store.restore(checkpoint)
 
     assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
+    assert not (workspace / "checkpoint-only.txt").exists()
     assert list((tmp_path / "host" / "recovery").glob("*.tar.gz"))
-    assert list(remote_tmp.glob("*backup.tar.gz"))
+    remaining = list(remote_tmp.iterdir())
+    assert len(remaining) == 1
+    assert remaining[0].name.endswith("backup.tar.gz")
+
+
+async def test_truncated_recovery_download_is_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = TruncatedRecoveryDownloadEnvironment()
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="does not match"):
+        await store.restore(checkpoint)
+
+    assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
+    assert not any(remote_tmp.iterdir())
+
+
+async def test_validated_host_copy_recovers_when_remote_backup_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = CorruptRemoteBackupFailureEnvironment(workspace, remote_tmp)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="host copy"):
+        await store.restore(checkpoint)
+
+    assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
+    remaining = list(remote_tmp.iterdir())
+    assert len(remaining) == 1
+    assert remaining[0].name.endswith("backup.tar.gz")
 
 
 async def test_remote_path_validation_rejects_symlink_alias_inside_workspace(

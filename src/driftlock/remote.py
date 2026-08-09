@@ -180,14 +180,16 @@ class RemoteArchiveCheckpointStore:
         restore_id = uuid.uuid4().hex
         remote_archive = self._remote_temp_path(restore_id, "restore.tar.gz")
         remote_backup = self._remote_temp_path(restore_id, "backup.tar.gz")
+        remote_host_backup = self._remote_temp_path(restore_id, "host-backup.tar.gz")
         remote_staging = self._remote_temp_path(restore_id, "staging")
+        remote_recovery_staging = self._remote_temp_path(restore_id, "recovery-staging")
         recovery_dir = self.store_dir / "recovery"
         recovery_dir.mkdir(parents=True, exist_ok=True)
         local_recovery = recovery_dir / f"restore-{restore_id}.tar.gz"
 
         try:
             await self.environment.upload_file(archive, remote_archive)
-            await self._checked_exec(
+            prepare_result = await self._checked_exec(
                 self._prepare_restore_script(
                     archive=remote_archive,
                     backup=remote_backup,
@@ -195,10 +197,15 @@ class RemoteArchiveCheckpointStore:
                 ),
                 operation="prepare remote checkpoint restore",
             )
+            remote_backup_digest = _parse_sha256(prepare_result.stdout)
             await self.environment.download_file(remote_backup, local_recovery)
             if not local_recovery.is_file():
                 raise RemoteCheckpointError(
                     "environment did not download the pre-restore recovery archive"
+                )
+            if _file_digest(local_recovery) != remote_backup_digest:
+                raise RemoteCheckpointError(
+                    "downloaded recovery archive does not match the remote SHA-256"
                 )
         except BaseException:
             await self._best_effort_remove(
@@ -217,6 +224,15 @@ class RemoteArchiveCheckpointStore:
             recovery_detail = await self._attempt_recovery(
                 local_recovery=local_recovery,
                 remote_backup=remote_backup,
+                remote_backup_digest=remote_backup_digest,
+                remote_host_backup=remote_host_backup,
+                recovery_staging=remote_recovery_staging,
+            )
+            await self._best_effort_remove(
+                remote_archive,
+                remote_staging,
+                remote_host_backup,
+                remote_recovery_staging,
             )
             raise RemoteCheckpointError(
                 f"remote restore failed: {error}; {recovery_detail}; "
@@ -224,7 +240,13 @@ class RemoteArchiveCheckpointStore:
                 f"remote recovery archive retained at {remote_backup}"
             ) from error
 
-        await self._best_effort_remove(remote_archive, remote_backup, remote_staging)
+        await self._best_effort_remove(
+            remote_archive,
+            remote_backup,
+            remote_staging,
+            remote_host_backup,
+            remote_recovery_staging,
+        )
         local_recovery.unlink(missing_ok=True)
         return state
 
@@ -252,6 +274,7 @@ rm -f -- {backup_q}
 mkdir -p -- {staging_q}
 tar -xzf {archive_q} -C {staging_q}
 tar -czf {backup_q} -C {workspace} .
+sha256sum {backup_q}
 """
         return "sh -ceu " + shlex.quote(script)
 
@@ -272,21 +295,63 @@ cp -a {staging_q}/. {workspace}/
         *,
         local_recovery: Path,
         remote_backup: str,
+        remote_backup_digest: str,
+        remote_host_backup: str,
+        recovery_staging: str,
     ) -> str:
+        recovery_errors: list[str] = []
         try:
-            await self.environment.upload_file(local_recovery, remote_backup)
-            command = " ".join(
-                [
-                    "tar -xzf",
-                    shlex.quote(remote_backup),
-                    "-C",
-                    shlex.quote(self._workspace_path),
-                ]
+            if await self._remote_sha256(remote_backup) != remote_backup_digest:
+                raise RemoteCheckpointError("remote recovery archive digest changed")
+            await self._checked_exec(
+                self._exact_recovery_script(
+                    archive=remote_backup,
+                    staging=recovery_staging,
+                ),
+                operation="recover failed restore from remote backup",
             )
-            await self._checked_exec(command, operation="recover failed restore")
+            return "the exact pre-restore workspace was recovered"
         except Exception as recovery_error:
-            return f"automatic recovery also failed: {recovery_error}"
-        return "the pre-restore archive was merged back into the workspace"
+            recovery_errors.append(f"remote backup: {recovery_error}")
+
+        try:
+            await self.environment.upload_file(local_recovery, remote_host_backup)
+            if await self._remote_sha256(remote_host_backup) != remote_backup_digest:
+                raise RemoteCheckpointError("uploaded host backup digest changed")
+            await self._checked_exec(
+                self._exact_recovery_script(
+                    archive=remote_host_backup,
+                    staging=recovery_staging,
+                ),
+                operation="recover failed restore from host backup",
+            )
+            return "the exact pre-restore workspace was recovered from the host copy"
+        except Exception as recovery_error:
+            recovery_errors.append(f"host backup: {recovery_error}")
+        return "automatic exact recovery failed: " + "; ".join(recovery_errors)
+
+    def _exact_recovery_script(self, *, archive: str, staging: str) -> str:
+        workspace = shlex.quote(self._workspace_path)
+        archive_q = shlex.quote(archive)
+        staging_q = shlex.quote(staging)
+        clear_workspace = (
+            f"find {workspace} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +"
+        )
+        script = f"""set -eu
+rm -rf -- {staging_q}
+mkdir -p -- {staging_q}
+tar -xzf {archive_q} -C {staging_q}
+{clear_workspace}
+cp -a {staging_q}/. {workspace}/
+"""
+        return "sh -ceu " + shlex.quote(script)
+
+    async def _remote_sha256(self, path: str) -> str:
+        result = await self._checked_exec(
+            "sha256sum " + shlex.quote(path),
+            operation="verify remote recovery archive",
+        )
+        return _parse_sha256(result.stdout)
 
     async def _ensure_remote_paths_are_safe(self) -> None:
         if self._canonical_workspace is not None:
@@ -294,7 +359,7 @@ cp -a {staging_q}/. {workspace}/
         workspace = shlex.quote(self.remote_workspace)
         tmp_dir = shlex.quote(self.remote_tmp_dir)
         script = f"""set -eu
-for tool in sh tar find rm cp realpath; do command -v "$tool" >/dev/null; done
+for tool in sh tar find rm cp realpath sha256sum; do command -v "$tool" >/dev/null; done
 test -d {workspace}
 test -d {tmp_dir}
 workspace_real=$(realpath -- {workspace})
@@ -395,3 +460,20 @@ def _archive_digest(archive: Path, state_json: str) -> str:
     digest.update(b"\0state\0")
     digest.update(state_json.encode())
     return digest.hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_sha256(output: str | None) -> str:
+    value = (output or "").strip().split(maxsplit=1)[0] if output else ""
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise RemoteCheckpointError("remote command did not return a valid SHA-256")
+    return value

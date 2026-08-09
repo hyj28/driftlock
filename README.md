@@ -174,12 +174,14 @@ store = RemoteArchiveCheckpointStore(
 
 Restore validates canonical paths remotely, rejects staging directories that resolve
 or mount inside the workspace, and downloads a pre-restore recovery archive to the
-host before changing live files. It preserves the workspace-root inode, but child
-directories are recreated: a Harbor adapter must use `before_restore` to move tmux
-panes parked in a child directory back to the workspace root before applying the
-snapshot. On an ordinary copy failure, the backup is merged back automatically; on
-failure, timeout, or cancellation, recovery archives are retained rather than
-deleted. The configured workspace cannot be `/`.
+host—and verifies it against the remote SHA-256—before changing live files. It
+preserves the workspace-root inode, but child directories are recreated: a Harbor
+adapter must use `before_restore` to move tmux panes parked in a child directory back
+to the workspace root before applying the snapshot. On an ordinary copy failure, an
+exact pre-restore tree is rebuilt from the untouched remote backup (or a separately
+named, checksum-verified host fallback). Recovery archives are retained on failure,
+timeout, or cancellation; other staging artifacts are cleaned after ordinary
+failures. The configured workspace cannot be `/`.
 
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
