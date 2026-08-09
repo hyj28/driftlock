@@ -2,9 +2,9 @@
 
 **A checkpoint-and-rollback layer for long-horizon agents.**
 
-> 🚧 **Status: early. No results yet.** This repo currently contains the research plan
-> and will accumulate the implementation, experiments, and write-up over the next ~8 weeks.
-> Nothing here is a claim — the numbers below are placeholders until measured.
+> 🚧 **Status: early. No benchmark results yet.** The first library slice implements
+> the checkpoint/rollback control loop and local filesystem snapshots. The LHTB
+> integration and experiments are still in progress. Nothing here is a result claim.
 
 ---
 
@@ -91,11 +91,74 @@ nobody can solve provide no headroom to measure against.
 1. This library — a rollback middle layer you can wrap around your own agent loop
 2. A technical writeup: the four curves, failure-case analysis, and the judge design tradeoffs
 
+## Core library quick start
+
+The runner wraps an async function that performs one agent step. Each result carries
+JSON-serializable agent state plus the observations used by the zero-token heuristics.
+The filesystem checkpoint store is deliberately separate from the agent so other
+backends (Docker, Harbor, cloud sandboxes) can implement the same interface.
+Local snapshots include Git metadata, tracked files, and untracked files so a restore
+returns both the worktree and repository state to the same point.
+
+```python
+from pathlib import Path
+
+from driftlock import (
+    DirectoryCheckpointStore,
+    DriftlockRunner,
+    HeuristicJudge,
+    StepOutcome,
+)
+
+workspace = Path("/path/to/agent/workspace")
+snapshots = Path("/path/to/snapshots")  # must be outside workspace
+
+
+async def next_step(context):
+    # Ask your agent for one action, execute it, and return its new state.
+    return StepOutcome(
+        action="pytest -q",
+        state={"messages": []},
+        changed_paths=("src/parser.py",),
+        diff="...",
+        tokens=1200,
+        completed=False,
+    )
+
+
+runner = DriftlockRunner(
+    DirectoryCheckpointStore(workspace, snapshots),
+    HeuristicJudge(),
+)
+result = await runner.run(
+    goal="Fix the parser without changing its public API",
+    plan="Reproduce, patch, test",
+    step=next_step,
+    initial_state={"messages": []},
+)
+```
+
+With no fine judge, coarse signals trigger rollback directly (the heuristics-only
+ablation). Pass `CallableLLMJudge(async_completion_function)` to enable the two-tier
+mode. The callable owns its provider SDK and credentials; driftlock sends it the
+original goal, plan, recent trajectory, heuristic signals, and latest diff, and
+expects a structured JSON verdict.
+
+Development uses Python 3.11+ and `uv`:
+
+```bash
+uv sync --extra dev
+uv run pytest
+uv run ruff check .
+```
+
 ## Repo layout
 
 ```
-PLAN.md     # full working plan, risk register, phase gates
-README.md   # this file
+src/driftlock/   # checkpoint store, judges, heuristics, runner
+tests/           # unit and integration-style local tests
+PLAN.md          # full working plan, risk register, phase gates
+README.md        # this file
 ```
 
 ## License

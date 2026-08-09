@@ -1,0 +1,115 @@
+"""Zero-token trajectory drift heuristics."""
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+from dataclasses import dataclass
+
+from driftlock.models import DriftSignal, StepRecord
+
+
+@dataclass(frozen=True, slots=True)
+class HeuristicConfig:
+    """Thresholds for the coarse drift detector."""
+
+    no_change_steps: int = 4
+    loop_window: int = 6
+    loop_repetitions: int = 3
+    error_window: int = 5
+    error_rate: float = 0.6
+    reward_stall_steps: int = 5
+    reward_epsilon: float = 1e-6
+
+    def __post_init__(self) -> None:
+        integer_fields = (
+            self.no_change_steps,
+            self.loop_window,
+            self.loop_repetitions,
+            self.error_window,
+            self.reward_stall_steps,
+        )
+        if any(value <= 0 for value in integer_fields):
+            raise ValueError("heuristic window sizes must be positive")
+        if self.loop_repetitions > self.loop_window:
+            raise ValueError("loop_repetitions cannot exceed loop_window")
+        if not 0.0 <= self.error_rate <= 1.0:
+            raise ValueError("error_rate must be between 0 and 1")
+        if self.reward_epsilon < 0:
+            raise ValueError("reward_epsilon cannot be negative")
+
+
+class HeuristicJudge:
+    """Detect suspicious stalls, loops, error spikes, and reward plateaus."""
+
+    def __init__(self, config: HeuristicConfig | None = None) -> None:
+        self.config = config or HeuristicConfig()
+
+    def evaluate(self, steps: list[StepRecord]) -> tuple[DriftSignal, ...]:
+        if not steps:
+            return ()
+        signals: list[DriftSignal] = []
+        config = self.config
+
+        no_change = steps[-config.no_change_steps :]
+        if len(no_change) == config.no_change_steps and all(
+            not step.outcome.changed_paths for step in no_change
+        ):
+            signals.append(
+                DriftSignal(
+                    "no_file_change",
+                    f"no files changed in the last {config.no_change_steps} steps",
+                )
+            )
+
+        loop_steps = steps[-config.loop_window :]
+        fingerprints = [_action_fingerprint(step.outcome.action) for step in loop_steps]
+        repeated = Counter(fingerprints).most_common(1)
+        if (
+            len(loop_steps) == config.loop_window
+            and repeated
+            and repeated[0][0]
+            and repeated[0][1] >= config.loop_repetitions
+        ):
+            signals.append(
+                DriftSignal(
+                    "action_loop",
+                    f"the same action appeared {repeated[0][1]} times in the last "
+                    f"{config.loop_window} steps",
+                )
+            )
+
+        error_steps = steps[-config.error_window :]
+        if len(error_steps) == config.error_window:
+            failures = sum(step.outcome.error is not None for step in error_steps)
+            rate = failures / config.error_window
+            if rate >= config.error_rate:
+                signals.append(
+                    DriftSignal(
+                        "error_spike",
+                        f"error rate is {rate:.0%} over the last "
+                        f"{config.error_window} steps",
+                    )
+                )
+
+        reward_steps = [
+            step.outcome.reward
+            for step in steps[-config.reward_stall_steps :]
+            if step.outcome.reward is not None
+        ]
+        if len(reward_steps) == config.reward_stall_steps and (
+            max(reward_steps) - min(reward_steps) <= config.reward_epsilon
+        ):
+            signals.append(
+                DriftSignal(
+                    "reward_stall",
+                    "reward did not improve in the last "
+                    f"{config.reward_stall_steps} steps",
+                )
+            )
+        return tuple(signals)
+
+
+def _action_fingerprint(action: str) -> str:
+    normalized = re.sub(r"\s+", " ", action.strip().lower())
+    return normalized[:500]

@@ -6,6 +6,15 @@
 
 **Last updated:** 2026-08-09
 
+### Implementation status
+
+- **Implemented:** provider-neutral async runner; atomic local workspace + agent-state
+  checkpoints with integrity verification; no-change, action-loop, error-spike, and
+  reward-stall heuristics; optional structured LLM judge; rollback and token/step
+  budgets; unit tests.
+- **Next:** add a remote-environment snapshot backend and Harbor/Terminus-2 adapter,
+  then run the week-1 LHTB smoke tests before selecting experiment tasks.
+
 ---
 
 ## 1. The claim, in one sentence
