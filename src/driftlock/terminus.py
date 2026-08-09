@@ -1,7 +1,7 @@
 """Checkpoint-boundary adapters for Harbor's Terminus-2 agent loop.
 
-The module deliberately has no Harbor dependency.  A Harbor fork only needs to
-expose one completed Terminus episode at a time through ``TerminusBoundaryRuntime``.
+The module deliberately has no Harbor dependency. A Harbor fork only needs to
+expose one billed Terminus episode at a time through ``TerminusBoundaryRuntime``.
 Conversation state is JSON-compatible so the regular checkpoint stores can persist
 it atomically with the workspace.
 """
@@ -9,6 +9,7 @@ it atomically with the workspace.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Mapping, MutableSequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -31,7 +32,7 @@ class TerminusChat(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class TerminusConversationState:
-    """Semantic Terminus state captured after one complete agent episode."""
+    """Semantic Terminus state captured after one billed agent episode."""
 
     messages: tuple[Mapping[str, Any], ...]
     next_prompt: str
@@ -82,6 +83,8 @@ class TerminusBoundaryRuntime(Protocol):
     must reset semantic conversation state while keeping physical usage counters
     and trajectory audit data monotonic.  Both methods must enforce the supplied
     provider token ceiling and report actual usage in the returned boundary.
+    Output-length responses must not be retried inside one call: they return an
+    error boundary with their billed usage and correction prompt instead.
     """
 
     async def start(
@@ -100,6 +103,10 @@ class TerminusBoundaryRuntime(Protocol):
         prompt: str,
         tokens_remaining: int | None,
     ) -> TerminusBoundary: ...
+
+    async def before_workspace_restore(self, remote_workspace: str) -> None:
+        """Quiesce branch processes and recreate a clean shell at the workspace."""
+        ...
 
 
 class TerminusConversationCodec:
@@ -137,7 +144,12 @@ class TerminusConversationCodec:
             raise TerminusStateError(
                 f"checkpoint state is missing the {self.state_key!r} object"
             )
-        if payload.get("schema_version") != self.schema_version:
+        schema_version = payload.get("schema_version")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != self.schema_version
+        ):
             raise TerminusStateError("unsupported Terminus state schema version")
         started = payload.get("started")
         if started is False:
@@ -195,8 +207,8 @@ class Terminus2StateBridge:
     """Narrow bridge for the relevant private fields of Harbor Terminus-2.
 
     Harbor currently does not expose checkpointable state publicly.  The forked
-    episode loop supplies ``next_prompt`` and uses this bridge only at a completed
-    episode boundary.  Compatibility failures are explicit instead of silently
+    episode loop supplies ``next_prompt`` and uses this bridge only after a billed
+    response is recorded. Compatibility failures are explicit instead of silently
     producing a partial restore.
     """
 
@@ -241,6 +253,16 @@ class TerminusStepAdapter:
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state()
+
+    async def before_workspace_restore(self, remote_workspace: str) -> None:
+        """Delegate the remote store's pre-restore lifecycle to Terminus.
+
+        The runtime must terminate processes from the rejected branch, replace the
+        persistent tmux shell with a clean one whose cwd is ``remote_workspace``,
+        and reset its terminal-output cursor. Any failure must propagate so the
+        checkpoint store leaves the live workspace untouched.
+        """
+        await self.runtime.before_workspace_restore(remote_workspace)
 
     async def __call__(self, context: StepContext) -> StepOutcome:
         previous = self.codec.decode(context.state)
@@ -321,6 +343,16 @@ def _validate_messages(messages: tuple[Mapping[str, Any], ...]) -> None:
 
 
 def _validate_json(value: Any) -> None:
+    _validate_json_tree(value)
+    try:
+        json.dumps(value, allow_nan=False, sort_keys=True)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise TerminusStateError(
+            "Terminus checkpoint state must be strict JSON"
+        ) from error
+
+
+def _validate_json_tree(value: Any) -> None:
     if value is None or isinstance(value, (bool, int, str)):
         return
     if isinstance(value, float):
@@ -329,7 +361,7 @@ def _validate_json(value: Any) -> None:
         return
     if isinstance(value, list):
         for item in value:
-            _validate_json(item)
+            _validate_json_tree(item)
         return
     if isinstance(value, dict):
         if any(not isinstance(key, str) for key in value):
@@ -337,6 +369,6 @@ def _validate_json(value: Any) -> None:
                 "Terminus checkpoint state must use string object keys"
             )
         for item in value.values():
-            _validate_json(item)
+            _validate_json_tree(item)
         return
     raise TerminusStateError("Terminus checkpoint state must be strict JSON")

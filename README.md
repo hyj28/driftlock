@@ -216,12 +216,36 @@ parse failure in `TerminusBoundary.error`. The runtime can use
 clears the provider response-chain id so the next call sends the restored full
 history.
 
+The same rule applies below `Chat`: Harbor currently turns an output-length response
+into an exception and recursively retries without adding its usage to `Chat`. The
+fork must intercept that response, return it as an error boundary with its actual
+token usage and shorter-response correction prompt, and let driftlock decide whether
+to continue. Multiple provider responses may never be hidden inside one boundary.
+
 Only semantic state rewinds. Token/cost accumulators, rollout details, trajectory
 files, session ids, and Harbor's physical turn counter remain monotonic so rolled-back
 work is still billed and auditable. The adapter rejects runtimes that skip or combine
 episode boundaries. A rollback reason is appended to the restored pending observation
 without contaminating stored checkpoint state; when rollback reaches the initial
 checkpoint, the same reason is passed explicitly to `start()`.
+
+Filesystem rollback is not enough for Terminus's persistent tmux shell: rejected
+branches can leave a different cwd, exported variables, aliases, foreground jobs, or
+background servers behind. Pass the adapter hook to the remote store:
+
+```python
+store = RemoteArchiveCheckpointStore(
+    harbor_environment,
+    remote_workspace="/app",
+    store_dir="./runs/checkpoints",
+    before_restore=step.before_workspace_restore,
+)
+```
+
+The runtime implementation must quiesce every process from the rejected branch,
+replace the tmux shell, start the new shell at the canonical workspace root, and
+reset incremental terminal-output tracking. If cleanup fails, it must raise; the
+remote store then aborts before mutating the workspace.
 
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then

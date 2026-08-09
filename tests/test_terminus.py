@@ -50,6 +50,7 @@ class RuntimeCall:
 class FakeBoundaryRuntime:
     def __init__(self) -> None:
         self.calls: list[RuntimeCall] = []
+        self.restored_workspaces: list[str] = []
 
     async def start(
         self,
@@ -84,6 +85,9 @@ class FakeBoundaryRuntime:
             tokens=13,
             completed=True,
         )
+
+    async def before_workspace_restore(self, remote_workspace: str) -> None:
+        self.restored_workspaces.append(remote_workspace)
 
 
 def _conversation(
@@ -163,6 +167,11 @@ def test_conversation_codec_rejects_non_json_and_unknown_schema() -> None:
             {"terminus_2": {"schema_version": 2, "started": False}}
         )
 
+    with pytest.raises(TerminusStateError, match="schema version"):
+        TerminusConversationCodec().decode(
+            {"terminus_2": {"schema_version": True, "started": False}}
+        )
+
     with pytest.raises(TerminusStateError, match="string object keys"):
         TerminusConversationState(
             messages=(
@@ -170,6 +179,19 @@ def test_conversation_codec_rejects_non_json_and_unknown_schema() -> None:
                     "role": "user",
                     "content": "task",
                     1: "key would be coerced by json.dumps",
+                },
+            ),
+            next_prompt="",
+            pending_completion=False,
+            episode=1,
+        )
+
+    with pytest.raises(TerminusStateError, match="strict JSON"):
+        TerminusConversationState(
+            messages=(
+                {
+                    "role": "user",
+                    "content": 10**5000,
                 },
             ),
             next_prompt="",
@@ -283,9 +305,57 @@ async def test_step_adapter_surfaces_parser_error_as_its_own_episode() -> None:
 
     assert outcome.error == "parser rejected the response"
     assert outcome.tokens == 17
-    assert adapter.codec.decode(outcome.state).next_prompt == (
-        "fix the malformed JSON response"
-    )
+    decoded = adapter.codec.decode(outcome.state)
+    assert decoded is not None
+    assert decoded.next_prompt == "fix the malformed JSON response"
+
+
+async def test_step_adapter_surfaces_truncation_without_an_internal_retry() -> None:
+    class TruncatedRuntime(FakeBoundaryRuntime):
+        async def start(
+            self,
+            instruction: str,
+            *,
+            plan: str,
+            rollback_feedback: str | None,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.calls.append(
+                RuntimeCall(
+                    "truncated",
+                    None,
+                    instruction,
+                    tokens_remaining,
+                    rollback_feedback,
+                )
+            )
+            return TerminusBoundary(
+                conversation=_conversation(
+                    episode=1,
+                    next_prompt="retry with a shorter response",
+                ),
+                action="truncated model response",
+                error="model output reached the token limit",
+                tokens=500,
+            )
+
+    runtime = TruncatedRuntime()
+    adapter = TerminusStepAdapter(runtime)
+
+    outcome = await adapter(_context(adapter.initial_state()))
+
+    assert outcome.error == "model output reached the token limit"
+    assert outcome.tokens == 500
+    assert len(runtime.calls) == 1
+
+
+async def test_step_adapter_delegates_pre_restore_process_cleanup() -> None:
+    runtime = FakeBoundaryRuntime()
+    adapter = TerminusStepAdapter(runtime)
+
+    await adapter.before_workspace_restore("/app")
+
+    assert runtime.restored_workspaces == ["/app"]
 
 
 async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
