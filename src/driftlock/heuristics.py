@@ -70,6 +70,7 @@ class HeuristicJudge:
                 DriftSignal(
                     "no_file_change",
                     f"no files changed in the last {config.no_change_steps} steps",
+                    lookback=config.no_change_steps,
                 )
             )
 
@@ -87,6 +88,7 @@ class HeuristicJudge:
                     "action_loop",
                     f"the same action appeared {repeated[0][1]} times in the last "
                     f"{config.loop_window} steps",
+                    lookback=config.loop_window,
                 )
             )
 
@@ -100,6 +102,7 @@ class HeuristicJudge:
                         "error_spike",
                         f"error rate is {rate:.0%} over the last "
                         f"{config.error_window} steps",
+                        lookback=config.error_window,
                     )
                 )
 
@@ -116,6 +119,7 @@ class HeuristicJudge:
                     "reward_stall",
                     "reward did not improve in the last "
                     f"{config.reward_stall_steps} steps",
+                    lookback=config.reward_stall_steps,
                 )
             )
         return tuple(signals)

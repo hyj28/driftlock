@@ -86,7 +86,12 @@ def _build_prompt(context: DriftContext) -> str:
             "logical_step": context.checkpoint.step,
         },
         "coarse_signals": [
-            {"kind": signal.kind, "detail": signal.detail} for signal in context.signals
+            {
+                "kind": signal.kind,
+                "detail": signal.detail,
+                "lookback": signal.lookback,
+            }
+            for signal in context.signals
         ],
         "recent_trajectory": trajectory,
         "latest_diff": context.diff,

@@ -77,9 +77,12 @@ class DriftlockRunner:
         state = dict(initial_state)
         checkpoint = self.checkpoint_store.create(state, step=0, label="initial")
         checkpoints = [checkpoint]
+        checkpoint_lineage = [checkpoint]
+        checkpoint_histories: dict[str, list[StepRecord]] = {
+            checkpoint.checkpoint_id: []
+        }
         all_steps: list[StepRecord] = []
         recent_steps: list[StepRecord] = []
-        checkpoint_recent_steps: list[StepRecord] = []
         rollbacks: list[RollbackRecord] = []
         agent_tokens_used = 0
         judge_tokens_used = 0
@@ -151,10 +154,15 @@ class DriftlockRunner:
             signals = self.coarse_judge.evaluate(recent_steps)
             checkpoint_is_healthy = not signals
             if signals:
+                rollback_checkpoint = self._select_rollback_checkpoint(
+                    checkpoint_lineage,
+                    signals,
+                    logical_step,
+                )
                 verdict = await self._judge(
                     goal=goal,
                     plan=plan,
-                    checkpoint=checkpoint,
+                    checkpoint=rollback_checkpoint,
                     signals=signals,
                     recent_steps=recent_steps,
                     tokens_used=agent_tokens_used + judge_tokens_used,
@@ -175,6 +183,7 @@ class DriftlockRunner:
                             agent_tokens_used,
                             judge_tokens_used,
                         )
+                    checkpoint = rollback_checkpoint
                     state = self.checkpoint_store.restore(checkpoint)
                     rollbacks.append(
                         RollbackRecord(
@@ -186,7 +195,9 @@ class DriftlockRunner:
                     )
                     logical_step = checkpoint.step
                     attempt += 1
-                    recent_steps = list(checkpoint_recent_steps)
+                    checkpoint_index = checkpoint_lineage.index(checkpoint)
+                    checkpoint_lineage = checkpoint_lineage[: checkpoint_index + 1]
+                    recent_steps = list(checkpoint_histories[checkpoint.checkpoint_id])
                     rollback_feedback = verdict.reason
                     if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
                         return self._result(
@@ -214,17 +225,17 @@ class DriftlockRunner:
 
             if (
                 checkpoint_is_healthy
-                and len(recent_steps) >= self.coarse_judge.history_window
                 and logical_step - checkpoint.step >= self.config.checkpoint_interval
             ):
                 checkpoint = self.checkpoint_store.create(
                     state,
                     step=logical_step,
                     parent_id=checkpoint.checkpoint_id,
-                    label="healthy",
+                    label="accepted",
                 )
                 checkpoints.append(checkpoint)
-                checkpoint_recent_steps = list(recent_steps)
+                checkpoint_lineage.append(checkpoint)
+                checkpoint_histories[checkpoint.checkpoint_id] = list(recent_steps)
 
         return self._result(
             RunStatus.STEP_LIMIT,
@@ -273,6 +284,20 @@ class DriftlockRunner:
         return (
             self.config.max_tokens is not None and tokens_used >= self.config.max_tokens
         )
+
+    @staticmethod
+    def _select_rollback_checkpoint(
+        checkpoint_lineage: list[Checkpoint],
+        signals: tuple[DriftSignal, ...],
+        logical_step: int,
+    ) -> Checkpoint:
+        suspicious_start = logical_step - max(signal.lookback for signal in signals) + 1
+        candidates = [
+            checkpoint
+            for checkpoint in checkpoint_lineage
+            if checkpoint.step < suspicious_start
+        ]
+        return candidates[-1] if candidates else checkpoint_lineage[0]
 
     @staticmethod
     def _result(

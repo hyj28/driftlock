@@ -147,6 +147,11 @@ mode. The callable owns its provider SDK and credentials; driftlock sends it the
 original goal, plan, recent trajectory, heuristic signals, and latest diff, and
 expects a structured JSON verdict.
 
+Periodic snapshots are retained across detector windows. When drift is confirmed,
+the runner selects the newest checkpoint from before the earliest triggered signal
+window, avoiding a superficially recent snapshot that already contains the loop,
+stall, or error spike.
+
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
 report actual billed tokens in `StepOutcome.tokens`, including failed model calls.

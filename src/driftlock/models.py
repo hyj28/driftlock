@@ -46,6 +46,11 @@ class DriftSignal:
 
     kind: str
     detail: str
+    lookback: int = 1
+
+    def __post_init__(self) -> None:
+        if self.lookback <= 0:
+            raise ValueError("lookback must be positive")
 
 
 @dataclass(frozen=True, slots=True)

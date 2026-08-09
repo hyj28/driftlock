@@ -221,8 +221,43 @@ async def test_default_action_loop_detector_survives_checkpoint_boundary(
     ).run(goal="avoid loops", step=agent_step, initial_state={})
 
     assert len(result.rollbacks) == 1
-    assert [checkpoint.step for checkpoint in result.checkpoints] == [0]
+    assert [checkpoint.step for checkpoint in result.checkpoints] == [0, 5]
+    assert result.rollbacks[0].checkpoint_id == result.checkpoints[0].checkpoint_id
     assert any(signal.kind == "action_loop" for signal in result.rollbacks[0].signals)
+
+
+async def test_long_detector_window_does_not_block_periodic_checkpoints(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+    coarse = HeuristicJudge(
+        HeuristicConfig(
+            no_change_steps=2,
+            loop_window=100,
+            loop_repetitions=100,
+            error_window=100,
+            reward_stall_steps=100,
+        )
+    )
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        is_stalled = context.logical_step >= 9
+        return StepOutcome(
+            action=f"step {context.logical_step}",
+            state={"n": context.logical_step},
+            changed_paths=() if is_stalled else ("progress.txt",),
+        )
+
+    result = await DriftlockRunner(
+        store,
+        coarse,
+        config=RunnerConfig(max_steps=10, max_rollbacks=1, checkpoint_interval=2),
+    ).run(goal="keep progress", step=agent_step, initial_state={"n": 0})
+
+    assert [checkpoint.step for checkpoint in result.checkpoints] == [0, 2, 4, 6, 8]
+    assert len(result.rollbacks) == 1
+    assert result.state == {"n": 8}
+    assert result.rollbacks[0].checkpoint_id == result.checkpoints[-1].checkpoint_id
 
 
 async def test_fine_judge_tokens_are_included_in_budget(tmp_path: Path) -> None:
