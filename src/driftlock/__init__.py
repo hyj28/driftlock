@@ -17,6 +17,15 @@ from driftlock.models import (
 )
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
 from driftlock.runner import DriftlockRunner, RunnerConfig
+from driftlock.terminus import (
+    Terminus2StateBridge,
+    TerminusBoundary,
+    TerminusBoundaryRuntime,
+    TerminusConversationCodec,
+    TerminusConversationState,
+    TerminusStateError,
+    TerminusStepAdapter,
+)
 
 __all__ = [
     "CallableLLMJudge",
@@ -37,5 +46,12 @@ __all__ = [
     "SnapshotIntegrityError",
     "StepContext",
     "StepOutcome",
+    "Terminus2StateBridge",
+    "TerminusBoundary",
+    "TerminusBoundaryRuntime",
+    "TerminusConversationCodec",
+    "TerminusConversationState",
+    "TerminusStateError",
+    "TerminusStepAdapter",
     "Verdict",
 ]

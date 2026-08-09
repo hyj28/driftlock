@@ -185,6 +185,40 @@ Recovery archives are retained on failure, timeout, or cancellation; other stagi
 artifacts are cleaned after ordinary failures. The configured workspace cannot be
 `/`.
 
+### Terminus-2 checkpoint boundaries
+
+`TerminusStepAdapter` connects the runner to a small, dependency-free runtime
+protocol that yields after exactly one complete Terminus episode. Its versioned
+codec checkpoints the message history, the terminal observation waiting to become
+the next prompt, the two-step completion-confirmation flag, and the logical episode
+number.
+
+```python
+from driftlock import TerminusStepAdapter
+
+step = TerminusStepAdapter(checkpointable_terminus_runtime)
+result = await runner.run(
+    goal=instruction,
+    plan="inspect, implement, verify",
+    step=step,
+    initial_state=step.initial_state(),
+)
+```
+
+Harbor's stock `Terminus2.run()` owns the whole loop and resets per-run state, so it
+must not be called once per driftlock step. The integration seam belongs immediately
+after one episode has executed commands and produced its next terminal observation.
+The fork implements `TerminusBoundaryRuntime.start()` / `resume()` at that seam and
+can use `Terminus2StateBridge` to capture and restore the existing `Chat` object.
+Restoring clears the provider response-chain id so the next call sends the restored
+full history.
+
+Only semantic state rewinds. Token/cost accumulators, rollout details, trajectory
+files, session ids, and Harbor's physical turn counter remain monotonic so rolled-back
+work is still billed and auditable. The adapter rejects runtimes that skip or combine
+episode boundaries. A rollback reason is appended to the restored pending observation
+without contaminating stored checkpoint state.
+
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
 report actual billed tokens in `StepOutcome.tokens`, including failed model calls.

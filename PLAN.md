@@ -14,10 +14,11 @@
   accounting and step/rollback budgets; signal-window-aware rollback selection;
   sync/async checkpoint backends; host-side archive snapshots for Harbor-compatible
   POSIX remote environments with canonical-path validation and retained recovery
-  archives; SHA-256-verified host fallback and exact failed-restore recovery; unit
-  tests.
-- **Next:** add the Terminus-2 conversation-state codec and checkpoint-boundary agent
-  adapter, then run the week-1 LHTB smoke tests before selecting experiment tasks.
+  archives; SHA-256-verified host fallback and exact failed-restore recovery;
+  versioned Terminus-2 semantic conversation codec and one-episode boundary adapter;
+  unit tests.
+- **Next:** wire the boundary runtime into the pinned LHTB Harbor fork, then run the
+  week-1 LHTB smoke tests before selecting experiment tasks.
 
 ---
 
