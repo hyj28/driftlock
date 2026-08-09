@@ -45,6 +45,17 @@ class HeuristicJudge:
     def __init__(self, config: HeuristicConfig | None = None) -> None:
         self.config = config or HeuristicConfig()
 
+    @property
+    def history_window(self) -> int:
+        """Number of observations needed before every detector is meaningful."""
+
+        return max(
+            self.config.no_change_steps,
+            self.config.loop_window,
+            self.config.error_window,
+            self.config.reward_stall_steps,
+        )
+
     def evaluate(self, steps: list[StepRecord]) -> tuple[DriftSignal, ...]:
         if not steps:
             return ()

@@ -6,7 +6,7 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from driftlock.models import DriftContext, JudgeVerdict, Verdict
+from driftlock.models import DriftContext, JudgeCompletion, JudgeVerdict, Verdict
 
 
 class FineJudge(Protocol):
@@ -22,12 +22,22 @@ class CallableLLMJudge:
     callable receives a complete prompt and must return a JSON object as text.
     """
 
-    def __init__(self, complete: Callable[[str], Awaitable[str]]) -> None:
+    def __init__(
+        self,
+        complete: Callable[[str], Awaitable[str | JudgeCompletion]],
+    ) -> None:
         self._complete = complete
 
     async def judge(self, context: DriftContext) -> JudgeVerdict:
+        tokens = 0
         try:
-            response = await self._complete(_build_prompt(context))
+            completion = await self._complete(_build_prompt(context))
+            if isinstance(completion, str):
+                response = completion
+                tokens = 0
+            else:
+                response = completion.text
+                tokens = completion.tokens
             payload = _parse_json_object(response)
             verdict_value = payload["verdict"]
             reason_value = payload["reason"]
@@ -44,12 +54,14 @@ class CallableLLMJudge:
                 verdict=Verdict(verdict_value.lower()),
                 reason=reason_value,
                 confidence=float(confidence_value),
+                tokens=tokens,
             )
         except Exception as error:
             return JudgeVerdict(
                 verdict=Verdict.UNCERTAIN,
                 reason=f"fine judge failed or returned an invalid response: {error}",
                 confidence=0.0,
+                tokens=tokens,
             )
 
 
@@ -78,6 +90,7 @@ def _build_prompt(context: DriftContext) -> str:
         ],
         "recent_trajectory": trajectory,
         "latest_diff": context.diff,
+        "tokens_remaining": context.tokens_remaining,
     }
     return (
         "You are an independent progress judge for a long-horizon terminal agent. "

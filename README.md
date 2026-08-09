@@ -98,7 +98,9 @@ JSON-serializable agent state plus the observations used by the zero-token heuri
 The filesystem checkpoint store is deliberately separate from the agent so other
 backends (Docker, Harbor, cloud sandboxes) can implement the same interface.
 Local snapshots include Git metadata, tracked files, and untracked files so a restore
-returns both the worktree and repository state to the same point.
+returns both the worktree and repository state to the same point. Linked Git
+worktrees and submodules are rejected because their mutable Git state lives outside
+the workspace; use a self-contained clone for now. Snapshots are exact by default.
 
 ```python
 from pathlib import Path
@@ -116,6 +118,7 @@ snapshots = Path("/path/to/snapshots")  # must be outside workspace
 
 async def next_step(context):
     # Ask your agent for one action, execute it, and return its new state.
+    # Cap the provider request at context.tokens_remaining when it is not None.
     return StepOutcome(
         action="pytest -q",
         state={"messages": []},
@@ -143,6 +146,14 @@ ablation). Pass `CallableLLMJudge(async_completion_function)` to enable the two-
 mode. The callable owns its provider SDK and credentials; driftlock sends it the
 original goal, plan, recent trajectory, heuristic signals, and latest diff, and
 expects a structured JSON verdict.
+
+`RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
+receives `context.tokens_remaining` and must use it to cap the provider request, then
+report actual billed tokens in `StepOutcome.tokens`, including failed model calls.
+Unexpected adapter exceptions propagate because treating them as zero-token agent
+steps would corrupt compute-matched experiments. For fine judges, return
+`JudgeCompletion(text=..., tokens=...)` from the completion callback to include judge
+usage; returning a bare string is supported when usage is genuinely unavailable.
 
 Development uses Python 3.11+ and `uv`:
 

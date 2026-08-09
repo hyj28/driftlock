@@ -8,6 +8,7 @@ from driftlock.models import (
     Checkpoint,
     DriftContext,
     DriftSignal,
+    JudgeCompletion,
     StepOutcome,
     StepRecord,
     Verdict,
@@ -39,21 +40,26 @@ def _context() -> DriftContext:
         signals=(DriftSignal("no_file_change", "stalled"),),
         recent_steps=(step,),
         diff=step.outcome.diff,
+        tokens_remaining=500,
     )
 
 
 async def test_callable_llm_judge_builds_evidence_and_parses_json() -> None:
     received = ""
 
-    async def complete(prompt: str) -> str:
+    async def complete(prompt: str) -> JudgeCompletion:
         nonlocal received
         received = prompt
-        return '{"verdict":"drifted","reason":"off goal","confidence":0.9}'
+        return JudgeCompletion(
+            '{"verdict":"drifted","reason":"off goal","confidence":0.9}',
+            tokens=17,
+        )
 
     verdict = await CallableLLMJudge(complete).judge(_context())
 
     assert verdict.verdict is Verdict.DRIFTED
     assert verdict.confidence == 0.9
+    assert verdict.tokens == 17
     assert "fix the parser" in received
     assert "rewrite unrelated module" in received
 

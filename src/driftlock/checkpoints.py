@@ -41,6 +41,9 @@ class DirectoryCheckpointStore:
     The checkpoint store must live outside the workspace. Restores are performed by
     copying into a sibling staging directory and swapping directories, so a failed
     restore leaves either the old or restored workspace available.
+
+    By default snapshots are exact. Custom ``ignore`` patterns intentionally omit
+    matching paths, which means those paths will not exist after a restore.
     """
 
     def __init__(
@@ -48,7 +51,7 @@ class DirectoryCheckpointStore:
         workspace: Path | str,
         store_dir: Path | str,
         *,
-        ignore: tuple[str, ...] = (".driftlock", "__pycache__", "*.pyc"),
+        ignore: tuple[str, ...] = (),
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.store_dir = Path(store_dir).expanduser().resolve()
@@ -63,6 +66,12 @@ class DirectoryCheckpointStore:
             raise ValueError("filesystem root cannot be used as a workspace")
         if self.store_dir == self.workspace or self.workspace in self.store_dir.parents:
             raise ValueError("store_dir must be outside the workspace")
+        git_metadata = self.workspace / ".git"
+        if git_metadata.is_file() or git_metadata.is_symlink():
+            raise ValueError(
+                "linked Git worktrees and submodules are not supported because their "
+                "repository state lives outside the workspace"
+            )
 
     @property
     def checkpoints_dir(self) -> Path:
@@ -147,6 +156,11 @@ class DirectoryCheckpointStore:
         suffix = uuid.uuid4().hex
         staging = self.workspace.parent / f".{self.workspace.name}.restore-{suffix}"
         backup = self.workspace.parent / f".{self.workspace.name}.backup-{suffix}"
+        original_cwd = Path.cwd().resolve()
+        try:
+            relative_cwd: Path | None = original_cwd.relative_to(self.workspace)
+        except ValueError:
+            relative_cwd = None
         try:
             shutil.copytree(snapshot, staging, symlinks=True)
             self.workspace.rename(backup)
@@ -155,6 +169,9 @@ class DirectoryCheckpointStore:
             except BaseException:
                 backup.rename(self.workspace)
                 raise
+            if relative_cwd is not None:
+                restored_cwd = self.workspace / relative_cwd
+                os.chdir(restored_cwd if restored_cwd.is_dir() else self.workspace)
             shutil.rmtree(backup)
         finally:
             shutil.rmtree(staging, ignore_errors=True)

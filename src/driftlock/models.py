@@ -93,6 +93,7 @@ class StepContext:
     logical_step: int
     attempt: int
     rollback_feedback: str | None
+    tokens_remaining: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +106,19 @@ class DriftContext:
     signals: tuple[DriftSignal, ...]
     recent_steps: tuple[StepRecord, ...]
     diff: str
+    tokens_remaining: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeCompletion:
+    """Raw fine-judge text together with its billed token usage."""
+
+    text: str
+    tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.tokens < 0:
+            raise ValueError("tokens cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,10 +128,13 @@ class JudgeVerdict:
     verdict: Verdict
     reason: str
     confidence: float = 1.0
+    tokens: int = 0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0 and 1")
+        if self.tokens < 0:
+            raise ValueError("tokens cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,3 +157,5 @@ class RunResult:
     rollbacks: tuple[RollbackRecord, ...]
     checkpoints: tuple[Checkpoint, ...]
     tokens_used: int
+    agent_tokens_used: int
+    judge_tokens_used: int

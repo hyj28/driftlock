@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -76,3 +77,46 @@ def test_checkpoint_includes_repository_metadata(tmp_path: Path) -> None:
     assert (checkpoint.path / "workspace" / ".git" / "index").exists()
     assert (workspace / ".git" / "index").read_text(encoding="utf-8") == "metadata"
     assert (workspace / "tracked.txt").exists()
+
+
+def test_restore_rebases_process_cwd_into_restored_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    (nested / "file.txt").write_text("healthy", encoding="utf-8")
+    store = DirectoryCheckpointStore(workspace, tmp_path / "snapshots")
+    checkpoint = store.create({}, step=0)
+    original_cwd = Path.cwd()
+
+    try:
+        os.chdir(nested)
+        (nested / "file.txt").write_text("drifted", encoding="utf-8")
+        store.restore(checkpoint)
+
+        assert Path.cwd() == workspace / "nested"
+        assert Path("file.txt").read_text(encoding="utf-8") == "healthy"
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_default_snapshot_preserves_cache_and_untracked_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    cache = workspace / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "keep.dat").write_text("checkpointed", encoding="utf-8")
+    store = DirectoryCheckpointStore(workspace, tmp_path / "snapshots")
+    checkpoint = store.create({}, step=0)
+    (cache / "keep.dat").write_text("changed", encoding="utf-8")
+
+    store.restore(checkpoint)
+
+    assert (cache / "keep.dat").read_text(encoding="utf-8") == "checkpointed"
+
+
+def test_linked_git_worktree_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".git").write_text("gitdir: /outside/worktrees/one", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="linked Git worktrees"):
+        DirectoryCheckpointStore(workspace, tmp_path / "snapshots")
