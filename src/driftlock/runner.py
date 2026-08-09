@@ -75,7 +75,7 @@ class DriftlockRunner:
         plan: str = "",
     ) -> RunResult:
         state = dict(initial_state)
-        checkpoint = self.checkpoint_store.create(state, step=0, label="initial")
+        checkpoint = await self._create_checkpoint(state, step=0, label="initial")
         checkpoints = [checkpoint]
         checkpoint_lineage = [checkpoint]
         checkpoint_histories: dict[str, list[StepRecord]] = {
@@ -184,7 +184,7 @@ class DriftlockRunner:
                             judge_tokens_used,
                         )
                     checkpoint = rollback_checkpoint
-                    state = self.checkpoint_store.restore(checkpoint)
+                    state = await self._restore_checkpoint(checkpoint)
                     rollbacks.append(
                         RollbackRecord(
                             sequence=sequence,
@@ -227,7 +227,7 @@ class DriftlockRunner:
                 checkpoint_is_healthy
                 and logical_step - checkpoint.step >= self.config.checkpoint_interval
             ):
-                checkpoint = self.checkpoint_store.create(
+                checkpoint = await self._create_checkpoint(
                     state,
                     step=logical_step,
                     parent_id=checkpoint.checkpoint_id,
@@ -298,6 +298,30 @@ class DriftlockRunner:
             if checkpoint.step < suspicious_start
         ]
         return candidates[-1] if candidates else checkpoint_lineage[0]
+
+    async def _create_checkpoint(
+        self,
+        state: Mapping[str, Any],
+        *,
+        step: int,
+        parent_id: str | None = None,
+        label: str | None = None,
+    ) -> Checkpoint:
+        result = self.checkpoint_store.create(
+            state,
+            step=step,
+            parent_id=parent_id,
+            label=label,
+        )
+        if isinstance(result, Checkpoint):
+            return result
+        return await result
+
+    async def _restore_checkpoint(self, checkpoint: Checkpoint) -> dict[str, Any]:
+        result = self.checkpoint_store.restore(checkpoint)
+        if isinstance(result, dict):
+            return result
+        return await result
 
     @staticmethod
     def _result(

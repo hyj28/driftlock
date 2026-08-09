@@ -152,6 +152,29 @@ the runner selects the newest checkpoint from before the earliest triggered sign
 window, avoiding a superficially recent snapshot that already contains the loop,
 stall, or error spike.
 
+### Remote and Harbor environments
+
+`RemoteArchiveCheckpointStore` implements the same interface over the three methods
+Harbor environments already expose: `exec`, `upload_file`, and `download_file`.
+Archives and agent state are persisted on the host, while short-lived staging files
+are removed from the remote environment after each operation.
+
+```python
+from driftlock import RemoteArchiveCheckpointStore
+
+store = RemoteArchiveCheckpointStore(
+    harbor_environment,
+    remote_workspace="/app",
+    store_dir="./runs/checkpoints",  # keep outside agent-visible mounts
+    user="root",
+)
+```
+
+Restore replaces the workspace contents in place, preserving the directory inode so
+a paused tmux shell remains in a valid cwd. It first creates a remote backup and
+attempts to restore that backup if copying the staged snapshot fails. The configured
+workspace cannot be `/`, and the remote staging directory must be outside it.
+
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
 report actual billed tokens in `StepOutcome.tokens`, including failed model calls.
@@ -171,7 +194,7 @@ uv run ruff check .
 ## Repo layout
 
 ```
-src/driftlock/   # checkpoint store, judges, heuristics, runner
+src/driftlock/   # local/remote checkpoint stores, judges, heuristics, runner
 tests/           # unit and integration-style local tests
 PLAN.md          # full working plan, risk register, phase gates
 README.md        # this file

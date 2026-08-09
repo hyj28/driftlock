@@ -15,6 +15,7 @@ from driftlock.models import (
     StepOutcome,
     Verdict,
 )
+from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
 __all__ = [
@@ -28,6 +29,8 @@ __all__ = [
     "HeuristicJudge",
     "JudgeCompletion",
     "JudgeVerdict",
+    "RemoteArchiveCheckpointStore",
+    "RemoteCheckpointError",
     "RunResult",
     "RunStatus",
     "RunnerConfig",
