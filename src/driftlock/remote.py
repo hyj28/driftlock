@@ -216,6 +216,18 @@ class RemoteArchiveCheckpointStore:
         try:
             if self.before_restore is not None:
                 await self.before_restore(self._workspace_path)
+        except BaseException:
+            await self._best_effort_remove(
+                remote_archive,
+                remote_backup,
+                remote_staging,
+                remote_host_backup,
+                remote_recovery_staging,
+            )
+            local_recovery.unlink(missing_ok=True)
+            raise
+
+        try:
             await self._checked_exec(
                 self._apply_restore_script(staging=remote_staging),
                 operation="apply remote checkpoint restore",
@@ -231,13 +243,13 @@ class RemoteArchiveCheckpointStore:
             await self._best_effort_remove(
                 remote_archive,
                 remote_staging,
-                remote_host_backup,
                 remote_recovery_staging,
             )
             raise RemoteCheckpointError(
                 f"remote restore failed: {error}; {recovery_detail}; "
                 f"host recovery archive retained at {local_recovery}; "
-                f"remote recovery archive retained at {remote_backup}"
+                "remote recovery archives retained when present at "
+                f"{remote_backup} and {remote_host_backup}"
             ) from error
 
         await self._best_effort_remove(
@@ -274,7 +286,7 @@ rm -f -- {backup_q}
 mkdir -p -- {staging_q}
 tar -xzf {archive_q} -C {staging_q}
 tar -czf {backup_q} -C {workspace} .
-sha256sum {backup_q}
+sha256sum < {backup_q}
 """
         return "sh -ceu " + shlex.quote(script)
 
@@ -301,12 +313,11 @@ cp -a {staging_q}/. {workspace}/
     ) -> str:
         recovery_errors: list[str] = []
         try:
-            if await self._remote_sha256(remote_backup) != remote_backup_digest:
-                raise RemoteCheckpointError("remote recovery archive digest changed")
             await self._checked_exec(
                 self._exact_recovery_script(
                     archive=remote_backup,
                     staging=recovery_staging,
+                    expected_digest=remote_backup_digest,
                 ),
                 operation="recover failed restore from remote backup",
             )
@@ -316,12 +327,11 @@ cp -a {staging_q}/. {workspace}/
 
         try:
             await self.environment.upload_file(local_recovery, remote_host_backup)
-            if await self._remote_sha256(remote_host_backup) != remote_backup_digest:
-                raise RemoteCheckpointError("uploaded host backup digest changed")
             await self._checked_exec(
                 self._exact_recovery_script(
                     archive=remote_host_backup,
                     staging=recovery_staging,
+                    expected_digest=remote_backup_digest,
                 ),
                 operation="recover failed restore from host backup",
             )
@@ -330,28 +340,44 @@ cp -a {staging_q}/. {workspace}/
             recovery_errors.append(f"host backup: {recovery_error}")
         return "automatic exact recovery failed: " + "; ".join(recovery_errors)
 
-    def _exact_recovery_script(self, *, archive: str, staging: str) -> str:
+    def _exact_recovery_script(
+        self,
+        *,
+        archive: str,
+        staging: str,
+        expected_digest: str,
+    ) -> str:
         workspace = shlex.quote(self._workspace_path)
         archive_q = shlex.quote(archive)
         staging_q = shlex.quote(staging)
+        fifo_q = shlex.quote(staging + ".sha256-fifo")
+        digest_file_q = shlex.quote(staging + ".sha256-result")
+        expected_q = shlex.quote(expected_digest)
         clear_workspace = (
             f"find {workspace} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +"
         )
         script = f"""set -eu
 rm -rf -- {staging_q}
+rm -f -- {fifo_q} {digest_file_q}
+cleanup_digest_stream() {{ rm -f -- {fifo_q} {digest_file_q}; }}
+trap cleanup_digest_stream EXIT
+trap 'exit 1' HUP INT TERM
 mkdir -p -- {staging_q}
-tar -xzf {archive_q} -C {staging_q}
+mkfifo {fifo_q}
+sha256sum < {fifo_q} > {digest_file_q} &
+hash_pid=$!
+if tee {fifo_q} < {archive_q} | tar -xzf - -C {staging_q}; then
+    wait "$hash_pid"
+else
+    wait "$hash_pid" || true
+    exit 1
+fi
+read -r actual_digest _ < {digest_file_q}
+test "$actual_digest" = {expected_q}
 {clear_workspace}
 cp -a {staging_q}/. {workspace}/
 """
         return "sh -ceu " + shlex.quote(script)
-
-    async def _remote_sha256(self, path: str) -> str:
-        result = await self._checked_exec(
-            "sha256sum " + shlex.quote(path),
-            operation="verify remote recovery archive",
-        )
-        return _parse_sha256(result.stdout)
 
     async def _ensure_remote_paths_are_safe(self) -> None:
         if self._canonical_workspace is not None:
@@ -359,7 +385,10 @@ cp -a {staging_q}/. {workspace}/
         workspace = shlex.quote(self.remote_workspace)
         tmp_dir = shlex.quote(self.remote_tmp_dir)
         script = f"""set -eu
-for tool in sh tar find rm cp realpath sha256sum; do command -v "$tool" >/dev/null; done
+for tool in sh tar find rm cp realpath sha256sum mkfifo tee
+do
+    command -v "$tool" >/dev/null
+done
 test -d {workspace}
 test -d {tmp_dir}
 workspace_real=$(realpath -- {workspace})
@@ -472,6 +501,7 @@ def _file_digest(path: Path) -> str:
 
 def _parse_sha256(output: str | None) -> str:
     value = (output or "").strip().split(maxsplit=1)[0] if output else ""
+    value = value.removeprefix("\\")
     if len(value) != 64 or any(
         character not in "0123456789abcdef" for character in value
     ):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import shutil
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,6 +156,46 @@ class CorruptRemoteBackupFailureEnvironment(LocalRemoteEnvironment):
         )
 
 
+class FailedHostFallbackEnvironment(CorruptRemoteBackupFailureEnvironment):
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if "host-backup.tar.gz" in command and "cp -a" in command:
+            return LocalExecResult(1, "", "injected host fallback failure")
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+
+class ArchiveSwapAfterChecksumEnvironment(PartialApplyFailureEnvironment):
+    def __init__(self, workspace: Path, alternate_archive: Path) -> None:
+        super().__init__(workspace)
+        self.alternate_archive = alternate_archive
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        result = await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+        arguments = shlex.split(command)
+        if arguments[:1] == ["sha256sum"] and arguments[1].endswith("backup.tar.gz"):
+            shutil.copy2(self.alternate_archive, arguments[1])
+        return result
+
+
 def _remote_store(
     tmp_path: Path,
 ) -> tuple[Path, RemoteArchiveCheckpointStore]:
@@ -288,8 +330,74 @@ async def test_validated_host_copy_recovers_when_remote_backup_is_corrupt(
 
     assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
     remaining = list(remote_tmp.iterdir())
-    assert len(remaining) == 1
-    assert remaining[0].name.endswith("backup.tar.gz")
+    assert len(remaining) == 2
+    assert (
+        sum(
+            path.name.endswith("backup.tar.gz")
+            and not path.name.endswith("host-backup.tar.gz")
+            for path in remaining
+        )
+        == 1
+    )
+    assert sum(path.name.endswith("host-backup.tar.gz") for path in remaining) == 1
+
+
+async def test_failed_host_fallback_retains_uploaded_verified_archive(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = FailedHostFallbackEnvironment(workspace, remote_tmp)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="automatic exact recovery failed"):
+        await store.restore(checkpoint)
+
+    retained_host_backups = list(remote_tmp.glob("*host-backup.tar.gz"))
+    assert len(retained_host_backups) == 1
+    assert retained_host_backups[0].stat().st_size > 0
+    assert not list(remote_tmp.glob("*recovery-staging*"))
+
+
+async def test_recovery_hashes_the_same_archive_stream_that_it_extracts(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    alternate = tmp_path / "alternate"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    alternate.mkdir()
+    (alternate / "attacker.txt").write_text("swapped", encoding="utf-8")
+    alternate_archive = tmp_path / "alternate.tar.gz"
+    with tarfile.open(alternate_archive, "w:gz") as archive:
+        archive.add(alternate, arcname=".")
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = ArchiveSwapAfterChecksumEnvironment(workspace, alternate_archive)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="exact pre-restore workspace"):
+        await store.restore(checkpoint)
+
+    assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
+    assert not (workspace / "attacker.txt").exists()
 
 
 async def test_remote_path_validation_rejects_symlink_alias_inside_workspace(
@@ -405,6 +513,60 @@ async def test_before_restore_hook_receives_canonical_workspace(tmp_path: Path) 
     await store.restore(checkpoint)
 
     assert called_with == [str(workspace.resolve())]
+
+
+async def test_before_restore_failure_does_not_rebuild_workspace_children(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    child = workspace / "child"
+    child.mkdir(parents=True)
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+
+    async def before_restore(_canonical_workspace: str) -> None:
+        raise RuntimeError("tmux evacuation failed")
+
+    store = RemoteArchiveCheckpointStore(
+        LocalRemoteEnvironment(),
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+        before_restore=before_restore,
+    )
+    (child / "state.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    (child / "state.txt").write_text("live", encoding="utf-8")
+    child_inode = child.stat().st_ino
+
+    with pytest.raises(RuntimeError, match="tmux evacuation failed"):
+        await store.restore(checkpoint)
+
+    assert child.stat().st_ino == child_inode
+    assert (child / "state.txt").read_text(encoding="utf-8") == "live"
+    assert not any(remote_tmp.iterdir())
+    assert not list((tmp_path / "host" / "recovery").glob("*.tar.gz"))
+
+
+async def test_restore_supports_backslash_in_remote_temp_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote\\tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    store = RemoteArchiveCheckpointStore(
+        LocalRemoteEnvironment(),
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    (workspace / "state.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    (workspace / "state.txt").write_text("live", encoding="utf-8")
+
+    await store.restore(checkpoint)
+
+    assert (workspace / "state.txt").read_text(encoding="utf-8") == "checkpoint"
+    assert not any(remote_tmp.iterdir())
 
 
 def test_remote_temp_directory_must_be_outside_workspace(tmp_path: Path) -> None:
