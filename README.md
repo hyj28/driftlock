@@ -94,7 +94,7 @@ nobody can solve provide no headroom to measure against.
 ## Repo layout
 
 ```
-PLAN.md     # full working plan, risk register, phase gates (Chinese)
+PLAN.md     # full working plan, risk register, phase gates
 README.md   # this file
 ```
 

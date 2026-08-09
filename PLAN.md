@@ -1,197 +1,250 @@
-# driftlock — 项目计划
+# driftlock — Project Plan
 
-> 长程 agent 的检查点 + 进度感知回滚层。
-> 本文档是工作计划，随进展更新。公开面向的介绍见 `README.md`。
+> A checkpoint-and-rollback layer for long-horizon agents.
+> This is the working plan and gets updated as the project moves. For the
+> public-facing introduction, see `README.md`.
 
-**最后更新**：2026-08-09
-
----
-
-## 1. 一句话主张
-
-同样的模型、同样的算力预算，加一层检查点 + 进度感知回滚，把长程终端任务的成功率从 X% 提到 Y%——并且能说清天花板在哪。
-
-（X / Y 是待测量的占位符，实验出结果前不填。）
+**Last updated:** 2026-08-09
 
 ---
 
-## 2. 为什么做这个
+## 1. The claim, in one sentence
 
-### 2.1 赛道选择
+Same model, same compute budget — add a layer of checkpointing and progress-aware
+rollback and long-horizon terminal task success goes from X% to Y%, with a clear
+account of where the ceiling is.
 
-2026 上半年 17 万篇 AI 论文的统计显示，**长程规划（long-horizon planning）是增长最快的单一话题**：提及数从 264 涨到 1,611（+510%）。体量最大的是 agentic workflows（4,585 → 10,496）。更关键的结论是：agent 的**专项组件**正以整体赛道 2–5 倍的速度增长——领域已经从"能不能造 agent"翻篇到"怎么让 agent 规划、用工具、评判自己的输出"。
-
-结论：**值钱的是组件层，不是又一个通用 agent。**
-
-### 2.2 为什么不做"自进化 / 自写 skill"
-
-那条线在 2026 上半年已经极度拥挤：SkillFoundry、SkillOpt、SkillComposer、SkillGen、SkillDAG、SkillX、SkillRL、EvoSkills、Trace2Skill、SkillWeaver、AutoSkill……半年十几篇，甚至已有专门基准 SkillResolve-Bench。走 happy path 会被一句"这和 SkillX 有什么区别"问死。
-
-### 2.3 为什么攻击"目标漂移"
-
-- **工业界公认是痛点、学术侧解法薄。** 搜索结果里主要是工程博客和 playbook（Wire、NxCode、Redis、digitalapplied 的回滚模式参考），arxiv 论文密度远低于 skill 那条线。
-- **已有可直接沿用的度量。** ICLR 2026 的 *Asymmetric Goal Drift in Coding Agents* 已把目标漂移形式化，给出 `GD_actions`（做了不该做的）与 `GD_inaction`（该做的没做），并有配套压测 repo [jhammant/agent-drift](https://github.com/jhammant/agent-drift)。**沿用已发表指标，数字才有人信。**
-- **有可攻击的定量规律。** 任务时长翻倍，失败率翻四倍。能把这条曲线压平一点，就是极干净的结论。
-- **有清晰的能力鸿沟。** 人类专家 4 分钟内能做完的任务，前沿模型接近 100% 成功；人类要 4 小时以上的，成功率不到 10%。
-
-### 2.4 公认的三个长程失败模式
-
-1. **上下文腐化** —— 历史越长，有用信息越难被检索到；跨过某个利用率阈值后性能断崖下跌。对前沿模型和小模型一视同仁（Claude Sonnet 4、GPT-4.1、Qwen3-32B、Gemini 2.5 Flash 均随输入 token 增长而退化）。
-2. **误差累积与目标漂移** ← **本项目攻击的目标**
-3. 上述二者的交互
+(X / Y are placeholders. They stay unfilled until measured.)
 
 ---
 
-## 3. 技术方案
+## 2. Why this project
 
-### 3.1 核心机制：检查点 + 进度感知回滚
+### 2.1 Choosing the track
 
-把文件系统状态（Docker 层 + git）和 agent 状态一起做快照；一个独立判别器周期性地问"当前状态还值不值得继续"，不值就回滚到最近的健康检查点重试。
+An analysis of ~170,000 AI papers from H1 2026 found that **long-horizon planning is
+the single fastest-growing topic**: mentions went from 264 to 1,611 (+510%). The
+largest by volume is agentic workflows (4,585 → 10,496). The more useful finding:
+**specialized agent components are growing two to five times faster** than the broader
+agentic-workflows category — the field has moved past "can we build agents?" to "how
+do we make agents plan, use tools, and judge their own output?"
 
-### 3.2 判别器：两级结构
+Conclusion: **the component layer is what's valuable, not another general-purpose agent.**
 
-| 层 | 做什么 | 成本 |
-|---|---|---|
-| **一级：启发式粗筛** | N 步无文件变更、动作循环、报错率突增、reward 停滞 | 零 token |
-| **二级：LLM 精判** | 粗筛触发后，把（原始目标 + 当前计划 + 最近轨迹 + 文件 diff）交给便宜模型判断语义漂移 | DeepSeek V4-Flash，可忽略 |
+### 2.2 Why not self-evolving agents / skill synthesis
 
-这个结构的额外好处：**启发式 / 纯 LLM / 两级 天然就是三个消融组**，实验设计不用另想。
+That line got extremely crowded in H1 2026: SkillFoundry, SkillOpt, SkillComposer,
+SkillGen, SkillDAG, SkillX, SkillRL, EvoSkills, Trace2Skill, SkillWeaver, AutoSkill,
+and more — a dozen-plus papers in six months, plus a dedicated benchmark
+(SkillResolve-Bench) for the second-order problem of skill-retrieval ambiguity.
+Walking the happy path there invites one fatal question: *"how is this different from
+SkillX?"*
 
-### 3.3 必须回答的杀手锏问题
+### 2.3 Why goal drift is the right target
 
-> "你这套检查点回滚，跟失败了重跑一遍有什么区别？是不是就是多花算力换成功率？"
+- **Industry treats it as a real pain point; the academic side is thin.** Search
+  turns up mostly engineering blogs and playbooks (Wire, NxCode, Redis,
+  digitalapplied's rollback-patterns reference) rather than the arXiv density seen in
+  the skill-synthesis space.
+- **Published metrics already exist.** *Asymmetric Goal Drift in Coding Agents*
+  (ICLR 2026) formalized goal drift with `GD_actions` (drift through commission) and
+  `GD_inaction` (drift through omission), with a companion stress-test repo,
+  [jhammant/agent-drift](https://github.com/jhammant/agent-drift). **Adopting published
+  metrics is what makes the numbers credible** — inventing our own would not.
+- **There's a quantitative law to attack.** Doubling a task's duration roughly
+  quadruples its failure rate. Flattening that curve even slightly is a clean result.
+- **The capability gap is stark.** Frontier models solve close to 100% of tasks a
+  human expert finishes in under four minutes, and under 10% of tasks taking a human
+  more than four hours.
 
-答案必须是：**判别器能在任务失败之前就识别出轨迹已经坏了**——早停 + 精准回滚到最后一个健康点，而不是全盘重来。因此**判别器的质量就是项目的质量**，也因此需要下面的等算力对照组。
+### 2.4 The three recognized long-horizon failure modes
 
----
-
-## 4. 实验设计
-
-### 4.1 基准
-
-**LHTB（Long-Horizon Terminal-Bench）子集**，[repo](https://github.com/zli12321/LHTB) / [数据集](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench)。
-
-关键事实（用于成本与时间估算）：
-
-| 项 | 数值 |
-|---|---|
-| 全量规模 | 46 题 / 9 类 |
-| 单任务 token | 约 990 万（平均 231 步，范围 120–320 步） |
-| 单任务耗时 | 平均 69–93 分钟，预算上限 90 分钟 |
-| 单模型跑完全套墙钟 | 53–71 小时 |
-| 评分 | 连续 reward 0–1（含部分分），≥0.95 记为 solved |
-| 验证 | 隐藏验证器 + 确定性重放 + 固定种子 |
-| 最佳成绩 | Grok 4.5 平均 reward 0.505，46 题解出 13 题 |
-| 无人解出 | 29/46；782 次运行里仅 7% 达到 solved |
-| 成本参考 | MiniMax M3 $6.13/任务；Claude 系 $38–73/任务 |
-
-**取 8–12 题子集**，按第 1 周实测的部分分挑选——必须避开 29 道无人解出的题（只会给地板效应）。保留官方 harness 与隐藏验证器，数字可对标榜单。
-
-任务结构标准化，五件套：`task.toml` / `instruction.md` / `environment/` / `tests/` / `solution/`。
-
-### 4.2 四组对照
-
-| 组 | 作用 |
-|---|---|
-| 1. 无干预基线 | 参照系 |
-| 2. **等算力朴素重试** | 给 baseline 同样的 token 预算去盲重试——**一拳打死"你只是多花算力"** |
-| 3. 检查点 + 回滚（本方法） | 主张 |
-| 4. **预言机上界** | 用事后上帝视角的完美判别器测天花板——说明判别器还差多少 |
-
-### 4.3 指标
-
-- 成功率（LHTB 连续 reward，含部分分）
-- `GD_actions` / `GD_inaction`（沿用 ICLR 2026 定义）
-- 每任务 token 成本
-- **任务时长 vs 失败率曲线的斜率**（能压平这条曲线是最强结论）
+1. **Context rot** — as history grows, relevant information becomes harder to
+   retrieve, and performance falls off sharply once context utilization crosses a
+   critical threshold. This hits frontier and small models alike (Claude Sonnet 4,
+   GPT-4.1, Qwen3-32B, and Gemini 2.5 Flash all degrade as input tokens grow).
+2. **Compounding error and goal drift** ← **what this project attacks**
+3. The interaction between the two
 
 ---
 
-## 5. 环境与成本
+## 3. Technical approach
 
-### 5.1 计算宿主：便宜 x86 云主机
+### 3.1 Core mechanism: checkpoints + progress-aware rollback
 
-**原因**：LHTB 镜像基本都是 amd64-only，官方要求 Apple Silicon 用户设 `DOCKER_DEFAULT_PLATFORM=linux/amd64`，即走模拟。本地 M4 Air（24GB、无风扇）整夜满载会严重降频，且部分镜像可能直接跑不起来。
+Snapshot filesystem state (Docker layers + git) together with agent state. An
+independent judge periodically asks whether the current state is still a sound basis
+for continuing. If not, roll back to the most recent healthy checkpoint and retry
+from there.
 
-**分工**：本机写代码 + 分析数据；云主机跑实验。
+### 3.2 The judge: two tiers
 
-### 5.2 模型
+| Tier | What it does | Cost |
+| --- | --- | --- |
+| **Coarse — heuristics** | No file changes for N steps, action loops, error-rate spikes, reward stalls | Zero tokens |
+| **Fine — LLM** | Once the coarse tier fires, hand (original goal + current plan + recent trajectory + file diff) to a cheap model to judge semantic drift | DeepSeek V4-Flash; negligible |
 
-| 用途 | 模型 | 价格（每百万 token） |
-|---|---|---|
-| agent 主体 | DeepSeek **V4-Pro** | 输入 $0.435 / 缓存命中 $0.003625 / 输出 $0.87 |
-| LLM 判别器 | DeepSeek **V4-Flash** | 输入 $0.14 / 缓存命中 $0.0028 / 输出 $0.28 |
+A useful side effect of this structure: **heuristics-only / LLM-only / two-tier are
+three ready-made ablation arms.** The experiment design falls out of the architecture.
 
-**缓存命中价便宜 50–120 倍，这对本项目是决定性的**——agent 循环每步都在重发几乎相同的历史，缓存命中率天然极高。
+### 3.3 The question this has to survive
 
-### 5.3 预算（$100 硬约束）
+> *"How is checkpoint-and-rollback different from just retrying on failure? Aren't you
+> buying success rate with extra compute?"*
 
-按 12 题 × 4 组、缓存命中率约 90% 估算：
-
-- 输入约 4.76 亿 token：10% 未命中 ≈ $20.7 + 90% 命中 ≈ $1.6
-- 输出约 1,200 万 token ≈ $10.4
-- **一轮完整四组实验 ≈ $33**
-
-加上云主机两三个月 $30–45，**$100 只够 1–2 轮完整实验 + 开发期零散调试**。
-
-**对策：先用 8 道题起步**，把第一轮压到 $20 出头，留出改判别器再跑第二轮的余量。结论稳了再扩到 12 题。
-
----
-
-## 6. 阶段与卡点
-
-| 阶段 | 内容 | 卡点（不过就调整方案） |
-|---|---|---|
-| **第 1 周** | 云主机搭起来，跑通 2 道原版 LHTB 题；用 V4-Pro 跑约 20 道题筛选，按**实测部分分**挑子集 | 若 V4-Pro 在所有题上都接近零分 → 地板效应，必须换更强模型或更简单的题 |
-| **第 2–3 周** | fork Harbor，插入检查点 / 快照 / 回滚骨架；先做纯启发式判别器 | 若 fork 改不动 → 退回 AgentCE-Bench |
-| **第 4–5 周** | 加 LLM 精判层；跑第一轮完整四组 | 若本方法打不过等算力重试 → 立刻改判别器，别硬跑 |
-| **第 6–7 周** | 消融实验、失败案例分析、预言机上界 | — |
-| **第 8 周** | 开源库打包（pip 可装、一键复现脚本）+ 技术博客 | — |
+The answer has to be: **the judge detects a broken trajectory before the task fails** —
+early stop plus precise rollback to the last healthy point, not a blind restart.
+Which means **the judge's quality is the project's quality**, and which is why the
+compute-matched control arm below is non-negotiable.
 
 ---
 
-## 7. 风险登记
+## 4. Experiment design
 
-| # | 风险 | 影响 | 缓解 |
-|---|---|---|---|
-| 1 | **地板效应**：V4-Pro 太弱，改进空间被压死 | 项目无结论 | 第 1 周按实测部分分筛题；备选换更强模型 |
-| 2 | **fork harness 工程量被低估**：Harbor / Terminus-2 无 agent 插件接口，回滚层要硬插进别人的循环 | 进度延后 2+ 周 | 第 2 周结束设卡点；备选 AgentCE-Bench |
-| 3 | **判别器不够准**：判断与随机无异，四组曲线重叠 | 项目无结论 | 预言机组提前暴露该问题 |
-| 4 | **amd64 模拟**：镜像跑不起来或过慢 | 无法迭代 | 已改用 x86 云主机规避；第 1 周先验证 |
-| 5 | **墙钟时间**：12 题 × 4 组 = 48 次运行 × 上限 90 分钟 | 一天一轮实验 | 云主机并行；必要时缩到 8 题 |
-| 6 | **预算超支**：一轮 $33，只够 1–2 轮 | 无法迭代 | 8 题起步；开发期用 V4-Flash |
+### 4.1 Benchmark
+
+**A subset of LHTB (Long-Horizon Terminal-Bench)** —
+[repo](https://github.com/zli12321/LHTB) ·
+[dataset](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench).
+
+Key facts driving cost and schedule estimates:
+
+| Item | Value |
+| --- | --- |
+| Full suite | 46 tasks across 9 categories |
+| Tokens per task | ~9.9M (231 steps average; 120–320 range) |
+| Time per task | 69–93 min average, 90 min budget cap |
+| Wall-clock for a full single-model run | 53–71 hours |
+| Scoring | Continuous reward 0–1 with partial credit; ≥0.95 counts as solved |
+| Verification | Hidden verifiers, deterministic replay, seeded environments |
+| Best result to date | Grok 4.5, mean reward 0.505, 13 of 46 solved |
+| Unsolved | 29/46; only 7% of 782 runs reached solve status |
+| Cost reference | MiniMax M3 $6.13/task; Claude models $38–73/task |
+
+**Use an 8–12 task subset**, selected by *measured* partial credit in week 1. The 29
+tasks nobody has solved must be excluded — they offer no headroom, only a floor effect.
+The official harness and hidden verifiers stay intact so numbers remain comparable to
+the public leaderboard.
+
+Task structure is standardized as five files:
+`task.toml` / `instruction.md` / `environment/` / `tests/` / `solution/`.
+
+### 4.2 Four arms
+
+| Arm | Purpose |
+| --- | --- |
+| 1. No intervention | Reference point |
+| 2. **Compute-matched retry** | Same token budget, spent on blind retries — **kills the "you just spent more compute" objection** |
+| 3. **driftlock** (checkpoint + rollback) | The claim |
+| 4. **Oracle upper bound** | A hindsight-perfect judge — shows how much headroom the real judge leaves on the table |
+
+### 4.3 Metrics
+
+- Success rate (LHTB continuous reward, partial credit included)
+- `GD_actions` / `GD_inaction` (adopted from the ICLR 2026 definitions)
+- Token cost per task
+- **Slope of the task-length vs. failure-rate curve** — flattening this is the
+  strongest result available
 
 ---
 
-## 8. 交付物
+## 5. Environment and cost
 
-1. **开源库** —— 能被别人套到自己 agent 上的回滚中间层：pip 可装、有 README、有一键复现脚本
-2. **深度技术博客** —— 四组曲线 + 失败案例分析 + 判别器设计取舍
+### 5.1 Compute host: a cheap x86 cloud box
+
+**Why:** LHTB images are essentially amd64-only — the docs instruct Apple Silicon
+users to set `DOCKER_DEFAULT_PLATFORM=linux/amd64`, i.e. run under emulation. The
+local M4 Air (24 GB, fanless) throttles hard under an overnight full-load run, and
+some images may not run at all.
+
+**Split:** write code and analyze data locally; run experiments on the cloud box.
+
+### 5.2 Models
+
+| Role | Model | Price per 1M tokens |
+| --- | --- | --- |
+| Agent | DeepSeek **V4-Pro** | $0.435 in / $0.003625 cache hit / $0.87 out |
+| LLM judge | DeepSeek **V4-Flash** | $0.14 in / $0.0028 cache hit / $0.28 out |
+
+**Cache-hit pricing is 50–120× cheaper, which is decisive here** — an agent loop
+re-sends a nearly identical history every step, so the cache hit rate is naturally
+very high.
+
+### 5.3 Budget (hard $100 constraint)
+
+Estimating 12 tasks × 4 arms at a ~90% cache hit rate:
+
+- ~476M input tokens: 10% miss ≈ $20.7 + 90% hit ≈ $1.6
+- ~12M output tokens ≈ $10.4
+- **≈ $33 for one complete four-arm round**
+
+Plus $30–45 for two to three months of the cloud box, **$100 covers 1–2 complete
+rounds plus scattered development runs.**
+
+**Mitigation: start with 8 tasks**, bringing the first round to just over $20 and
+leaving room to revise the judge and run a second round. Expand to 12 once the
+result is stable.
 
 ---
 
-## 9. 关键参考
+## 6. Phases and gates
 
-**基准与 harness**
-- [LHTB — Long-Horizon Terminal-Bench](https://zli12321.github.io/LHTB/) · [GitHub](https://github.com/zli12321/LHTB) · [HF 数据集](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench)
-- [AgentCE-Bench](https://arxiv.org/pdf/2604.06111) —— 备选：horizon 可调、轻量环境
-- [LOCA-bench](https://arxiv.org/pdf/2602.07962) —— 可控的极端上下文增长
+| Phase | Work | Gate (fail → change the plan) |
+| --- | --- | --- |
+| **Week 1** | Stand up the cloud box, run 2 stock LHTB tasks end to end; screen ~20 tasks with V4-Pro and pick the subset by **measured partial credit** | If V4-Pro scores near zero on everything → floor effect; switch to a stronger model or easier tasks |
+| **Weeks 2–3** | Fork Harbor, insert the checkpoint / snapshot / rollback skeleton; heuristics-only judge first | If the fork proves intractable → fall back to AgentCE-Bench |
+| **Weeks 4–5** | Add the LLM judge tier; run the first complete four-arm round | If driftlock doesn't beat compute-matched retry → fix the judge immediately, don't keep running |
+| **Weeks 6–7** | Ablations, failure-case analysis, oracle upper bound | — |
+| **Week 8** | Package the library (pip-installable, one-command repro script) + technical blog post | — |
+
+---
+
+## 7. Risk register
+
+| # | Risk | Impact | Mitigation |
+| --- | --- | --- | --- |
+| 1 | **Floor effect** — V4-Pro too weak, no headroom to improve | No result | Week-1 screening by measured partial credit; fall back to a stronger model |
+| 2 | **Harness fork underestimated** — Harbor / Terminus-2 expose no agent plugin interface, so the rollback layer must be wedged into someone else's loop | 2+ week slip | Gate at end of week 2; fall back to AgentCE-Bench |
+| 3 | **Judge isn't accurate enough** — decisions no better than random, all four curves overlap | No result | The oracle arm surfaces this early |
+| 4 | **amd64 emulation** — images fail or run too slowly | Can't iterate | Already avoided via the x86 cloud box; verify in week 1 |
+| 5 | **Wall-clock** — 12 tasks × 4 arms = 48 runs × 90 min cap | One experiment round per day | Parallelize on the cloud box; drop to 8 tasks if needed |
+| 6 | **Budget overrun** — $33/round only covers 1–2 rounds | Can't iterate | Start at 8 tasks; use V4-Flash during development |
+
+---
+
+## 8. Deliverables
+
+1. **Open-source library** — a rollback middle layer others can wrap around their own
+   agent loop: pip-installable, documented, with a one-command reproduction script
+2. **Technical blog post** — the four curves, failure-case analysis, and the design
+   tradeoffs behind the judge
+
+---
+
+## 9. Key references
+
+**Benchmarks and harnesses**
+- [LHTB — Long-Horizon Terminal-Bench](https://zli12321.github.io/LHTB/) ·
+  [GitHub](https://github.com/zli12321/LHTB) ·
+  [HF dataset](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench)
+- [AgentCE-Bench](https://arxiv.org/pdf/2604.06111) — fallback: tunable horizon, lightweight environments
+- [LOCA-bench](https://arxiv.org/pdf/2602.07962) — controllable, extreme context growth
 - [LongHorizon-Harness](https://arxiv.org/html/2608.01964)
 
-**失败模式与度量**
-- [Beyond the Leaderboard: 工具使用、规划与推理失败综述](https://arxiv.org/pdf/2607.05775)
+**Failure modes and metrics**
+- [Beyond the Leaderboard: tool-use, planning, and reasoning failures](https://arxiv.org/pdf/2607.05775)
 - [The Long-Horizon Task Mirage?](https://arxiv.org/html/2604.11978v1)
-- *Asymmetric Goal Drift in Coding Agents*（ICLR 2026）—— `GD_actions` / `GD_inaction` 来源
-- [jhammant/agent-drift](https://github.com/jhammant/agent-drift) —— 漂移压测
+- *Asymmetric Goal Drift in Coding Agents* (ICLR 2026) — source of `GD_actions` / `GD_inaction`
+- [jhammant/agent-drift](https://github.com/jhammant/agent-drift) — drift stress-testing
 
-**工程参考**
+**Engineering references**
 - [Agent Rollback and Checkpoint Patterns](https://www.digitalapplied.com/blog/agent-rollback-checkpoint-patterns-2026-engineering-reference)
 - [Agent drift: why long-running AI agents lose the plot](https://usewire.io/blog/agent-drift-why-long-running-ai-agents-lose-the-plot/)
 - [Long-Horizon Agent Trajectory Governance Playbook](https://www.nxcode.io/resources/news/long-horizon-agent-trajectory-governance-playbook-2026)
 
-**相邻工作（注意区分边界）**
-- [Self-Compacting Language Model Agents](https://arxiv.org/pdf/2606.23525) —— 上下文压缩方向
+**Adjacent work (worth keeping the boundary clear)**
+- [Self-Compacting Language Model Agents](https://arxiv.org/pdf/2606.23525) — the context-compaction direction
 - [A Survey of Self-Evolving Agents](https://arxiv.org/abs/2507.21046)
 
-**定价**
-- [DeepSeek 官方定价](https://deepseek.ai/pricing) · [汇总](https://benchlm.ai/deepseek/api-pricing)
+**Pricing**
+- [DeepSeek official pricing](https://deepseek.ai/pricing) · [summary](https://benchlm.ai/deepseek/api-pricing)
