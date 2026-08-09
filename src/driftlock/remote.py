@@ -363,10 +363,11 @@ cleanup_digest_stream() {{ rm -f -- {fifo_q} {digest_file_q}; }}
 trap cleanup_digest_stream EXIT
 trap 'exit 1' HUP INT TERM
 mkdir -p -- {staging_q}
+exec 3< {archive_q}
 mkfifo {fifo_q}
 sha256sum < {fifo_q} > {digest_file_q} &
 hash_pid=$!
-if tee {fifo_q} < {archive_q} | tar -xzf - -C {staging_q}; then
+if tee {fifo_q} <&3 | tar -xzf - -C {staging_q}; then
     wait "$hash_pid"
 else
     wait "$hash_pid" || true

@@ -156,6 +156,28 @@ class CorruptRemoteBackupFailureEnvironment(LocalRemoteEnvironment):
         )
 
 
+class MissingRemoteBackupFailureEnvironment(PartialApplyFailureEnvironment):
+    def __init__(self, workspace: Path, remote_tmp: Path) -> None:
+        super().__init__(workspace)
+        self.remote_tmp = remote_tmp
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if "cp -a" in command and not self.failed_once:
+            for backup in self.remote_tmp.glob("*backup.tar.gz"):
+                backup.unlink()
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+
 class FailedHostFallbackEnvironment(CorruptRemoteBackupFailureEnvironment):
     async def exec(
         self,
@@ -174,9 +196,16 @@ class FailedHostFallbackEnvironment(CorruptRemoteBackupFailureEnvironment):
 
 
 class ArchiveSwapAfterChecksumEnvironment(PartialApplyFailureEnvironment):
-    def __init__(self, workspace: Path, alternate_archive: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        remote_tmp: Path,
+        alternate_archive: Path,
+    ) -> None:
         super().__init__(workspace)
+        self.remote_tmp = remote_tmp
         self.alternate_archive = alternate_archive
+        self.swap_fired = False
 
     async def exec(
         self,
@@ -185,14 +214,34 @@ class ArchiveSwapAfterChecksumEnvironment(PartialApplyFailureEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> LocalExecResult:
+        arguments = shlex.split(command)
+        streamed_recovery = (
+            arguments[:2] == ["sh", "-ceu"]
+            and "recovery-staging" in arguments[2]
+            and "host-backup.tar.gz" not in arguments[2]
+        )
+        if streamed_recovery and not self.swap_fired:
+            remote_backups = [
+                path
+                for path in self.remote_tmp.glob("*backup.tar.gz")
+                if not path.name.endswith("host-backup.tar.gz")
+            ]
+            assert len(remote_backups) == 1
+            shutil.copy2(self.alternate_archive, remote_backups[0])
+            self.swap_fired = True
+
         result = await super().exec(
             command,
             timeout_sec=timeout_sec,
             user=user,
         )
-        arguments = shlex.split(command)
-        if arguments[:1] == ["sha256sum"] and arguments[1].endswith("backup.tar.gz"):
+        if (
+            arguments[:1] == ["sha256sum"]
+            and arguments[1].endswith("backup.tar.gz")
+            and not self.swap_fired
+        ):
             shutil.copy2(self.alternate_archive, arguments[1])
+            self.swap_fired = True
         return result
 
 
@@ -342,6 +391,31 @@ async def test_validated_host_copy_recovers_when_remote_backup_is_corrupt(
     assert sum(path.name.endswith("host-backup.tar.gz") for path in remaining) == 1
 
 
+async def test_missing_remote_backup_falls_back_without_fifo_deadlock(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = MissingRemoteBackupFailureEnvironment(workspace, remote_tmp)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+        timeout_sec=30,
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="host copy"):
+        await asyncio.wait_for(store.restore(checkpoint), timeout=2)
+
+    assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
+
+
 async def test_failed_host_fallback_retains_uploaded_verified_archive(
     tmp_path: Path,
 ) -> None:
@@ -383,7 +457,11 @@ async def test_recovery_hashes_the_same_archive_stream_that_it_extracts(
     with tarfile.open(alternate_archive, "w:gz") as archive:
         archive.add(alternate, arcname=".")
     (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
-    environment = ArchiveSwapAfterChecksumEnvironment(workspace, alternate_archive)
+    environment = ArchiveSwapAfterChecksumEnvironment(
+        workspace,
+        remote_tmp,
+        alternate_archive,
+    )
     store = RemoteArchiveCheckpointStore(
         environment,
         str(workspace),
@@ -398,6 +476,7 @@ async def test_recovery_hashes_the_same_archive_stream_that_it_extracts(
 
     assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
     assert not (workspace / "attacker.txt").exists()
+    assert environment.swap_fired
 
 
 async def test_remote_path_validation_rejects_symlink_alias_inside_workspace(
