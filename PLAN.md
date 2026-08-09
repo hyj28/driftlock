@@ -13,7 +13,8 @@
   reward-stall heuristics; optional structured LLM judge; shared agent/judge token
   accounting and step/rollback budgets; signal-window-aware rollback selection;
   sync/async checkpoint backends; host-side archive snapshots for Harbor-compatible
-  remote environments; unit tests.
+  POSIX remote environments with canonical-path validation and retained recovery
+  archives; unit tests.
 - **Next:** add the Terminus-2 conversation-state codec and checkpoint-boundary agent
   adapter, then run the week-1 LHTB smoke tests before selecting experiment tasks.
 

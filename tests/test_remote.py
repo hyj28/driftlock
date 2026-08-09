@@ -17,8 +17,8 @@ from driftlock.runner import DriftlockRunner, RunnerConfig
 @dataclass
 class LocalExecResult:
     return_code: int
-    stdout: str
-    stderr: str
+    stdout: str | None
+    stderr: str | None
 
 
 class LocalRemoteEnvironment:
@@ -50,6 +50,65 @@ class LocalRemoteEnvironment:
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         shutil.copy2(source_path, target_path)
+
+
+class PartialApplyFailureEnvironment(LocalRemoteEnvironment):
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if "cp -a" in command:
+            (self.workspace / "important.txt").unlink(missing_ok=True)
+            return LocalExecResult(1, "", "injected copy failure")
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+
+class CleanupFailureEnvironment(LocalRemoteEnvironment):
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if command.startswith("rm -rf --") and "driftlock-" in command:
+            return LocalExecResult(1, "", "injected cleanup failure")
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+
+class CancelApplyEnvironment(LocalRemoteEnvironment):
+    def __init__(self) -> None:
+        self.apply_started = asyncio.Event()
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if "cp -a" in command:
+            self.apply_started.set()
+            await asyncio.Future()
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
 
 
 def _remote_store(
@@ -107,8 +166,147 @@ async def test_remote_store_reports_archive_command_failure(tmp_path: Path) -> N
     workspace, store = _remote_store(tmp_path)
     workspace.rmdir()
 
-    with pytest.raises(RemoteCheckpointError, match="create remote archive"):
+    with pytest.raises(RemoteCheckpointError, match="validate remote checkpoint"):
         await store.create({}, step=0)
+
+
+async def test_failed_restore_recovers_and_retains_host_backup(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = PartialApplyFailureEnvironment(workspace)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="recovery archive retained"):
+        await store.restore(checkpoint)
+
+    assert (workspace / "important.txt").read_text(encoding="utf-8") == "before-restore"
+    assert list((tmp_path / "host" / "recovery").glob("*.tar.gz"))
+    assert list(remote_tmp.glob("*backup.tar.gz"))
+
+
+async def test_remote_path_validation_rejects_symlink_alias_inside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    inside_tmp = workspace / "inside-tmp"
+    workspace.mkdir()
+    inside_tmp.mkdir()
+    tmp_alias = tmp_path / "tmp-alias"
+    tmp_alias.symlink_to(inside_tmp, target_is_directory=True)
+    store = RemoteArchiveCheckpointStore(
+        LocalRemoteEnvironment(),
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(tmp_alias),
+    )
+
+    with pytest.raises(ValueError, match="aliases"):
+        await store.create({}, step=0)
+
+
+async def test_cancelled_restore_retains_host_and_remote_recovery(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    (workspace / "important.txt").write_text("checkpoint", encoding="utf-8")
+    environment = CancelApplyEnvironment()
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    checkpoint = await store.create({}, step=0)
+    (workspace / "important.txt").write_text("before-restore", encoding="utf-8")
+
+    restore_task = asyncio.create_task(store.restore(checkpoint))
+    await environment.apply_started.wait()
+    restore_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await restore_task
+
+    assert list((tmp_path / "host" / "recovery").glob("*.tar.gz"))
+    assert list(remote_tmp.glob("*backup.tar.gz"))
+
+
+async def test_symlinked_workspace_is_restored_through_canonical_path(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-workspace"
+    workspace.mkdir()
+    workspace_alias = tmp_path / "workspace-alias"
+    workspace_alias.symlink_to(workspace, target_is_directory=True)
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+    store = RemoteArchiveCheckpointStore(
+        LocalRemoteEnvironment(),
+        str(workspace_alias),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    (workspace / "keep.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    (workspace / "stale.txt").write_text("remove", encoding="utf-8")
+
+    await store.restore(checkpoint)
+
+    assert not (workspace / "stale.txt").exists()
+    assert (workspace / "keep.txt").read_text(encoding="utf-8") == "checkpoint"
+
+
+async def test_cleanup_failure_is_surfaced_as_warning(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    store = RemoteArchiveCheckpointStore(
+        CleanupFailureEnvironment(),
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+
+    with pytest.warns(RuntimeWarning, match="failed to clean"):
+        checkpoint = await store.create({}, step=0)
+
+    assert checkpoint.path.is_dir()
+
+
+async def test_before_restore_hook_receives_canonical_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+    called_with: list[str] = []
+
+    async def before_restore(canonical_workspace: str) -> None:
+        called_with.append(canonical_workspace)
+
+    store = RemoteArchiveCheckpointStore(
+        LocalRemoteEnvironment(),
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+        before_restore=before_restore,
+    )
+    checkpoint = await store.create({}, step=0)
+
+    await store.restore(checkpoint)
+
+    assert called_with == [str(workspace.resolve())]
 
 
 def test_remote_temp_directory_must_be_outside_workspace(tmp_path: Path) -> None:

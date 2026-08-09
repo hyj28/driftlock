@@ -7,8 +7,8 @@ import json
 import shlex
 import shutil
 import uuid
-from collections.abc import Mapping
-from contextlib import suppress
+import warnings
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -23,8 +23,8 @@ class RemoteCheckpointError(RuntimeError):
 
 class ExecResultLike(Protocol):
     return_code: int
-    stdout: str
-    stderr: str
+    stdout: str | None
+    stderr: str | None
 
 
 class RemoteEnvironment(Protocol):
@@ -46,11 +46,10 @@ class RemoteEnvironment(Protocol):
 class RemoteArchiveCheckpointStore:
     """Persist remote workspace snapshots in a host directory.
 
-    The implementation uses only ``exec``, ``upload_file``, and ``download_file``,
-    making it compatible with Harbor Docker, Daytona, E2B, Modal, and similar
-    environments. Restores replace the *contents* of the workspace while preserving
-    its directory inode, so a paused shell whose cwd is the workspace stays usable.
-    Keep ``store_dir`` outside any directory mounted into the agent environment.
+    The implementation uses only ``exec``, ``upload_file``, and ``download_file``
+    plus standard Linux userland tools. It works with POSIX Harbor Docker, Daytona,
+    E2B, Modal, and similar environments. Keep ``store_dir`` outside any directory
+    mounted into the agent environment.
     """
 
     def __init__(
@@ -62,6 +61,7 @@ class RemoteArchiveCheckpointStore:
         remote_tmp_dir: str = "/tmp",
         user: str | int | None = None,
         timeout_sec: int = 300,
+        before_restore: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.environment = environment
         self.remote_workspace = _validated_remote_path(
@@ -77,6 +77,9 @@ class RemoteArchiveCheckpointStore:
         self.store_dir = Path(store_dir).expanduser().resolve()
         self.user = user
         self.timeout_sec = timeout_sec
+        self.before_restore = before_restore
+        self._canonical_workspace: str | None = None
+        self._canonical_tmp_dir: str | None = None
         (self.store_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     @property
@@ -91,6 +94,7 @@ class RemoteArchiveCheckpointStore:
         parent_id: str | None = None,
         label: str | None = None,
     ) -> Checkpoint:
+        await self._ensure_remote_paths_are_safe()
         if step < 0:
             raise ValueError("step cannot be negative")
         state_json = json.dumps(state, sort_keys=True, separators=(",", ":"))
@@ -106,7 +110,7 @@ class RemoteArchiveCheckpointStore:
                     "tar -czf",
                     shlex.quote(remote_archive),
                     "-C",
-                    shlex.quote(self.remote_workspace),
+                    shlex.quote(self._workspace_path),
                     ".",
                 ]
             )
@@ -148,6 +152,7 @@ class RemoteArchiveCheckpointStore:
         )
 
     async def restore(self, checkpoint: Checkpoint) -> dict[str, Any]:
+        await self._ensure_remote_paths_are_safe()
         checkpoint_dir = checkpoint.path.resolve()
         if checkpoint_dir.parent != self.checkpoints_dir.resolve():
             raise ValueError("checkpoint does not belong to this store")
@@ -176,49 +181,153 @@ class RemoteArchiveCheckpointStore:
         remote_archive = self._remote_temp_path(restore_id, "restore.tar.gz")
         remote_backup = self._remote_temp_path(restore_id, "backup.tar.gz")
         remote_staging = self._remote_temp_path(restore_id, "staging")
+        recovery_dir = self.store_dir / "recovery"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        local_recovery = recovery_dir / f"restore-{restore_id}.tar.gz"
+
         try:
             await self.environment.upload_file(archive, remote_archive)
             await self._checked_exec(
-                self._restore_script(
+                self._prepare_restore_script(
                     archive=remote_archive,
                     backup=remote_backup,
                     staging=remote_staging,
                 ),
-                operation="restore remote checkpoint",
+                operation="prepare remote checkpoint restore",
             )
-        finally:
+            await self.environment.download_file(remote_backup, local_recovery)
+            if not local_recovery.is_file():
+                raise RemoteCheckpointError(
+                    "environment did not download the pre-restore recovery archive"
+                )
+        except BaseException:
             await self._best_effort_remove(
                 remote_archive, remote_backup, remote_staging
             )
+            raise
+
+        try:
+            if self.before_restore is not None:
+                await self.before_restore(self._workspace_path)
+            await self._checked_exec(
+                self._apply_restore_script(staging=remote_staging),
+                operation="apply remote checkpoint restore",
+            )
+        except Exception as error:
+            recovery_detail = await self._attempt_recovery(
+                local_recovery=local_recovery,
+                remote_backup=remote_backup,
+            )
+            raise RemoteCheckpointError(
+                f"remote restore failed: {error}; {recovery_detail}; "
+                f"host recovery archive retained at {local_recovery}; "
+                f"remote recovery archive retained at {remote_backup}"
+            ) from error
+
+        await self._best_effort_remove(remote_archive, remote_backup, remote_staging)
+        local_recovery.unlink(missing_ok=True)
         return state
 
     def _remote_temp_path(self, identifier: str, suffix: str) -> str:
-        return str(
-            PurePosixPath(self.remote_tmp_dir) / f"driftlock-{identifier}-{suffix}"
-        )
+        return str(PurePosixPath(self._tmp_path) / f"driftlock-{identifier}-{suffix}")
 
-    def _restore_script(self, *, archive: str, backup: str, staging: str) -> str:
-        workspace = shlex.quote(self.remote_workspace)
+    @property
+    def _workspace_path(self) -> str:
+        return self._canonical_workspace or self.remote_workspace
+
+    @property
+    def _tmp_path(self) -> str:
+        return self._canonical_tmp_dir or self.remote_tmp_dir
+
+    def _prepare_restore_script(
+        self, *, archive: str, backup: str, staging: str
+    ) -> str:
+        workspace = shlex.quote(self._workspace_path)
         archive_q = shlex.quote(archive)
         backup_q = shlex.quote(backup)
         staging_q = shlex.quote(staging)
-        clear_workspace = (
-            f"find {workspace} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +"
-        )
         script = f"""set -eu
 rm -rf -- {staging_q}
 rm -f -- {backup_q}
 mkdir -p -- {staging_q}
 tar -xzf {archive_q} -C {staging_q}
 tar -czf {backup_q} -C {workspace} .
-if {clear_workspace} && cp -a {staging_q}/. {workspace}/; then
-    exit 0
-fi
-{clear_workspace}
-tar -xzf {backup_q} -C {workspace}
-exit 1
 """
         return "sh -ceu " + shlex.quote(script)
+
+    def _apply_restore_script(self, *, staging: str) -> str:
+        workspace = shlex.quote(self._workspace_path)
+        staging_q = shlex.quote(staging)
+        clear_workspace = (
+            f"find {workspace} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +"
+        )
+        script = f"""set -eu
+{clear_workspace}
+cp -a {staging_q}/. {workspace}/
+"""
+        return "sh -ceu " + shlex.quote(script)
+
+    async def _attempt_recovery(
+        self,
+        *,
+        local_recovery: Path,
+        remote_backup: str,
+    ) -> str:
+        try:
+            await self.environment.upload_file(local_recovery, remote_backup)
+            command = " ".join(
+                [
+                    "tar -xzf",
+                    shlex.quote(remote_backup),
+                    "-C",
+                    shlex.quote(self._workspace_path),
+                ]
+            )
+            await self._checked_exec(command, operation="recover failed restore")
+        except Exception as recovery_error:
+            return f"automatic recovery also failed: {recovery_error}"
+        return "the pre-restore archive was merged back into the workspace"
+
+    async def _ensure_remote_paths_are_safe(self) -> None:
+        if self._canonical_workspace is not None:
+            return
+        workspace = shlex.quote(self.remote_workspace)
+        tmp_dir = shlex.quote(self.remote_tmp_dir)
+        script = f"""set -eu
+for tool in sh tar find rm cp realpath; do command -v "$tool" >/dev/null; done
+test -d {workspace}
+test -d {tmp_dir}
+workspace_real=$(realpath -- {workspace})
+tmp_real=$(realpath -- {tmp_dir})
+printf '%s\n' "$workspace_real" "$tmp_real"
+find "$workspace_real" -type d -samefile "$tmp_real" -print -quit
+"""
+        result = await self._checked_exec(
+            "sh -ceu " + shlex.quote(script),
+            operation="validate remote checkpoint paths and tools",
+        )
+        lines = (result.stdout or "").splitlines()
+        if len(lines) < 2:
+            raise RemoteCheckpointError(
+                "remote path validation did not return canonical paths"
+            )
+        canonical_workspace = _validated_remote_path(
+            lines[0], name="canonical remote_workspace", allow_root=False
+        )
+        canonical_tmp = _validated_remote_path(
+            lines[1], name="canonical remote_tmp_dir", allow_root=False
+        )
+        alias_inside_workspace = lines[2] if len(lines) > 2 else ""
+        if (
+            _is_relative_to(canonical_tmp, canonical_workspace)
+            or alias_inside_workspace
+        ):
+            raise ValueError(
+                "remote_tmp_dir resolves to or aliases a directory inside "
+                "remote_workspace"
+            )
+        self._canonical_workspace = canonical_workspace
+        self._canonical_tmp_dir = canonical_tmp
 
     async def _checked_exec(self, command: str, *, operation: str) -> ExecResultLike:
         result = await self.environment.exec(
@@ -237,11 +346,26 @@ exit 1
         if not paths:
             return
         command = "rm -rf -- " + " ".join(shlex.quote(path) for path in paths)
-        with suppress(Exception):
-            await self.environment.exec(
+        try:
+            result = await self.environment.exec(
                 command,
                 timeout_sec=min(self.timeout_sec, 30),
                 user=self.user,
+            )
+        except Exception as error:
+            warnings.warn(
+                f"failed to clean remote checkpoint artifacts: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        if result.return_code != 0:
+            detail = (result.stderr or result.stdout or "no output").strip()
+            warnings.warn(
+                "failed to clean remote checkpoint artifacts: "
+                f"exit code {result.return_code}: {detail}",
+                RuntimeWarning,
+                stacklevel=2,
             )
 
 

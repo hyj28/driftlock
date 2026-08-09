@@ -155,9 +155,11 @@ stall, or error spike.
 ### Remote and Harbor environments
 
 `RemoteArchiveCheckpointStore` implements the same interface over the three methods
-Harbor environments already expose: `exec`, `upload_file`, and `download_file`.
-Archives and agent state are persisted on the host, while short-lived staging files
-are removed from the remote environment after each operation.
+POSIX Harbor environments already expose: `exec`, `upload_file`, and
+`download_file`. It requires Linux-style `sh`, `tar`, `find`, `rm`, `cp -a`, and
+`realpath`; Windows containers are not supported. Archives and agent state are
+persisted on the host. Remote cleanup failures emit a warning instead of being
+silently treated as success.
 
 ```python
 from driftlock import RemoteArchiveCheckpointStore
@@ -170,10 +172,14 @@ store = RemoteArchiveCheckpointStore(
 )
 ```
 
-Restore replaces the workspace contents in place, preserving the directory inode so
-a paused tmux shell remains in a valid cwd. It first creates a remote backup and
-attempts to restore that backup if copying the staged snapshot fails. The configured
-workspace cannot be `/`, and the remote staging directory must be outside it.
+Restore validates canonical paths remotely, rejects staging directories that resolve
+or mount inside the workspace, and downloads a pre-restore recovery archive to the
+host before changing live files. It preserves the workspace-root inode, but child
+directories are recreated: a Harbor adapter must use `before_restore` to move tmux
+panes parked in a child directory back to the workspace root before applying the
+snapshot. On an ordinary copy failure, the backup is merged back automatically; on
+failure, timeout, or cancellation, recovery archives are retained rather than
+deleted. The configured workspace cannot be `/`.
 
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
