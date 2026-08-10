@@ -185,6 +185,89 @@ Recovery archives are retained on failure, timeout, or cancellation; other stagi
 artifacts are cleaned after ordinary failures. The configured workspace cannot be
 `/`.
 
+### Terminus-2 checkpoint boundaries
+
+`TerminusStepAdapter` connects the runner to a small, dependency-free runtime
+protocol that yields after exactly one billed Terminus episode. Its versioned
+codec checkpoints the message history, the terminal observation waiting to become
+the next prompt, the two-step completion-confirmation flag, and the logical episode
+number.
+
+```python
+from driftlock import TerminusStepAdapter
+
+step = TerminusStepAdapter(checkpointable_terminus_runtime)
+result = await runner.run(
+    goal=instruction,
+    plan="inspect, implement, verify",
+    step=step,
+    initial_state=step.initial_state(),
+)
+```
+
+Harbor's stock `Terminus2.run()` owns the whole loop and resets per-run state, so it
+must not be called once per driftlock step. The fork implements a two-phase
+`prepare_start()` / `start()` plus `resume()`, and yields after every LLM response.
+`prepare_start()` performs no model call: it resets semantic state, reads the initial
+terminal screen, and returns the exact rendered Terminus user prompt. The adapter
+passes that string unchanged to `start()` and verifies it is the first chat message,
+so an unrelated or stale initial conversation cannot be checkpointed.
+For a normal response, the boundary is after commands execute and the next terminal
+observation is ready. A parser-error response is also a billed episode: it must yield
+before Harbor's early `continue`, with the parser correction as `next_prompt` and the
+parse failure in `TerminusBoundary.error`. The runtime can use
+`Terminus2StateBridge` to capture and restore the existing `Chat` object. Restoring
+clears the provider response-chain id so the next call sends the restored full
+history.
+
+The same rule applies below `Chat`: Harbor currently turns an output-length response
+into an exception and recursively retries without adding its usage to `Chat`. The
+fork must intercept that response, return it as an error boundary with its actual
+token usage and shorter-response correction prompt, and let driftlock decide whether
+to continue. Multiple provider responses may never be hidden inside one boundary.
+
+Terminus must be constructed with context summarization disabled, and the fork must
+disable `_query_llm`'s internal retry decorator. Summarization can make three
+subagent calls before the main call; it also derives copied audit steps from a
+trajectory prefix that no longer matches restored chat after rollback. The runtime
+therefore exposes `summarization_enabled`, `internal_retries_enabled`, and a monotonic
+`provider_call_count` incremented around the lowest-level provider request. The
+adapter refuses either hidden-call feature and verifies that the physical counter
+advances by exactly one on every driftlock step. It also verifies the captured chat
+is the restored history as an exact prefix followed by the submitted user prompt and
+one assistant response, preventing an early or wrong-branch capture from silently
+discarding context.
+
+The adapter also enforces Terminus's completion handshake: a boundary may report
+`completed=True` only when the restored previous boundary was already awaiting
+completion confirmation and the current boundary still carries that flag. A single
+premature completion claim cannot end the driftlock run.
+
+Only semantic state rewinds. Token/cost accumulators, rollout details, trajectory
+files, session ids, and Harbor's physical turn counter remain monotonic so rolled-back
+work is still billed and auditable. The adapter rejects runtimes that skip or combine
+episode boundaries. A rollback reason is appended to the restored pending observation
+without contaminating stored checkpoint state; when rollback reaches the initial
+checkpoint, the same reason is passed explicitly to `prepare_start()`.
+
+Filesystem rollback is not enough for Terminus's persistent tmux shell: rejected
+branches can leave a different cwd, exported variables, aliases, foreground jobs, or
+background servers behind. Pass the adapter hook to the remote store:
+
+```python
+store = RemoteArchiveCheckpointStore(
+    harbor_environment,
+    remote_workspace="/app",
+    store_dir="./runs/checkpoints",
+    before_restore=step.before_workspace_restore,
+)
+```
+
+The runtime implementation must quiesce every process from the rejected branch,
+replace the tmux shell, start the new shell at the canonical workspace root, and
+reset incremental terminal-output tracking. If cleanup fails, it must raise; the
+remote store then aborts before mutating the workspace.
+
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
 report actual billed tokens in `StepOutcome.tokens`, including failed model calls.
