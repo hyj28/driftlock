@@ -168,10 +168,11 @@ class TerminusConversationCodec:
 
     def encode(self, state: TerminusConversationState) -> dict[str, Any]:
         """Return a detached JSON-compatible checkpoint payload."""
+        _validate_messages(state.messages)
         payload = {
             "schema_version": self.schema_version,
             "started": True,
-            "messages": copy.deepcopy(list(state.messages)),
+            "messages": _deepcopy_json(list(state.messages)),
             "next_prompt": state.next_prompt,
             "pending_completion": state.pending_completion,
             "episode": state.episode,
@@ -202,6 +203,7 @@ class TerminusConversationCodec:
         messages = payload.get("messages")
         if not isinstance(messages, list):
             raise TerminusStateError("Terminus messages must be a list")
+        _validate_messages(tuple(messages))
         next_prompt = payload.get("next_prompt")
         pending_completion = payload.get("pending_completion")
         episode = payload.get("episode")
@@ -212,7 +214,7 @@ class TerminusConversationCodec:
         if not isinstance(episode, int) or isinstance(episode, bool):
             raise TerminusStateError("Terminus episode must be an integer")
         return TerminusConversationState(
-            messages=tuple(copy.deepcopy(messages)),
+            messages=tuple(_deepcopy_json(messages)),
             next_prompt=next_prompt,
             pending_completion=pending_completion,
             episode=episode,
@@ -227,7 +229,9 @@ class TerminusConversationCodec:
         episode: int,
     ) -> TerminusConversationState:
         """Capture the semantic fields from Harbor after an episode boundary."""
-        messages = copy.deepcopy(list(chat.messages))
+        current_messages = list(chat.messages)
+        _validate_messages(tuple(current_messages))
+        messages = _deepcopy_json(current_messages)
         return TerminusConversationState(
             messages=tuple(messages),
             next_prompt=next_prompt,
@@ -241,7 +245,8 @@ class TerminusConversationCodec:
         Token counters and rollout details intentionally remain untouched.  They
         account for physical compute and must not rewind with semantic state.
         """
-        chat.messages[:] = copy.deepcopy(list(state.messages))
+        _validate_messages(state.messages)
+        chat.messages[:] = _deepcopy_json(list(state.messages))
         chat.reset_response_chain()
 
 
@@ -355,6 +360,11 @@ class TerminusStepAdapter:
                 "Terminus runtime must advance exactly one episode per driftlock step: "
                 f"expected {expected_episode}, got {boundary.conversation.episode}"
             )
+        _validate_chat_advance(
+            previous,
+            boundary.conversation,
+            submitted_prompt=prompt if previous is not None else None,
+        )
         if boundary.completed and (
             previous is None
             or not previous.pending_completion
@@ -400,6 +410,35 @@ def _provider_call_count(runtime: TerminusBoundaryRuntime) -> int:
     return value
 
 
+def _validate_chat_advance(
+    previous: TerminusConversationState | None,
+    current: TerminusConversationState,
+    *,
+    submitted_prompt: str | None,
+) -> None:
+    messages = current.messages
+    previous_length = len(previous.messages) if previous is not None else 0
+    if len(messages) != previous_length + 2:
+        raise RuntimeError(
+            "Terminus runtime must append exactly one user/assistant message pair"
+        )
+    if previous is not None and tuple(messages[:previous_length]) != previous.messages:
+        raise RuntimeError(
+            "Terminus runtime must preserve the restored chat history as a prefix"
+        )
+    user_message, assistant_message = messages[-2:]
+    if user_message.get("role") != "user" or assistant_message.get("role") != (
+        "assistant"
+    ):
+        raise RuntimeError(
+            "Terminus runtime must append one user message and one assistant message"
+        )
+    if submitted_prompt is not None and user_message.get("content") != submitted_prompt:
+        raise RuntimeError(
+            "Terminus runtime chat history does not contain the submitted prompt"
+        )
+
+
 def _agent_field(agent: Any, name: str, expected_type: type[Any]) -> Any:
     value = getattr(agent, name, None)
     if not isinstance(value, expected_type):
@@ -420,6 +459,15 @@ def _validate_messages(messages: tuple[Mapping[str, Any], ...]) -> None:
         if "content" not in message:
             raise TerminusStateError(f"Terminus message {index} must contain content")
     _validate_json(list(messages))
+
+
+def _deepcopy_json(value: Any) -> Any:
+    try:
+        return copy.deepcopy(value)
+    except RecursionError as error:
+        raise TerminusStateError(
+            "Terminus checkpoint state is too deeply nested"
+        ) from error
 
 
 def _validate_json(value: Any) -> None:

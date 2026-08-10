@@ -91,12 +91,23 @@ class FakeBoundaryRuntime:
         self.provider_call_count += 1
         self.calls.append(RuntimeCall("resume", state, prompt, tokens_remaining))
         confirmed_completion = state.pending_completion
-        return _boundary(
-            episode=state.episode + 1,
-            next_prompt="terminal two",
+        return TerminusBoundary(
+            conversation=TerminusConversationState(
+                messages=(
+                    *state.messages,
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "second response"},
+                ),
+                next_prompt="terminal two",
+                pending_completion=confirmed_completion,
+                episode=state.episode + 1,
+            ),
+            action="run tests",
+            changed_paths=("src/app.py",),
+            diff="+healthy",
             tokens=13,
             completed=confirmed_completion,
-            pending_completion=confirmed_completion,
+            summary="one Terminus episode",
         )
 
     async def before_workspace_restore(self, remote_workspace: str) -> None:
@@ -232,6 +243,25 @@ def test_conversation_codec_rejects_cyclic_state_cleanly() -> None:
             pending_completion=False,
             episode=1,
         )
+
+
+def test_conversation_codec_translates_deep_copy_recursion_errors() -> None:
+    nested_content: Any = "leaf"
+    for _ in range(600):
+        nested_content = [nested_content]
+    payload = {
+        "terminus_2": {
+            "schema_version": 1,
+            "started": True,
+            "messages": [{"role": "user", "content": nested_content}],
+            "next_prompt": "",
+            "pending_completion": False,
+            "episode": 1,
+        }
+    }
+
+    with pytest.raises(TerminusStateError, match="too deeply nested"):
+        TerminusConversationCodec().decode(payload)
 
 
 @pytest.mark.parametrize(
@@ -483,6 +513,29 @@ async def test_step_adapter_rejects_multiple_physical_provider_calls() -> None:
 
     with pytest.raises(RuntimeError, match="exactly one provider call"):
         await adapter(_context(adapter.initial_state()))
+
+
+async def test_step_adapter_rejects_runtime_that_drops_chat_history() -> None:
+    class DroppingRuntime(FakeBoundaryRuntime):
+        async def resume(
+            self,
+            state: TerminusConversationState,
+            *,
+            prompt: str,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.provider_call_count += 1
+            return _boundary(
+                episode=state.episode + 1,
+                next_prompt="lost history",
+                tokens=10,
+            )
+
+    adapter = TerminusStepAdapter(DroppingRuntime())
+    state = adapter.codec.encode(_conversation())
+
+    with pytest.raises(RuntimeError, match="append exactly one"):
+        await adapter(_context(state, logical_step=2))
 
 
 async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:

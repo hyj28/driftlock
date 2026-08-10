@@ -229,7 +229,10 @@ trajectory prefix that no longer matches restored chat after rollback. The runti
 therefore exposes `summarization_enabled`, `internal_retries_enabled`, and a monotonic
 `provider_call_count` incremented around the lowest-level provider request. The
 adapter refuses either hidden-call feature and verifies that the physical counter
-advances by exactly one on every driftlock step.
+advances by exactly one on every driftlock step. It also verifies the captured chat
+is the restored history as an exact prefix followed by the submitted user prompt and
+one assistant response, preventing an early or wrong-branch capture from silently
+discarding context.
 
 The adapter also enforces Terminus's completion handshake: a boundary may report
 `completed=True` only when the restored previous boundary was already awaiting
