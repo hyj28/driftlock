@@ -222,6 +222,15 @@ fork must intercept that response, return it as an error boundary with its actua
 token usage and shorter-response correction prompt, and let driftlock decide whether
 to continue. Multiple provider responses may never be hidden inside one boundary.
 
+Terminus must be constructed with context summarization disabled, and the fork must
+disable `_query_llm`'s internal retry decorator. Summarization can make three
+subagent calls before the main call; it also derives copied audit steps from a
+trajectory prefix that no longer matches restored chat after rollback. The runtime
+therefore exposes `summarization_enabled`, `internal_retries_enabled`, and a monotonic
+`provider_call_count` incremented around the lowest-level provider request. The
+adapter refuses either hidden-call feature and verifies that the physical counter
+advances by exactly one on every driftlock step.
+
 Only semantic state rewinds. Token/cost accumulators, rollout details, trajectory
 files, session ids, and Harbor's physical turn counter remain monotonic so rolled-back
 work is still billed and auditable. The adapter rejects runtimes that skip or combine

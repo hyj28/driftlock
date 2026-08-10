@@ -87,6 +87,21 @@ class TerminusBoundaryRuntime(Protocol):
     error boundary with their billed usage and correction prompt instead.
     """
 
+    @property
+    def provider_call_count(self) -> int:
+        """Monotonic count incremented at the lowest provider-call boundary."""
+        ...
+
+    @property
+    def summarization_enabled(self) -> bool:
+        """Whether Terminus may make internal summarization model calls."""
+        ...
+
+    @property
+    def internal_retries_enabled(self) -> bool:
+        """Whether one Terminus query may make multiple provider attempts."""
+        ...
+
     async def start(
         self,
         instruction: str,
@@ -250,6 +265,17 @@ class TerminusStepAdapter:
         self.runtime = runtime
         self.codec = codec or TerminusConversationCodec()
         self.rollback_prefix = rollback_prefix
+        if runtime.summarization_enabled:
+            raise ValueError(
+                "Terminus internal summarization must be disabled for "
+                "checkpoint boundaries"
+            )
+        if runtime.internal_retries_enabled:
+            raise ValueError(
+                "Terminus internal provider retries must be disabled for "
+                "checkpoint boundaries"
+            )
+        _provider_call_count(runtime)
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state()
@@ -265,6 +291,7 @@ class TerminusStepAdapter:
         await self.runtime.before_workspace_restore(remote_workspace)
 
     async def __call__(self, context: StepContext) -> StepOutcome:
+        provider_calls_before = _provider_call_count(self.runtime)
         previous = self.codec.decode(context.state)
         if previous is None:
             boundary = await self.runtime.start(
@@ -286,6 +313,15 @@ class TerminusStepAdapter:
                 tokens_remaining=context.tokens_remaining,
             )
             expected_episode = previous.episode + 1
+
+        provider_calls_after = _provider_call_count(self.runtime)
+        if provider_calls_after != provider_calls_before + 1:
+            raise RuntimeError(
+                "Terminus runtime must make exactly one provider call per "
+                "driftlock step: "
+                f"expected counter {provider_calls_before + 1}, got "
+                f"{provider_calls_after}"
+            )
 
         if boundary.conversation.episode != expected_episode:
             raise RuntimeError(
@@ -318,6 +354,15 @@ def _agent_chat(agent: Any) -> TerminusChat:
             "reset_response_chain() is required"
         )
     return chat
+
+
+def _provider_call_count(runtime: TerminusBoundaryRuntime) -> int:
+    value = runtime.provider_call_count
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(
+            "Terminus runtime provider_call_count must be a non-negative integer"
+        )
+    return value
 
 
 def _agent_field(agent: Any, name: str, expected_type: type[Any]) -> Any:

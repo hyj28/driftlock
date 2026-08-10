@@ -51,6 +51,9 @@ class FakeBoundaryRuntime:
     def __init__(self) -> None:
         self.calls: list[RuntimeCall] = []
         self.restored_workspaces: list[str] = []
+        self.provider_call_count = 0
+        self.summarization_enabled = False
+        self.internal_retries_enabled = False
 
     async def start(
         self,
@@ -60,6 +63,7 @@ class FakeBoundaryRuntime:
         rollback_feedback: str | None,
         tokens_remaining: int | None,
     ) -> TerminusBoundary:
+        self.provider_call_count += 1
         self.calls.append(
             RuntimeCall(
                 "start",
@@ -78,6 +82,7 @@ class FakeBoundaryRuntime:
         prompt: str,
         tokens_remaining: int | None,
     ) -> TerminusBoundary:
+        self.provider_call_count += 1
         self.calls.append(RuntimeCall("resume", state, prompt, tokens_remaining))
         return _boundary(
             episode=state.episode + 1,
@@ -289,6 +294,7 @@ async def test_step_adapter_surfaces_parser_error_as_its_own_episode() -> None:
             rollback_feedback: str | None,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
+            self.provider_call_count += 1
             return TerminusBoundary(
                 conversation=_conversation(
                     episode=1,
@@ -320,6 +326,7 @@ async def test_step_adapter_surfaces_truncation_without_an_internal_retry() -> N
             rollback_feedback: str | None,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
+            self.provider_call_count += 1
             self.calls.append(
                 RuntimeCall(
                     "truncated",
@@ -358,6 +365,43 @@ async def test_step_adapter_delegates_pre_restore_process_cleanup() -> None:
     assert runtime.restored_workspaces == ["/app"]
 
 
+@pytest.mark.parametrize(
+    ("attribute", "message"),
+    [
+        ("summarization_enabled", "summarization must be disabled"),
+        ("internal_retries_enabled", "retries must be disabled"),
+    ],
+)
+def test_step_adapter_rejects_hidden_provider_call_features(
+    attribute: str,
+    message: str,
+) -> None:
+    runtime = FakeBoundaryRuntime()
+    setattr(runtime, attribute, True)
+
+    with pytest.raises(ValueError, match=message):
+        TerminusStepAdapter(runtime)
+
+
+async def test_step_adapter_rejects_multiple_physical_provider_calls() -> None:
+    class SummarizingRuntime(FakeBoundaryRuntime):
+        async def start(
+            self,
+            instruction: str,
+            *,
+            plan: str,
+            rollback_feedback: str | None,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.provider_call_count += 4
+            return _boundary(episode=1, next_prompt="hidden summaries", tokens=100)
+
+    adapter = TerminusStepAdapter(SummarizingRuntime())
+
+    with pytest.raises(RuntimeError, match="exactly one provider call"):
+        await adapter(_context(adapter.initial_state()))
+
+
 async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
     class SkippingRuntime(FakeBoundaryRuntime):
         async def start(
@@ -368,6 +412,7 @@ async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
             rollback_feedback: str | None,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
+            self.provider_call_count += 1
             return _boundary(episode=2, next_prompt="late", tokens=1)
 
     adapter = TerminusStepAdapter(SkippingRuntime())
