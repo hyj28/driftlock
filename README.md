@@ -206,8 +206,12 @@ result = await runner.run(
 ```
 
 Harbor's stock `Terminus2.run()` owns the whole loop and resets per-run state, so it
-must not be called once per driftlock step. The fork implements
-`TerminusBoundaryRuntime.start()` / `resume()` and yields after every LLM response.
+must not be called once per driftlock step. The fork implements a two-phase
+`prepare_start()` / `start()` plus `resume()`, and yields after every LLM response.
+`prepare_start()` performs no model call: it resets semantic state, reads the initial
+terminal screen, and returns the exact rendered Terminus user prompt. The adapter
+passes that string unchanged to `start()` and verifies it is the first chat message,
+so an unrelated or stale initial conversation cannot be checkpointed.
 For a normal response, the boundary is after commands execute and the next terminal
 observation is ready. A parser-error response is also a billed episode: it must yield
 before Harbor's early `continue`, with the parser correction as `next_prompt` and the

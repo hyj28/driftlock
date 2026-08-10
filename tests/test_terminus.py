@@ -55,13 +55,25 @@ class FakeBoundaryRuntime:
         self.provider_call_count = 0
         self.summarization_enabled = False
         self.internal_retries_enabled = False
+        self._prepared_feedback: str | None = None
 
-    async def start(
+    async def prepare_start(
         self,
         instruction: str,
         *,
         plan: str,
         rollback_feedback: str | None,
+    ) -> str:
+        self._prepared_feedback = rollback_feedback
+        prompt = f"{instruction}|{plan}"
+        if rollback_feedback:
+            prompt += f"|rollback:{rollback_feedback}"
+        return prompt
+
+    async def start(
+        self,
+        *,
+        prompt: str,
         tokens_remaining: int | None,
     ) -> TerminusBoundary:
         self.provider_call_count += 1
@@ -69,9 +81,9 @@ class FakeBoundaryRuntime:
             RuntimeCall(
                 "start",
                 None,
-                f"{instruction}|{plan}",
+                prompt,
                 tokens_remaining,
-                rollback_feedback,
+                self._prepared_feedback,
             )
         )
         return _boundary(
@@ -79,6 +91,7 @@ class FakeBoundaryRuntime:
             next_prompt="terminal one",
             tokens=11,
             pending_completion=True,
+            user_prompt=prompt,
         )
 
     async def resume(
@@ -119,10 +132,11 @@ def _conversation(
     episode: int = 1,
     next_prompt: str = "terminal output",
     pending_completion: bool = False,
+    user_prompt: str = "task",
 ) -> TerminusConversationState:
     return TerminusConversationState(
         messages=(
-            {"role": "user", "content": "task"},
+            {"role": "user", "content": user_prompt},
             {"role": "assistant", "content": '{"commands": []}'},
         ),
         next_prompt=next_prompt,
@@ -138,12 +152,14 @@ def _boundary(
     tokens: int,
     completed: bool = False,
     pending_completion: bool = False,
+    user_prompt: str = "task",
 ) -> TerminusBoundary:
     return TerminusBoundary(
         conversation=_conversation(
             episode=episode,
             next_prompt=next_prompt,
             pending_completion=pending_completion,
+            user_prompt=user_prompt,
         ),
         action="run tests",
         changed_paths=("src/app.py",),
@@ -338,10 +354,8 @@ async def test_step_adapter_rejects_unconfirmed_completion() -> None:
     class PrematureCompletionRuntime(FakeBoundaryRuntime):
         async def start(
             self,
-            instruction: str,
             *,
-            plan: str,
-            rollback_feedback: str | None,
+            prompt: str,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
             self.provider_call_count += 1
@@ -351,11 +365,34 @@ async def test_step_adapter_rejects_unconfirmed_completion() -> None:
                 tokens=10,
                 completed=True,
                 pending_completion=True,
+                user_prompt=prompt,
             )
 
     adapter = TerminusStepAdapter(PrematureCompletionRuntime())
 
     with pytest.raises(RuntimeError, match="two consecutive completion"):
+        await adapter(_context(adapter.initial_state()))
+
+
+async def test_step_adapter_rejects_stale_initial_conversation() -> None:
+    class StaleRuntime(FakeBoundaryRuntime):
+        async def start(
+            self,
+            *,
+            prompt: str,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.provider_call_count += 1
+            return _boundary(
+                episode=1,
+                next_prompt="stale",
+                tokens=10,
+                user_prompt="an unrelated previous task",
+            )
+
+    adapter = TerminusStepAdapter(StaleRuntime())
+
+    with pytest.raises(RuntimeError, match="submitted prompt"):
         await adapter(_context(adapter.initial_state()))
 
 
@@ -401,10 +438,8 @@ async def test_step_adapter_surfaces_parser_error_as_its_own_episode() -> None:
     class ParserErrorRuntime(FakeBoundaryRuntime):
         async def start(
             self,
-            instruction: str,
             *,
-            plan: str,
-            rollback_feedback: str | None,
+            prompt: str,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
             self.provider_call_count += 1
@@ -412,6 +447,7 @@ async def test_step_adapter_surfaces_parser_error_as_its_own_episode() -> None:
                 conversation=_conversation(
                     episode=1,
                     next_prompt="fix the malformed JSON response",
+                    user_prompt=prompt,
                 ),
                 action="malformed model response",
                 error="parser rejected the response",
@@ -433,10 +469,8 @@ async def test_step_adapter_surfaces_truncation_without_an_internal_retry() -> N
     class TruncatedRuntime(FakeBoundaryRuntime):
         async def start(
             self,
-            instruction: str,
             *,
-            plan: str,
-            rollback_feedback: str | None,
+            prompt: str,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
             self.provider_call_count += 1
@@ -444,15 +478,16 @@ async def test_step_adapter_surfaces_truncation_without_an_internal_retry() -> N
                 RuntimeCall(
                     "truncated",
                     None,
-                    instruction,
+                    prompt,
                     tokens_remaining,
-                    rollback_feedback,
+                    self._prepared_feedback,
                 )
             )
             return TerminusBoundary(
                 conversation=_conversation(
                     episode=1,
                     next_prompt="retry with a shorter response",
+                    user_prompt=prompt,
                 ),
                 action="truncated model response",
                 error="model output reached the token limit",
@@ -500,14 +535,17 @@ async def test_step_adapter_rejects_multiple_physical_provider_calls() -> None:
     class SummarizingRuntime(FakeBoundaryRuntime):
         async def start(
             self,
-            instruction: str,
             *,
-            plan: str,
-            rollback_feedback: str | None,
+            prompt: str,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
             self.provider_call_count += 4
-            return _boundary(episode=1, next_prompt="hidden summaries", tokens=100)
+            return _boundary(
+                episode=1,
+                next_prompt="hidden summaries",
+                tokens=100,
+                user_prompt=prompt,
+            )
 
     adapter = TerminusStepAdapter(SummarizingRuntime())
 
@@ -542,14 +580,17 @@ async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
     class SkippingRuntime(FakeBoundaryRuntime):
         async def start(
             self,
-            instruction: str,
             *,
-            plan: str,
-            rollback_feedback: str | None,
+            prompt: str,
             tokens_remaining: int | None,
         ) -> TerminusBoundary:
             self.provider_call_count += 1
-            return _boundary(episode=2, next_prompt="late", tokens=1)
+            return _boundary(
+                episode=2,
+                next_prompt="late",
+                tokens=1,
+                user_prompt=prompt,
+            )
 
     adapter = TerminusStepAdapter(SkippingRuntime())
 

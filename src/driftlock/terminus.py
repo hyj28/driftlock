@@ -129,12 +129,20 @@ class TerminusBoundaryRuntime(Protocol):
         """Whether one Terminus query may make multiple provider attempts."""
         ...
 
-    async def start(
+    async def prepare_start(
         self,
         instruction: str,
         *,
         plan: str,
         rollback_feedback: str | None,
+    ) -> str:
+        """Reset semantic state and render the exact initial user prompt."""
+        ...
+
+    async def start(
+        self,
+        *,
+        prompt: str,
         tokens_remaining: int | None,
     ) -> TerminusBoundary: ...
 
@@ -326,10 +334,17 @@ class TerminusStepAdapter:
         provider_calls_before = _provider_call_count(self.runtime)
         previous = self.codec.decode(context.state)
         if previous is None:
-            boundary = await self.runtime.start(
+            submitted_prompt = await self.runtime.prepare_start(
                 context.goal,
                 plan=context.plan,
                 rollback_feedback=context.rollback_feedback,
+            )
+            if not isinstance(submitted_prompt, str):
+                raise RuntimeError(
+                    "Terminus runtime prepare_start must return a string prompt"
+                )
+            boundary = await self.runtime.start(
+                prompt=submitted_prompt,
                 tokens_remaining=context.tokens_remaining,
             )
             expected_episode = 1
@@ -339,6 +354,7 @@ class TerminusStepAdapter:
                 prompt = (
                     f"{prompt}\n\n{self.rollback_prefix} {context.rollback_feedback}"
                 )
+            submitted_prompt = prompt
             boundary = await self.runtime.resume(
                 previous,
                 prompt=prompt,
@@ -363,7 +379,7 @@ class TerminusStepAdapter:
         _validate_chat_advance(
             previous,
             boundary.conversation,
-            submitted_prompt=prompt if previous is not None else None,
+            submitted_prompt=submitted_prompt,
         )
         if boundary.completed and (
             previous is None
@@ -414,7 +430,7 @@ def _validate_chat_advance(
     previous: TerminusConversationState | None,
     current: TerminusConversationState,
     *,
-    submitted_prompt: str | None,
+    submitted_prompt: str,
 ) -> None:
     messages = current.messages
     previous_length = len(previous.messages) if previous is not None else 0
@@ -433,7 +449,7 @@ def _validate_chat_advance(
         raise RuntimeError(
             "Terminus runtime must append one user message and one assistant message"
         )
-    if submitted_prompt is not None and user_message.get("content") != submitted_prompt:
+    if user_message.get("content") != submitted_prompt:
         raise RuntimeError(
             "Terminus runtime chat history does not contain the submitted prompt"
         )
