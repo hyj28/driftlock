@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,7 +74,12 @@ class FakeBoundaryRuntime:
                 rollback_feedback,
             )
         )
-        return _boundary(episode=1, next_prompt="terminal one", tokens=11)
+        return _boundary(
+            episode=1,
+            next_prompt="terminal one",
+            tokens=11,
+            pending_completion=True,
+        )
 
     async def resume(
         self,
@@ -84,11 +90,13 @@ class FakeBoundaryRuntime:
     ) -> TerminusBoundary:
         self.provider_call_count += 1
         self.calls.append(RuntimeCall("resume", state, prompt, tokens_remaining))
+        confirmed_completion = state.pending_completion
         return _boundary(
             episode=state.episode + 1,
             next_prompt="terminal two",
             tokens=13,
-            completed=True,
+            completed=confirmed_completion,
+            pending_completion=confirmed_completion,
         )
 
     async def before_workspace_restore(self, remote_workspace: str) -> None:
@@ -96,7 +104,10 @@ class FakeBoundaryRuntime:
 
 
 def _conversation(
-    *, episode: int = 1, next_prompt: str = "terminal output"
+    *,
+    episode: int = 1,
+    next_prompt: str = "terminal output",
+    pending_completion: bool = False,
 ) -> TerminusConversationState:
     return TerminusConversationState(
         messages=(
@@ -104,7 +115,7 @@ def _conversation(
             {"role": "assistant", "content": '{"commands": []}'},
         ),
         next_prompt=next_prompt,
-        pending_completion=False,
+        pending_completion=pending_completion,
         episode=episode,
     )
 
@@ -115,9 +126,14 @@ def _boundary(
     next_prompt: str,
     tokens: int,
     completed: bool = False,
+    pending_completion: bool = False,
 ) -> TerminusBoundary:
     return TerminusBoundary(
-        conversation=_conversation(episode=episode, next_prompt=next_prompt),
+        conversation=_conversation(
+            episode=episode,
+            next_prompt=next_prompt,
+            pending_completion=pending_completion,
+        ),
         action="run tests",
         changed_paths=("src/app.py",),
         diff="+healthy",
@@ -205,6 +221,44 @@ def test_conversation_codec_rejects_non_json_and_unknown_schema() -> None:
         )
 
 
+def test_conversation_codec_rejects_cyclic_state_cleanly() -> None:
+    cyclic_message: dict[str, Any] = {"role": "user"}
+    cyclic_message["content"] = cyclic_message
+
+    with pytest.raises(TerminusStateError, match="cannot contain cycles"):
+        TerminusConversationState(
+            messages=(cyclic_message,),
+            next_prompt="",
+            pending_completion=False,
+            episode=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"tokens": True}, "non-negative integer"),
+        ({"tokens": 1.5}, "non-negative integer"),
+        ({"tokens": math.nan}, "non-negative integer"),
+        ({"completed": "false"}, "completed must be a boolean"),
+        ({"reward": math.nan}, "reward must be a finite number"),
+        ({"changed_paths": ["src/app.py"]}, "tuple of strings"),
+    ],
+)
+def test_boundary_rejects_malformed_runtime_values(
+    overrides: dict[str, Any],
+    message: str,
+) -> None:
+    values: dict[str, Any] = {
+        "conversation": _conversation(),
+        "action": "test",
+    }
+    values.update(overrides)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        TerminusBoundary(**values)
+
+
 def test_state_bridge_restores_only_semantic_state() -> None:
     codec = TerminusConversationCodec()
     chat = FakeChat(
@@ -238,12 +292,41 @@ async def test_step_adapter_starts_then_resumes_at_exact_boundaries() -> None:
     second = await adapter(_context(dict(first.state), logical_step=2))
 
     assert first.tokens == 11
+    first_state = adapter.codec.decode(first.state)
+    assert first_state is not None
+    assert first_state.pending_completion
+    assert not first.completed
     assert first.changed_paths == ("src/app.py",)
     assert second.tokens == 13
     assert second.completed
     assert [call.operation for call in runtime.calls] == ["start", "resume"]
     assert runtime.calls[1].prompt == "terminal one"
     assert runtime.calls[1].tokens_remaining == 500
+
+
+async def test_step_adapter_rejects_unconfirmed_completion() -> None:
+    class PrematureCompletionRuntime(FakeBoundaryRuntime):
+        async def start(
+            self,
+            instruction: str,
+            *,
+            plan: str,
+            rollback_feedback: str | None,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.provider_call_count += 1
+            return _boundary(
+                episode=1,
+                next_prompt="please confirm completion",
+                tokens=10,
+                completed=True,
+                pending_completion=True,
+            )
+
+    adapter = TerminusStepAdapter(PrematureCompletionRuntime())
+
+    with pytest.raises(RuntimeError, match="two consecutive completion"):
+        await adapter(_context(adapter.initial_state()))
 
 
 async def test_step_adapter_adds_feedback_only_after_rollback() -> None:

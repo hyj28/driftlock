@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from collections.abc import Mapping, MutableSequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -72,8 +73,34 @@ class TerminusBoundary:
     summary: str = ""
 
     def __post_init__(self) -> None:
-        if self.tokens < 0:
-            raise ValueError("tokens cannot be negative")
+        if not isinstance(self.conversation, TerminusConversationState):
+            raise TypeError("conversation must be TerminusConversationState")
+        if not isinstance(self.action, str):
+            raise TypeError("action must be a string")
+        if not isinstance(self.changed_paths, tuple) or any(
+            not isinstance(path, str) for path in self.changed_paths
+        ):
+            raise TypeError("changed_paths must be a tuple of strings")
+        if not isinstance(self.diff, str):
+            raise TypeError("diff must be a string")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("error must be a string or None")
+        if self.reward is not None and (
+            not isinstance(self.reward, (int, float))
+            or isinstance(self.reward, bool)
+            or not math.isfinite(self.reward)
+        ):
+            raise TypeError("reward must be a finite number or None")
+        if (
+            not isinstance(self.tokens, int)
+            or isinstance(self.tokens, bool)
+            or self.tokens < 0
+        ):
+            raise ValueError("tokens must be a non-negative integer")
+        if not isinstance(self.completed, bool):
+            raise TypeError("completed must be a boolean")
+        if not isinstance(self.summary, str):
+            raise TypeError("summary must be a string")
 
 
 class TerminusBoundaryRuntime(Protocol):
@@ -328,6 +355,14 @@ class TerminusStepAdapter:
                 "Terminus runtime must advance exactly one episode per driftlock step: "
                 f"expected {expected_episode}, got {boundary.conversation.episode}"
             )
+        if boundary.completed and (
+            previous is None
+            or not previous.pending_completion
+            or not boundary.conversation.pending_completion
+        ):
+            raise RuntimeError(
+                "Terminus completion requires two consecutive completion episodes"
+            )
 
         return StepOutcome(
             action=boundary.action,
@@ -388,16 +423,21 @@ def _validate_messages(messages: tuple[Mapping[str, Any], ...]) -> None:
 
 
 def _validate_json(value: Any) -> None:
-    _validate_json_tree(value)
+    try:
+        _validate_json_tree(value, active_containers=set())
+    except RecursionError as error:
+        raise TerminusStateError(
+            "Terminus checkpoint state is too deeply nested"
+        ) from error
     try:
         json.dumps(value, allow_nan=False, sort_keys=True)
-    except (OverflowError, TypeError, ValueError) as error:
+    except (OverflowError, RecursionError, TypeError, ValueError) as error:
         raise TerminusStateError(
             "Terminus checkpoint state must be strict JSON"
         ) from error
 
 
-def _validate_json_tree(value: Any) -> None:
+def _validate_json_tree(value: Any, *, active_containers: set[int]) -> None:
     if value is None or isinstance(value, (bool, int, str)):
         return
     if isinstance(value, float):
@@ -405,15 +445,28 @@ def _validate_json_tree(value: Any) -> None:
             raise TerminusStateError("Terminus checkpoint state must be strict JSON")
         return
     if isinstance(value, list):
-        for item in value:
-            _validate_json_tree(item)
+        _validate_json_container(value, active_containers)
         return
     if isinstance(value, dict):
         if any(not isinstance(key, str) for key in value):
             raise TerminusStateError(
                 "Terminus checkpoint state must use string object keys"
             )
-        for item in value.values():
-            _validate_json_tree(item)
+        _validate_json_container(value, active_containers)
         return
     raise TerminusStateError("Terminus checkpoint state must be strict JSON")
+
+
+def _validate_json_container(
+    value: list[Any] | dict[str, Any], active_containers: set[int]
+) -> None:
+    identity = id(value)
+    if identity in active_containers:
+        raise TerminusStateError("Terminus checkpoint state cannot contain cycles")
+    active_containers.add(identity)
+    try:
+        items = value if isinstance(value, list) else value.values()
+        for item in items:
+            _validate_json_tree(item, active_containers=active_containers)
+    finally:
+        active_containers.remove(identity)

@@ -231,6 +231,11 @@ therefore exposes `summarization_enabled`, `internal_retries_enabled`, and a mon
 adapter refuses either hidden-call feature and verifies that the physical counter
 advances by exactly one on every driftlock step.
 
+The adapter also enforces Terminus's completion handshake: a boundary may report
+`completed=True` only when the restored previous boundary was already awaiting
+completion confirmation and the current boundary still carries that flag. A single
+premature completion claim cannot end the driftlock run.
+
 Only semantic state rewinds. Token/cost accumulators, rollout details, trajectory
 files, session ids, and Harbor's physical turn counter remain monotonic so rolled-back
 work is still billed and auditable. The adapter rejects runtimes that skip or combine
