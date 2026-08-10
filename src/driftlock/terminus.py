@@ -106,10 +106,10 @@ class TerminusBoundary:
 class TerminusBoundaryRuntime(Protocol):
     """A Terminus fork that yields after exactly one billed episode.
 
-    ``start`` may be called again after rollback to the initial checkpoint.  It
-    must reset semantic conversation state while keeping physical usage counters
-    and trajectory audit data monotonic.  Both methods must enforce the supplied
-    provider token ceiling and report actual usage in the returned boundary.
+    ``prepare_start`` may be called again after rollback to the initial checkpoint.
+    It resets semantic conversation state while keeping physical usage counters and
+    trajectory audit data monotonic. ``start`` and ``resume`` must enforce the
+    supplied provider token ceiling and report actual usage in the returned boundary.
     Output-length responses must not be retried inside one call: they return an
     error boundary with their billed usage and correction prompt instead.
     """

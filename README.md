@@ -248,7 +248,7 @@ files, session ids, and Harbor's physical turn counter remain monotonic so rolle
 work is still billed and auditable. The adapter rejects runtimes that skip or combine
 episode boundaries. A rollback reason is appended to the restored pending observation
 without contaminating stored checkpoint state; when rollback reaches the initial
-checkpoint, the same reason is passed explicitly to `start()`.
+checkpoint, the same reason is passed explicitly to `prepare_start()`.
 
 Filesystem rollback is not enough for Terminus's persistent tmux shell: rejected
 branches can leave a different cwd, exported variables, aliases, foreground jobs, or
