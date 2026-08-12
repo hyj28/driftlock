@@ -1,0 +1,290 @@
+diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
+new file mode 100644
+index 0000000..d168455
+--- /dev/null
++++ b/harbor/src/harbor/_driftlock_pin.py
+@@ -0,0 +1,4 @@
++"""Compatibility marker for driftlock's pinned LHTB integration."""
++
++LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
++DRIFTLOCK_HARBOR_PATCH_VERSION = 2
+diff --git a/harbor/src/harbor/llms/base.py b/harbor/src/harbor/llms/base.py
+index 6aae215..9f532e0 100644
+--- a/harbor/src/harbor/llms/base.py
++++ b/harbor/src/harbor/llms/base.py
+@@ -46,9 +46,15 @@ class ContextLengthExceededError(Exception):
+ class OutputLengthExceededError(Exception):
+     """Raised when the LLM response was truncated due to max_tokens limit."""
+ 
+-    def __init__(self, message: str, truncated_response: str | None = None):
++    def __init__(
++        self,
++        message: str,
++        truncated_response: str | None = None,
++        response: LLMResponse | None = None,
++    ):
+         super().__init__(message)
+         self.truncated_response = truncated_response
++        self.response = response
+ 
+ 
+ class BaseLLM(ABC):
+diff --git a/harbor/src/harbor/llms/chat.py b/harbor/src/harbor/llms/chat.py
+index 51eddf3..c376ade 100644
+--- a/harbor/src/harbor/llms/chat.py
++++ b/harbor/src/harbor/llms/chat.py
+@@ -94,6 +94,17 @@ class Chat:
+             **kwargs,
+         )
+ 
++        self.record_response(prompt, llm_response)
++        return llm_response
++
++    def record_response(self, prompt: str, llm_response: LLMResponse) -> None:
++        """Record a provider response that was billed.
++
++        A boundary runtime also uses this for a truncated response retained on
++        ``OutputLengthExceededError``.  Keeping this logic in one method ensures
++        those billed responses advance usage and chat history exactly once.
++        """
++
+         # Track response chain for Responses API
+         if llm_response.response_id is not None:
+             self._last_response_id = llm_response.response_id
+@@ -120,7 +131,6 @@ class Chat:
+                 assistant_message,
+             ]
+         )
+-        return llm_response
+ 
+     def reset_response_chain(self) -> None:
+         """Reset the response chain so the next call sends full message history.
+diff --git a/harbor/src/harbor/llms/lite_llm.py b/harbor/src/harbor/llms/lite_llm.py
+index 7442a5f..6d9a900 100644
+--- a/harbor/src/harbor/llms/lite_llm.py
++++ b/harbor/src/harbor/llms/lite_llm.py
+@@ -120,6 +120,8 @@ class LiteLLM(BaseLLM):
+         self._collect_rollout_details = collect_rollout_details
+         self._max_thinking_tokens = max_thinking_tokens
+         self._reasoning_effort = reasoning_effort
++        self._driftlock_single_attempt = False
++        self._driftlock_provider_call_count = 0
+ 
+         if self._supported_params is not None:
+             self._supports_response_format = "response_format" in self._supported_params
+@@ -356,6 +358,7 @@ class LiteLLM(BaseLLM):
+                 extra_body["session_id"] = self._session_id
+ 
+             try:
++                self._driftlock_provider_call_count += 1
+                 response = await litellm.acompletion(**completion_kwargs)
+             except LiteLLMBadRequestError as e:
+                 # If provider (e.g., OpenAI) rejects extra_body parameters, retry without them
+@@ -375,6 +378,8 @@ class LiteLLM(BaseLLM):
+                         rejected_params.append("logprobs")
+ 
+                     if rejected_params:
++                        if self._driftlock_single_attempt:
++                            raise
+                         self._logger.warning(
+                             f"Provider {self._model_name} rejected request parameters: {', '.join(rejected_params)}. "
+                             f"Retrying without them. Rollout details may be incomplete."
+@@ -392,6 +397,7 @@ class LiteLLM(BaseLLM):
+                         if "logprobs" in rejected_params:
+                             completion_kwargs.pop("logprobs", None)
+ 
++                        self._driftlock_provider_call_count += 1
+                         response = await litellm.acompletion(**completion_kwargs)
+                     else:
+                         raise e
+@@ -422,6 +422,17 @@ class LiteLLM(BaseLLM):
+         content = message.get("content") or ""
+         reasoning_content = message.get("reasoning_content")
+ 
++        llm_response = LLMResponse(
++            content=content,
++            reasoning_content=reasoning_content,
++            model_name=response.get("model"),
++            usage=usage_info,
++            prompt_token_ids=prompt_token_ids,
++            completion_token_ids=completion_token_ids,
++            logprobs=logprobs,
++            extra=extra,
++        )
++
+         # Sometimes the LLM returns a response with a finish reason of "length"
+         # This typically means we hit the max_tokens limit, not the context window
+         if choice.get("finish_reason") == "length":
+@@ -430,19 +441,11 @@ class LiteLLM(BaseLLM):
+                 f"Model {self._model_name} hit max_tokens limit. "
+                 f"Response was truncated. Consider increasing max_tokens if possible.",
+                 truncated_response=content,
++                response=llm_response,
+             )
+             raise exc
+ 
+-        return LLMResponse(
+-            content=content,
+-            reasoning_content=reasoning_content,
+-            model_name=response.get("model"),
+-            usage=usage_info,
+-            prompt_token_ids=prompt_token_ids,
+-            completion_token_ids=completion_token_ids,
+-            logprobs=logprobs,
+-            extra=extra,
+-        )
++        return llm_response
+ 
+     def _extract_token_ids(self, response) -> tuple[list[int] | None, list[int] | None]:
+         """Extract token IDs from a response.
+@@ -729,6 +738,7 @@ class LiteLLM(BaseLLM):
+                 input_items.append({"role": "user", "content": prompt})
+                 responses_kwargs["input"] = input_items
+ 
++            self._driftlock_provider_call_count += 1
+             response = await litellm.aresponses(**responses_kwargs)
+ 
+         except Exception as e:
+@@ -746,6 +756,14 @@ class LiteLLM(BaseLLM):
+         # Extract usage information
+         usage_info = self._extract_responses_usage_info(response)
+ 
++        llm_response = LLMResponse(
++            content=content,
++            reasoning_content=reasoning_content,
++            model_name=getattr(response, "model", None),
++            usage=usage_info,
++            response_id=getattr(response, "id", None),
++        )
++
+         # Check for truncation via response status
+         response_status = getattr(response, "status", None)
+         if response_status == "incomplete":
+@@ -760,14 +771,7 @@ class LiteLLM(BaseLLM):
+                     f"Model {self._model_name} hit max_tokens limit. "
+                     f"Response was truncated.",
+                     truncated_response=content,
++                    response=llm_response,
+                 )
+ 
+-        response_id = getattr(response, "id", None)
+-
+-        return LLMResponse(
+-            content=content,
+-            reasoning_content=reasoning_content,
+-            model_name=getattr(response, "model", None),
+-            usage=usage_info,
+-            response_id=response_id,
+-        )
++        return llm_response
+diff --git a/harbor/tests/unit/llms/test_chat.py b/harbor/tests/unit/llms/test_chat.py
+index b34b4fc..20cc6ac 100644
+--- a/harbor/tests/unit/llms/test_chat.py
++++ b/harbor/tests/unit/llms/test_chat.py
+@@ -52,6 +52,31 @@ async def test_chat_tracks_response_id():
+     assert chat._last_response_id == "resp_001"
+ 
+ 
++def test_chat_records_retained_billed_response():
++    """A truncated response can use the same accounting path exactly once."""
++    chat = Chat(model=FakeLLM())
++    response = LLMResponse(
++        content="partial",
++        usage=UsageInfo(
++            prompt_tokens=11,
++            completion_tokens=7,
++            cache_tokens=2,
++            cost_usd=0.25,
++        ),
++    )
++
++    chat.record_response("prompt", response)
++
++    assert chat.messages == [
++        {"role": "user", "content": "prompt"},
++        {"role": "assistant", "content": "partial"},
++    ]
++    assert chat.total_input_tokens == 11
++    assert chat.total_output_tokens == 7
++    assert chat.total_cache_tokens == 2
++    assert chat.total_cost == 0.25
++
++
+ @pytest.mark.asyncio
+ async def test_chat_passes_previous_response_id():
+     """Verify previous_response_id is passed as kwarg to model.call()."""
+diff --git a/harbor/tests/unit/llms/test_lite_llm.py b/harbor/tests/unit/llms/test_lite_llm.py
+index 03266fb..dcf3332 100644
+--- a/harbor/tests/unit/llms/test_lite_llm.py
++++ b/harbor/tests/unit/llms/test_lite_llm.py
+@@ -349,6 +349,70 @@ async def test_litellm_responses_api_output_length_error(monkeypatch):
+         await llm.call(prompt="hello", message_history=[])
+ 
+     assert exc_info.value.truncated_response == "partial output..."
++    assert exc_info.value.response is not None
++    assert exc_info.value.response.content == "partial output..."
++    assert exc_info.value.response.usage is not None
++
++
++@pytest.mark.asyncio
++async def test_litellm_chat_output_length_error_retains_response(monkeypatch):
++    async def fake_acompletion(**kwargs):
++        class Completion(dict):
++            pass
++
++        response = Completion({
++            "model": "provider-model",
++            "choices": [
++                {
++                    "message": {
++                        "content": "partial chat output",
++                        "reasoning_content": None,
++                    },
++                    "finish_reason": "length",
++                }
++            ],
++        })
++        response.usage = SimpleNamespace(prompt_tokens=13, completion_tokens=8)
++        return response
++
++    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
++    llm = LiteLLM(model_name="fake-provider/fake-model")
++
++    with pytest.raises(OutputLengthExceededError) as exc_info:
++        await llm.call(prompt="hello", message_history=[])
++
++    assert exc_info.value.truncated_response == "partial chat output"
++    assert exc_info.value.response is not None
++    assert exc_info.value.response.content == "partial chat output"
++    assert exc_info.value.response.model_name == "provider-model"
++    assert exc_info.value.response.usage is not None
++    assert exc_info.value.response.usage.prompt_tokens == 13
++    assert exc_info.value.response.usage.completion_tokens == 8
++    assert llm._driftlock_provider_call_count == 1
++
++
++@pytest.mark.asyncio
++async def test_driftlock_single_attempt_disables_parameter_fallback(monkeypatch):
++    calls = 0
++
++    async def fake_acompletion(**kwargs):
++        nonlocal calls
++        calls += 1
++        raise LiteLLMBadRequestError(
++            message="Unrecognized request argument: session_id",
++            model="fake-model",
++            llm_provider="openai",
++        )
++
++    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
++    llm = LiteLLM(model_name="openai/fake-model", session_id="session")
++    llm._driftlock_single_attempt = True
++
++    with pytest.raises(LiteLLMBadRequestError):
++        await llm.call.__wrapped__(llm, prompt="hello", message_history=[])
++
++    assert calls == 1
++    assert llm._driftlock_provider_call_count == 1
+ 
+ 
+ @pytest.mark.asyncio

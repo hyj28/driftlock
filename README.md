@@ -268,6 +268,16 @@ replace the tmux shell, start the new shell at the canonical workspace root, and
 reset incremental terminal-output tracking. If cleanup fails, it must raise; the
 remote store then aborts before mutating the workspace.
 
+The concrete `LHTBTerminusRuntime` targets LHTB commit
+`0d9918f6b66eda0752f8c7d17c9a73a18ee32f98`. Its companion patch preserves the
+otherwise discarded LiteLLM usage on output truncation, counts the lowest-level
+provider attempt, disables both retry layers, and installs a revision marker that the
+runtime checks before making a provider call. Installation and construction
+instructions are in [`integrations/lhtb/README.md`](integrations/lhtb/README.md).
+`HarborWorkspaceDeltaObserver` hashes the full remote workspace around each episode
+and records a before/after Git view, so the heuristics receive changes made to files
+that were already dirty as well as newly changed paths.
+
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
 receives `context.tokens_remaining` and must use it to cap the provider request, then
 report actual billed tokens in `StepOutcome.tokens`, including failed model calls.

@@ -16,9 +16,10 @@
   POSIX remote environments with canonical-path validation and retained recovery
   archives; SHA-256-verified host fallback and exact failed-restore recovery;
   versioned Terminus-2 semantic conversation codec and one-episode boundary adapter;
-  unit tests.
-- **Next:** wire the boundary runtime into the pinned LHTB Harbor fork, then run the
-  week-1 LHTB smoke tests before selecting experiment tasks.
+  pinned LHTB Harbor runtime with exact physical-call accounting, truncation usage,
+  per-episode workspace evidence, and tmux lifecycle cleanup; unit tests.
+- **Next:** run the week-1 LHTB smoke tests, then select experiment tasks by measured
+  partial credit.
 
 ---
 
