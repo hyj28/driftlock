@@ -5,6 +5,7 @@ from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import CallableLLMJudge
 from driftlock.lhtb import (
     DRIFTLOCK_HARBOR_PATCH_VERSION,
+    LHTB_LITELLM_VERSION,
     LHTB_REPOSITORY_REVISION,
     HarborWorkspaceDeltaObserver,
     LHTBRuntimeCompatibilityError,
@@ -12,6 +13,7 @@ from driftlock.lhtb import (
     WorkspaceDelta,
     WorkspaceDeltaObserver,
     WorkspaceSnapshot,
+    lhtb_harbor_patch_path,
 )
 from driftlock.models import (
     Checkpoint,
@@ -23,6 +25,7 @@ from driftlock.models import (
     RunStatus,
     StepContext,
     StepOutcome,
+    StepTokenBudgetExhausted,
     Verdict,
 )
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
@@ -39,6 +42,7 @@ from driftlock.terminus import (
 
 __all__ = [
     "DRIFTLOCK_HARBOR_PATCH_VERSION",
+    "LHTB_LITELLM_VERSION",
     "LHTB_REPOSITORY_REVISION",
     "CallableLLMJudge",
     "Checkpoint",
@@ -61,6 +65,7 @@ __all__ = [
     "SnapshotIntegrityError",
     "StepContext",
     "StepOutcome",
+    "StepTokenBudgetExhausted",
     "Terminus2StateBridge",
     "TerminusBoundary",
     "TerminusBoundaryRuntime",
@@ -72,4 +77,5 @@ __all__ = [
     "WorkspaceDelta",
     "WorkspaceDeltaObserver",
     "WorkspaceSnapshot",
+    "lhtb_harbor_patch_path",
 ]

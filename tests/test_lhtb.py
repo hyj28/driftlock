@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +17,7 @@ from driftlock.lhtb import (
     WorkspaceDelta,
     WorkspaceSnapshot,
 )
+from driftlock.models import StepTokenBudgetExhausted
 
 
 @dataclass
@@ -54,6 +56,8 @@ class FakeLLM:
     def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
         self.responses = responses
         self.calls: list[dict[str, Any]] = []
+        self._llm_kwargs: dict[str, Any] = {}
+        self._use_responses_api = False
 
     async def call(self, prompt: str, **kwargs: Any) -> FakeResponse:
         self.calls.append({"prompt": prompt, **kwargs})
@@ -156,7 +160,11 @@ class FakeSession:
         self._previous_buffer = "old"
         self.environment = environment
         self.starts = 0
+        self.stops = 0
         self.keys: list[list[str]] = []
+        self._markers: list[tuple[float, str]] = []
+        self._local_asciinema_recording_path: Path | None = None
+        self._remote_asciinema_recording_path: PurePosixPath | None = None
 
     async def get_incremental_output(self) -> str:
         return "Current Terminal Screen:\n$"
@@ -166,6 +174,9 @@ class FakeSession:
 
     async def start(self) -> None:
         self.starts += 1
+
+    async def stop(self) -> None:
+        self.stops += 1
 
     async def send_keys(self, keys: list[str], **kwargs: Any) -> None:
         self.keys.append(keys)
@@ -193,6 +204,7 @@ class FakeAgent:
         self._context: Any = None
         self._api_request_times: list[float] = []
         self._model_name = "fake-model"
+        self._llm_kwargs: dict[str, Any] = {}
         self._last_response_model_name: str | None = None
         self.logs_dir = Path("logs")
         self.mcp_servers: list[Any] = []
@@ -281,13 +293,17 @@ class FakeAgent:
 
 
 class FakeObserver:
-    def __init__(self) -> None:
+    def __init__(self, canonical: str = "/app") -> None:
+        self.canonical = canonical
         self.snapshots = [
             WorkspaceSnapshot({"a": "1"}, "old"),
             WorkspaceSnapshot({"a": "2"}, "new"),
             WorkspaceSnapshot({"a": "2"}, "new"),
             WorkspaceSnapshot({"a": "2"}, "new"),
         ]
+
+    async def canonical_workspace(self) -> str:
+        return self.canonical
 
     async def snapshot(self) -> WorkspaceSnapshot:
         return self.snapshots.pop(0)
@@ -312,6 +328,8 @@ class FakeEnvironment:
 
     async def exec(self, command: str, **kwargs: Any) -> RemoteResult:
         self.calls.append({"command": command, **kwargs})
+        if command.startswith("realpath -e --"):
+            return RemoteResult("/app\n")
         return self.results.pop(0) if self.results else RemoteResult()
 
 
@@ -361,11 +379,11 @@ async def test_runtime_yields_one_response_and_restores_semantic_chat(
     prompt = await runtime.prepare_start(
         "fix it", plan="inspect then test", rollback_feedback=None
     )
-    first = await runtime.start(prompt=prompt, tokens_remaining=80)
+    first = await runtime.start(prompt=prompt, tokens_remaining=10_000)
     second = await runtime.resume(
         first.conversation,
         prompt=first.conversation.next_prompt,
-        tokens_remaining=50,
+        tokens_remaining=10_000,
     )
 
     assert runtime.provider_call_count == 2
@@ -375,13 +393,54 @@ async def test_runtime_yields_one_response_and_restores_semantic_chat(
     assert second.tokens == 35
     assert second.conversation.episode == 2
     assert len(second.conversation.messages) == 4
-    assert llm.calls[0]["max_tokens"] == 80
-    assert llm.calls[1]["max_tokens"] == 50
+    assert 0 < llm.calls[0]["max_tokens"] < 10_000
+    assert 0 < llm.calls[1]["max_tokens"] < llm.calls[0]["max_tokens"]
     assert llm.calls[0]["num_retries"] == 0
+    assert llm.calls[0]["max_retries"] == 0
     assert agent._max_episodes == 100
     assert agent._n_episodes == 2
     assert context.n_input_tokens == 50
     assert context.n_output_tokens == 9
+
+
+async def test_runtime_reserves_input_tokens_and_uses_responses_ceiling(
+    fake_harbor_symbols: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, agent, llm, _ = _runtime([FakeResponse("ok", FakeUsage(30, 10))])
+    llm._use_responses_api = True
+    agent._llm_call_kwargs["max_completion_tokens"] = 50
+    monkeypatch.setattr(lhtb, "_conservative_input_token_bound", lambda *args: 30)
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    await runtime.start(prompt=prompt, tokens_remaining=100)
+
+    assert llm.calls[0]["max_output_tokens"] == 50
+    assert "max_tokens" not in llm.calls[0]
+    assert "max_completion_tokens" not in llm.calls[0]
+
+
+async def test_runtime_refuses_call_when_input_exhausts_budget(
+    fake_harbor_symbols: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _, llm, _ = _runtime([FakeResponse("unused", FakeUsage(1, 1))])
+    monkeypatch.setattr(lhtb, "_conservative_input_token_bound", lambda *args: 101)
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    with pytest.raises(StepTokenBudgetExhausted, match="cannot cover"):
+        await runtime.start(prompt=prompt, tokens_remaining=100)
+
+    assert llm.calls == []
+
+
+async def test_runtime_rejects_canonical_observer_mismatch(
+    fake_harbor_symbols: None,
+) -> None:
+    runtime, _, _, _ = _runtime([], observer=FakeObserver("/other"))
+
+    with pytest.raises(LHTBRuntimeCompatibilityError, match="different canonical"):
+        await runtime.prepare_start("task", plan="", rollback_feedback=None)
 
 
 async def test_runtime_keeps_physical_accounting_when_rollback_restarts(
@@ -411,8 +470,8 @@ async def test_runtime_keeps_physical_accounting_when_rollback_restarts(
     assert agent._chat.total_output_tokens == 5
     assert len(agent._trajectory_steps) == physical_steps + 2
     assert agent._n_episodes == 2
-    assert len(runtime.environment.calls) == 1
-    assert "pane_pid" in runtime.environment.calls[0]["command"]
+    assert len(runtime.environment.calls) == 3
+    assert "pane_pid" in runtime.environment.calls[1]["command"]
 
 
 async def test_runtime_records_parser_error_as_billed_boundary(
@@ -422,7 +481,7 @@ async def test_runtime_records_parser_error_as_billed_boundary(
     runtime, _, _, _ = _runtime([response])
     prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
 
-    boundary = await runtime.start(prompt=prompt, tokens_remaining=100)
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
 
     assert boundary.tokens == 20
     assert boundary.error is not None
@@ -441,11 +500,11 @@ async def test_runtime_preserves_harbor_two_response_completion_handshake(
     )
     prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
 
-    first = await runtime.start(prompt=prompt, tokens_remaining=100)
+    first = await runtime.start(prompt=prompt, tokens_remaining=10_000)
     second = await runtime.resume(
         first.conversation,
         prompt=first.conversation.next_prompt,
-        tokens_remaining=100,
+        tokens_remaining=10_000,
     )
 
     assert first.conversation.pending_completion
@@ -461,7 +520,7 @@ async def test_runtime_records_truncation_usage_without_retry(
     runtime, agent, llm, _ = _runtime([OutputLengthExceededError(response)])
     prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
 
-    boundary = await runtime.start(prompt=prompt, tokens_remaining=50)
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
 
     assert runtime.provider_call_count == 1
     assert len(llm.calls) == 1
@@ -484,18 +543,22 @@ async def test_runtime_refuses_unpatched_truncation(
     prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
 
     with pytest.raises(LHTBRuntimeCompatibilityError, match="retain"):
-        await runtime.start(prompt=prompt, tokens_remaining=2)
+        await runtime.start(prompt=prompt, tokens_remaining=10_000)
 
 
 async def test_workspace_observer_reports_content_and_git_view_changes() -> None:
     environment = FakeEnvironment(
         [
-            RemoteResult("d\0./src\0\0f\0./src/a.py\0" + "a" * 64 + "\0"),
+            RemoteResult(
+                "d\0./src\0metadata:\0f\0./src/a.py\0metadata:"
+                + "a" * 64
+                + "\0"
+            ),
             RemoteResult("-old\n"),
             RemoteResult(
-                "d\0./src\0\0f\0./src/a.py\0"
+                "d\0./src\0metadata:\0f\0./src/a.py\0metadata:"
                 + "b" * 64
-                + "\0l\0./latest\0src/a.py\0"
+                + "\0l\0./latest\0metadata:7372632f612e7079\0"
             ),
             RemoteResult("+new\n"),
         ]
@@ -510,7 +573,10 @@ async def test_workspace_observer_reports_content_and_git_view_changes() -> None
 
     assert delta.changed_paths == ("latest", "src/a.py")
     assert "workspace-before" in delta.diff
-    assert environment.calls[0]["cwd"] == "/app"
+    manifest_call = next(
+        call for call in environment.calls if "python3" in call["command"]
+    )
+    assert manifest_call["cwd"] == "/app"
 
 
 def test_workspace_observer_rejects_root_or_relative_workspace() -> None:
@@ -522,15 +588,80 @@ def test_workspace_observer_rejects_root_or_relative_workspace() -> None:
 
 def test_workspace_manifest_supports_newlines_and_rejects_bad_digests() -> None:
     parsed = lhtb._parse_sha256_manifest(
-        "d\0./empty\nname\0\0l\0./link\0target\nname\0"
+        "d\0./empty\nname\0metadata:\0"
+        "l\0./link\0metadata:7461726765740a6e616d65\0"
     )
 
     assert parsed == {
-        "empty\nname": "d:",
-        "link": "l:target\nname",
+        "empty\nname": "d:metadata:",
+        "link": "l:metadata:7461726765740a6e616d65",
     }
     with pytest.raises(RuntimeError, match="SHA-256"):
         lhtb._parse_sha256_manifest("f\0./file\0not-a-digest\0")
+
+
+@pytest.mark.skipif(not hasattr(os, "listxattr"), reason="requires POSIX xattrs")
+def test_workspace_manifest_detects_metadata_and_special_files(tmp_path: Path) -> None:
+    file_path = tmp_path / "mode-only.txt"
+    file_path.write_text("same content")
+    fifo_path = tmp_path / "events.fifo"
+    os.mkfifo(fifo_path)
+
+    before = subprocess.run(
+        lhtb.HarborWorkspaceDeltaObserver._MANIFEST_COMMAND,
+        cwd=tmp_path,
+        shell=True,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    file_path.chmod(0o700)
+    after = subprocess.run(
+        lhtb.HarborWorkspaceDeltaObserver._MANIFEST_COMMAND,
+        cwd=tmp_path,
+        shell=True,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    before_manifest = lhtb._parse_sha256_manifest(before)
+    after_manifest = lhtb._parse_sha256_manifest(after)
+    assert before_manifest["mode-only.txt"] != after_manifest["mode-only.txt"]
+    assert after_manifest["events.fifo"].startswith("p:")
+
+
+def test_single_attempt_configuration_rejects_retry_and_fallback_keys() -> None:
+    agent = SimpleNamespace(
+        _llm_kwargs={"fallbacks": ["other"]},
+        _llm_call_kwargs={"temperature": 0.2},
+    )
+    llm = SimpleNamespace(_llm_kwargs={"max_retries": 2})
+
+    with pytest.raises(LHTBRuntimeCompatibilityError, match="fallbacks, max_retries"):
+        lhtb._validate_single_attempt_configuration(agent, llm)
+
+
+def test_packaged_harbor_patch_is_available() -> None:
+    patch = lhtb.lhtb_harbor_patch_path()
+
+    assert patch.is_file()
+    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 3" in patch.read_text()
+    assert "cat >>" in patch.read_text()
+
+
+def test_recording_rotation_stays_based_on_original_path() -> None:
+    session = FakeSession()
+    session._local_asciinema_recording_path = Path("run.cast")
+    session._remote_asciinema_recording_path = PurePosixPath("/tmp/run.cast")
+
+    lhtb._rotate_session_recording(session, 1)
+    lhtb._rotate_session_recording(session, 2)
+
+    assert session._local_asciinema_recording_path == Path("run.rollback-2.cast")
+    assert session._remote_asciinema_recording_path == PurePosixPath(
+        "/tmp/run.rollback-2.cast"
+    )
 
 
 async def test_before_restore_replaces_shell_and_verifies_cwd(
@@ -546,17 +677,30 @@ async def test_before_restore_replaces_shell_and_verifies_cwd(
     runtime, agent, _, _ = _runtime([])
     runtime.environment = environment
     runtime._process_baseline = ("2:100", "3:200")
+    runtime._canonical_workspace = "/app"
     agent._session.environment = environment
+    agent._session._local_asciinema_recording_path = Path("run.cast")
+    agent._session._remote_asciinema_recording_path = PurePosixPath("/tmp/run.cast")
 
     await runtime.before_workspace_restore("/app")
 
-    assert "kill -STOP" in environment.calls[0]["command"]
-    assert "kill -KILL" in environment.calls[0]["command"]
-    assert "2:100 3:200" in environment.calls[0]["command"]
-    assert "tmux kill-session" in environment.calls[0]["command"]
+    cleanup = next(
+        call["command"]
+        for call in environment.calls
+        if "kill -STOP" in call["command"]
+    )
+    assert "kill -KILL" in cleanup
+    assert "2:100 3:200" in cleanup
+    assert "tmux kill-session" in cleanup
+    assert "exit 42" in cleanup
+    assert agent._session.stops == 1
     assert agent._session.starts == 1
     assert agent._session.keys == [["cd -- /app", "Enter"]]
     assert agent._session._previous_buffer is None
+    assert agent._session._local_asciinema_recording_path == Path("run.rollback-1.cast")
+    assert agent._session._remote_asciinema_recording_path == PurePosixPath(
+        "/tmp/run.rollback-1.cast"
+    )
 
 
 def test_runtime_rejects_process_reward_tracker() -> None:

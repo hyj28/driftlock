@@ -7,7 +7,19 @@ index 0000000..d168455
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 2
++DRIFTLOCK_HARBOR_PATCH_VERSION = 3
+diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
+--- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
++++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
+@@ -335,7 +335,7 @@ class TmuxSession:
+             f"export SHELL=/bin/bash && "
+             f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
+             f"pipe-pane -t {self._session_name} "
+-            f"'cat > {self._logging_path}'"
++            f"'cat >> {self._logging_path}'"
+         )
+ 
+     def _tmux_send_keys(self, keys: list[str]) -> list[str]:
 diff --git a/harbor/src/harbor/llms/base.py b/harbor/src/harbor/llms/base.py
 index 6aae215..9f532e0 100644
 --- a/harbor/src/harbor/llms/base.py

@@ -33,6 +33,9 @@ class Session:
 
 
 class Observer:
+    async def canonical_workspace(self) -> str:
+        return "/app"
+
     async def snapshot(self) -> WorkspaceSnapshot:
         return WorkspaceSnapshot({})
 
@@ -44,6 +47,8 @@ class Observer:
 
 class Environment:
     async def exec(self, command: str, **kwargs: Any) -> Any:
+        if command.startswith("realpath -e --"):
+            return SimpleNamespace(stdout="/app\n", stderr="", return_code=0)
         return SimpleNamespace(stdout="2:100\n", stderr="", return_code=0)
 
 
@@ -65,8 +70,9 @@ async def test_real_pinned_terminus_loop_yields_after_one_response(
     async def fake_completion(**kwargs: Any) -> Any:
         nonlocal calls
         calls += 1
-        assert kwargs["max_tokens"] == 100
+        assert 0 < kwargs["max_tokens"] < 10_000
         assert kwargs["num_retries"] == 0
+        assert kwargs["max_retries"] == 0
 
         class Completion(dict):
             pass
@@ -107,7 +113,7 @@ async def test_real_pinned_terminus_loop_yields_after_one_response(
     prompt = await runtime.prepare_start(
         "inspect the workspace", plan="list files", rollback_feedback=None
     )
-    boundary = await runtime.start(prompt=prompt, tokens_remaining=100)
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
 
     assert calls == 1
     assert runtime.provider_call_count == 1

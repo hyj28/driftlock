@@ -2,13 +2,16 @@
 
 The implementation intentionally imports Harbor lazily.  ``driftlock`` remains a
 small provider-neutral package, while an experiment environment can install the
-pinned LHTB checkout and apply the companion patch under ``integrations/lhtb``.
+pinned LHTB checkout and apply the packaged companion patch.
 """
 
 from __future__ import annotations
 
 import difflib
+import importlib.metadata
+import importlib.resources
 import inspect
+import json
 import shlex
 import time
 from collections.abc import Mapping
@@ -18,6 +21,7 @@ from pathlib import Path, PurePosixPath
 from types import MethodType
 from typing import Any, Protocol
 
+from driftlock.models import StepTokenBudgetExhausted
 from driftlock.terminus import (
     Terminus2StateBridge,
     TerminusBoundary,
@@ -25,7 +29,27 @@ from driftlock.terminus import (
 )
 
 LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-DRIFTLOCK_HARBOR_PATCH_VERSION = 2
+LHTB_LITELLM_VERSION = "1.83.14"
+DRIFTLOCK_HARBOR_PATCH_VERSION = 3
+
+_RETRY_OR_FALLBACK_KEYS = frozenset(
+    {
+        "allowed_fails",
+        "content_policy_fallbacks",
+        "context_window_fallbacks",
+        "cooldown_time",
+        "fallbacks",
+        "max_fallbacks",
+        "max_retries",
+        "model_list",
+        "num_retries",
+        "retry_policy",
+        "routing_strategy",
+    }
+)
+_OUTPUT_TOKEN_KEYS = frozenset(
+    {"max_completion_tokens", "max_output_tokens", "max_tokens"}
+)
 
 
 class LHTBRuntimeCompatibilityError(RuntimeError):
@@ -51,6 +75,8 @@ class WorkspaceDelta:
 class WorkspaceDeltaObserver(Protocol):
     """Capture remote workspace state without mutating the task."""
 
+    async def canonical_workspace(self) -> str: ...
+
     async def snapshot(self) -> WorkspaceSnapshot: ...
 
     def compare(
@@ -68,19 +94,104 @@ class HarborWorkspaceDeltaObserver:
     """
 
     _MANIFEST_COMMAND = r"""
-find . -xdev ! -path './.git' ! -path './.git/*' -type d \
-  -printf 'd\0%p\0\0'
-find . -xdev ! -path './.git' ! -path './.git/*' -type l \
-  -printf 'l\0%p\0%l\0'
-find . -xdev ! -path './.git' ! -path './.git/*' -type f \
-  -exec sh -c '
-    for path do
-      line=$(sha256sum -- "$path") || exit
-      case "$line" in \\*) line=${line#\\};; esac
-      digest=${line%% *}
-      printf "f\0%s\0%s\0" "$path" "$digest"
-    done
-  ' sh {} +
+python3 - <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.lstat(b".")
+out = sys.stdout.buffer
+if not hasattr(os, "listxattr") or not hasattr(os, "getxattr"):
+    raise RuntimeError("remote Python must expose POSIX extended-attribute APIs")
+
+
+def digest_xattrs(path):
+    digest = hashlib.sha256()
+    for name in sorted(os.listxattr(path, follow_symlinks=False)):
+        encoded_name = os.fsencode(name)
+        value = os.getxattr(path, name, follow_symlinks=False)
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def content_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb", buffering=0) as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+root_metadata = ":".join(
+    str(item)
+    for item in (
+        root.st_mode,
+        root.st_uid,
+        root.st_gid,
+        root.st_size,
+        root.st_mtime_ns,
+    )
+).encode()
+root_value = b":".join((root_metadata, digest_xattrs(b".").encode(), b""))
+out.write(b"d\0.\0" + root_value + b"\0")
+
+
+def visit(directory, relative=b"."):
+    entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    for entry in entries:
+        if relative == b"." and entry.name == b".git":
+            continue
+        path = os.path.join(directory, entry.name)
+        shown = relative + b"/" + entry.name
+        value = os.lstat(path)
+        mode = value.st_mode
+        if stat.S_ISREG(mode):
+            kind = b"f"
+            payload = content_digest(path).encode()
+        elif stat.S_ISDIR(mode):
+            kind = b"d"
+            payload = b""
+        elif stat.S_ISLNK(mode):
+            kind = b"l"
+            payload = os.fsencode(os.readlink(path)).hex().encode()
+        elif stat.S_ISFIFO(mode):
+            kind = b"p"
+            payload = b""
+        elif stat.S_ISSOCK(mode):
+            kind = b"s"
+            payload = b""
+        elif stat.S_ISBLK(mode):
+            kind = b"b"
+            payload = str(value.st_rdev).encode()
+        elif stat.S_ISCHR(mode):
+            kind = b"c"
+            payload = str(value.st_rdev).encode()
+        else:
+            raise RuntimeError(f"unsupported workspace entry: {os.fsdecode(shown)}")
+        metadata = ":".join(
+            str(item)
+            for item in (
+                mode,
+                value.st_uid,
+                value.st_gid,
+                value.st_size,
+                value.st_mtime_ns,
+            )
+        ).encode()
+        manifest_value = b":".join(
+            (metadata, digest_xattrs(path).encode(), payload)
+        )
+        out.write(kind + b"\0" + shown + b"\0" + manifest_value + b"\0")
+        if kind == b"d" and value.st_dev == root.st_dev:
+            visit(path, shown)
+
+
+visit(b".")
+PY
 """.strip()
     _GIT_VIEW_COMMAND = (
         "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then "
@@ -105,17 +216,33 @@ find . -xdev ! -path './.git' ! -path './.git/*' -type f \
         self.environment = environment
         self.remote_workspace = remote_workspace
         self.user = user
+        self._canonical_workspace: str | None = None
+
+    async def canonical_workspace(self) -> str:
+        canonical = await _canonical_remote_workspace(
+            self.environment,
+            self.remote_workspace,
+            user=self.user,
+        )
+        if (
+            self._canonical_workspace is not None
+            and canonical != self._canonical_workspace
+        ):
+            raise RuntimeError("remote workspace canonical path changed during the run")
+        self._canonical_workspace = canonical
+        return canonical
 
     async def snapshot(self) -> WorkspaceSnapshot:
+        workspace = await self.canonical_workspace()
         manifest_result = await self.environment.exec(
             self._MANIFEST_COMMAND,
-            cwd=self.remote_workspace,
+            cwd=workspace,
             user=self.user,
         )
         _require_remote_success(manifest_result, "hash remote workspace")
         git_result = await self.environment.exec(
             self._GIT_VIEW_COMMAND,
-            cwd=self.remote_workspace,
+            cwd=workspace,
             user=self.user,
         )
         _require_remote_success(git_result, "capture remote Git view")
@@ -197,15 +324,21 @@ class LHTBTerminusRuntime:
         if not workspace_path.is_absolute() or workspace_path == PurePosixPath("/"):
             raise ValueError("remote_workspace must be an absolute non-root POSIX path")
         self.remote_workspace = remote_workspace
-        if not callable(getattr(observer, "snapshot", None)) or not callable(
-            getattr(observer, "compare", None)
+        observer_methods = ("canonical_workspace", "snapshot", "compare")
+        if any(
+            not callable(getattr(observer, name, None)) for name in observer_methods
         ):
-            raise TypeError("observer must implement snapshot() and compare()")
+            raise TypeError(
+                "observer must implement canonical_workspace(), snapshot(), "
+                "and compare()"
+            )
         self.observer = observer
         self.bridge = Terminus2StateBridge()
         self._prepared_prompt: str | None = None
         self._initialized = False
         self._process_baseline: tuple[str, ...] | None = None
+        self._canonical_workspace: str | None = None
+        self._recording_generation = 0
         self._require_pinned_harbor = require_pinned_harbor
         self._validate_agent()
         if require_pinned_harbor:
@@ -219,6 +352,7 @@ class LHTBTerminusRuntime:
                 raise LHTBRuntimeCompatibilityError(
                     "the pinned runtime supports Harbor's LiteLLM backend only"
                 )
+            _validate_single_attempt_configuration(agent, llm)
         if isinstance(llm, _CountingLLM):
             raise LHTBRuntimeCompatibilityError(
                 "Terminus agent is already owned by an LHTBTerminusRuntime"
@@ -256,6 +390,22 @@ class LHTBTerminusRuntime:
 
         calls_before = self.provider_call_count
         agent = self.agent
+        runtime_workspace = await _canonical_remote_workspace(
+            self.environment,
+            self.remote_workspace,
+            user=getattr(agent._session, "_user", None),
+        )
+        observer_workspace = await self.observer.canonical_workspace()
+        if observer_workspace != runtime_workspace:
+            raise LHTBRuntimeCompatibilityError(
+                "runtime and workspace observer resolve different canonical paths"
+            )
+        if (
+            self._canonical_workspace is not None
+            and runtime_workspace != self._canonical_workspace
+        ):
+            raise RuntimeError("remote workspace canonical path changed during the run")
+        self._canonical_workspace = runtime_workspace
         if self._process_baseline is None:
             self._process_baseline = await self._capture_process_baseline()
         if not self._initialized:
@@ -354,13 +504,37 @@ class LHTBTerminusRuntime:
         steps_before = len(self.agent._trajectory_steps)
         old_max_episodes = self.agent._max_episodes
         old_call_kwargs = dict(self.agent._llm_call_kwargs)
+        if self._require_pinned_harbor:
+            _validate_single_attempt_configuration(
+                self.agent, self._counting_llm.delegate
+            )
         if tokens_remaining is not None:
-            configured = old_call_kwargs.get("max_tokens")
-            ceiling = tokens_remaining
-            if isinstance(configured, int) and not isinstance(configured, bool):
-                ceiling = min(ceiling, configured)
-            self.agent._llm_call_kwargs["max_tokens"] = ceiling
+            input_tokens = _conservative_input_token_bound(
+                self.agent,
+                _agent_chat(self.agent),
+                prompt,
+            )
+            ceiling = tokens_remaining - input_tokens
+            if ceiling <= 0:
+                raise StepTokenBudgetExhausted(
+                    "remaining token budget cannot cover the next provider input"
+                )
+            output_key = (
+                "max_output_tokens"
+                if getattr(self._counting_llm.delegate, "_use_responses_api", False)
+                else "max_tokens"
+            )
+            configured_values = (
+                old_call_kwargs.get(key) for key in _OUTPUT_TOKEN_KEYS
+            )
+            for configured in configured_values:
+                if isinstance(configured, int) and not isinstance(configured, bool):
+                    ceiling = min(ceiling, configured)
+            for key in _OUTPUT_TOKEN_KEYS:
+                self.agent._llm_call_kwargs.pop(key, None)
+            self.agent._llm_call_kwargs[output_key] = ceiling
         self.agent._llm_call_kwargs["num_retries"] = 0
+        self.agent._llm_call_kwargs["max_retries"] = 0
         self.agent._max_episodes = self.agent._n_episodes + 1
 
         truncation: BaseException | None = None
@@ -433,20 +607,32 @@ class LHTBTerminusRuntime:
             raise LHTBRuntimeCompatibilityError("TmuxSession._session_name is required")
         if self._process_baseline is None:
             raise RuntimeError("prepare_start must capture the process baseline first")
+        if self._canonical_workspace is None:
+            raise RuntimeError("prepare_start must canonicalize the workspace first")
         user = getattr(session, "_user", None)
+        canonical = await _canonical_remote_workspace(
+            self.environment,
+            remote_workspace,
+            user=user,
+        )
+        if canonical != self._canonical_workspace:
+            raise ValueError("restore workspace canonical path does not match runtime")
+        await session.stop()
         result = await self.environment.exec(
             _kill_tmux_tree_command(
                 session_name,
-                remote_workspace,
+                canonical,
                 process_baseline=self._process_baseline,
             ),
             user=user,
             timeout_sec=30,
         )
         _require_remote_success(result, "quiesce rejected tmux process tree")
+        self._recording_generation += 1
+        _rotate_session_recording(session, self._recording_generation)
         await session.start()
         await session.send_keys(
-            [f"cd -- {shlex.quote(remote_workspace)}", "Enter"],
+            [f"cd -- {shlex.quote(canonical)}", "Enter"],
             min_timeout_sec=0.1,
         )
         cwd_result = await self.environment.exec(
@@ -457,13 +643,7 @@ class LHTBTerminusRuntime:
         )
         _require_remote_success(cwd_result, "verify replacement tmux cwd")
         actual_cwd = (cwd_result.stdout or "").strip()
-        expected_result = await self.environment.exec(
-            f"realpath -e -- {shlex.quote(remote_workspace)}",
-            user=user,
-            timeout_sec=10,
-        )
-        _require_remote_success(expected_result, "canonicalize replacement tmux cwd")
-        if actual_cwd != (expected_result.stdout or "").strip():
+        if actual_cwd != canonical:
             raise RuntimeError(
                 f"replacement tmux cwd is {actual_cwd!r}, expected remote workspace"
             )
@@ -559,8 +739,8 @@ def _validate_pinned_harbor() -> None:
         marker = __import__("harbor._driftlock_pin", fromlist=["*"])
     except ImportError as error:
         raise LHTBRuntimeCompatibilityError(
-            "install LHTB Harbor at the pinned revision and apply "
-            "integrations/lhtb/driftlock-harbor.patch"
+            "install LHTB Harbor at the pinned revision and apply the patch from "
+            "driftlock.lhtb_harbor_patch_path()"
         ) from error
     revision = getattr(marker, "LHTB_REPOSITORY_REVISION", None)
     patch_version = getattr(marker, "DRIFTLOCK_HARBOR_PATCH_VERSION", None)
@@ -570,6 +750,122 @@ def _validate_pinned_harbor() -> None:
         raise LHTBRuntimeCompatibilityError(
             "installed Harbor does not match driftlock's pinned LHTB integration"
         )
+    try:
+        installed_litellm = importlib.metadata.version("litellm")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise LHTBRuntimeCompatibilityError(
+            "the pinned Harbor environment must install LiteLLM from its lockfile"
+        ) from error
+    if installed_litellm != LHTB_LITELLM_VERSION:
+        raise LHTBRuntimeCompatibilityError(
+            "installed LiteLLM does not match the pinned Harbor lockfile: "
+            f"expected {LHTB_LITELLM_VERSION}, found {installed_litellm}"
+        )
+
+
+def lhtb_harbor_patch_path() -> Path:
+    """Return the installed companion patch for the pinned Harbor checkout."""
+    resource = importlib.resources.files("driftlock").joinpath(
+        "integrations/lhtb/driftlock-harbor.patch"
+    )
+    return Path(str(resource))
+
+
+def _validate_single_attempt_configuration(agent: Any, llm: Any) -> None:
+    configured: set[str] = set()
+    for value in (
+        getattr(agent, "_llm_kwargs", None),
+        getattr(agent, "_llm_call_kwargs", None),
+        getattr(llm, "_llm_kwargs", None),
+    ):
+        if isinstance(value, Mapping):
+            configured.update(_RETRY_OR_FALLBACK_KEYS.intersection(value))
+    if configured:
+        names = ", ".join(sorted(configured))
+        raise LHTBRuntimeCompatibilityError(
+            "retry, router, and fallback configuration is unsupported: " + names
+        )
+    llm_kwargs = getattr(llm, "_llm_kwargs", None)
+    if isinstance(llm_kwargs, Mapping):
+        base_output_keys = sorted(_OUTPUT_TOKEN_KEYS.intersection(llm_kwargs))
+        if base_output_keys:
+            raise LHTBRuntimeCompatibilityError(
+                "output token limits must be supplied through Terminus "
+                "llm_call_kwargs, not LiteLLM model kwargs: "
+                + ", ".join(base_output_keys)
+            )
+    try:
+        litellm = __import__("litellm")
+    except ImportError:
+        return
+    if getattr(litellm, "model_fallbacks", None):
+        raise LHTBRuntimeCompatibilityError(
+            "global litellm.model_fallbacks must be disabled"
+        )
+
+
+def _conservative_input_token_bound(agent: Any, chat: Any, prompt: str) -> int:
+    messages = [*chat.messages, {"role": "user", "content": prompt}]
+    encoded = json.dumps(
+        messages,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    byte_bound = len(encoded) + 32 * len(messages) + 256
+    try:
+        token_counter = __import__(
+            "litellm", fromlist=["token_counter"]
+        ).token_counter
+        estimated = token_counter(model=agent._model_name, messages=messages)
+    except Exception:
+        estimated = 0
+    if not isinstance(estimated, int) or isinstance(estimated, bool) or estimated < 0:
+        estimated = 0
+    return max(byte_bound, estimated)
+
+
+def _rotate_session_recording(session: Any, generation: int) -> None:
+    """Use a fresh cast file after each stopped rejected trajectory."""
+    for name in (
+        "_local_asciinema_recording_path",
+        "_remote_asciinema_recording_path",
+    ):
+        original_name = f"_driftlock_original{name}"
+        if not hasattr(session, original_name):
+            setattr(session, original_name, getattr(session, name, None))
+        value = getattr(session, original_name)
+        if value is None:
+            continue
+        path = Path(value) if name.startswith("_local") else PurePosixPath(value)
+        stem = path.name.removesuffix(path.suffix)
+        rotated = path.with_name(f"{stem}.rollback-{generation}{path.suffix}")
+        setattr(session, name, rotated)
+    markers = getattr(session, "_markers", None)
+    if isinstance(markers, list):
+        markers.clear()
+
+
+async def _canonical_remote_workspace(
+    environment: Any,
+    remote_workspace: str,
+    *,
+    user: str | int | None,
+) -> str:
+    result = await environment.exec(
+        f"realpath -e -- {shlex.quote(remote_workspace)}",
+        user=user,
+        timeout_sec=10,
+    )
+    _require_remote_success(result, "canonicalize remote workspace")
+    lines = (getattr(result, "stdout", None) or "").splitlines()
+    if len(lines) != 1:
+        raise RuntimeError("remote workspace canonicalization returned invalid output")
+    canonical = lines[0]
+    path = PurePosixPath(canonical)
+    if not path.is_absolute() or path == PurePosixPath("/") or canonical != str(path):
+        raise ValueError("remote workspace resolves to an invalid or root path")
+    return canonical
 
 
 def _harbor_symbol(module: str, name: str) -> Any:
@@ -745,17 +1041,20 @@ def _parse_sha256_manifest(output: str) -> dict[str, str]:
     for offset in range(0, len(fields) - 1, 3):
         kind, name, value = fields[offset : offset + 3]
         normalized = name.removeprefix("./")
-        if kind not in {"d", "f", "l"} or not normalized or normalized in files:
+        if kind not in {"b", "c", "d", "f", "l", "p", "s"} or (
+            not normalized or normalized in files
+        ):
             raise RuntimeError("remote workspace returned duplicate or empty paths")
+        if not value:
+            raise RuntimeError("remote workspace returned empty metadata")
+        payload = value.rsplit(":", 1)[-1]
         if kind == "f" and (
-            len(value) != 64
+            len(payload) != 64
             or any(
-                character not in "0123456789abcdefABCDEF" for character in value
+                character not in "0123456789abcdefABCDEF" for character in payload
             )
         ):
             raise RuntimeError("remote workspace returned an invalid SHA-256 digest")
-        if kind == "d" and value:
-            raise RuntimeError("remote directory manifest value must be empty")
         files[normalized] = f"{kind}:{value.lower() if kind == 'f' else value}"
     return files
 
@@ -861,7 +1160,16 @@ while [ "$changed" -eq 1 ]; do
     esac
   done
 done
+targets=
 for pid in $marked; do
+  stat=/proc/$pid/stat
+  [ -r "$stat" ] || continue
+  IFS= read -r value < "$stat" || continue
+  rest=${{value##*) }}
+  set -- $rest
+  start=${{20:-}}
+  case "$start" in ''|*[!0-9]*) continue;; esac
+  targets="$targets $pid:$start"
   kill -KILL "$pid" 2>/dev/null || true
 done
 tmux kill-session -t {session} 2>/dev/null || true
@@ -893,20 +1201,50 @@ while [ "$changed" -eq 1 ]; do
     [ -r "$stat" ] || continue
     pid=${{stat#/proc/}}
     pid=${{pid%/stat}}
-    case " $protected $candidates " in *" $pid "*) continue;; esac
+    case " $protected " in *" $pid "*) continue;; esac
     IFS= read -r value < "$stat" || continue
     rest=${{value##*) }}
     set -- $rest
     start=${{20:-}}
     case "$start" in ''|*[!0-9]*) continue;; esac
     case " $baseline " in *" $pid:$start "*) continue;; esac
-    candidates="$candidates $pid"
+    case " $candidates " in *" $pid:$start "*) continue;; esac
+    candidates="$candidates $pid:$start"
     kill -STOP "$pid" 2>/dev/null || true
     changed=1
   done
 done
-sleep 1
-for pid in $candidates; do kill -KILL "$pid" 2>/dev/null || true; done
+for identity in $candidates; do
+  pid=${{identity%%:*}}
+  kill -KILL "$pid" 2>/dev/null || true
+done
+targets="$targets$candidates"
+
+# A failed signal is harmless only if the exact PID/start-time identity has exited.
+# Poll briefly so the restore hook cannot report success while rejected code survives.
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+  survivors=
+  for identity in $targets; do
+    pid=${{identity%%:*}}
+    expected=${{identity#*:}}
+    stat=/proc/$pid/stat
+    [ -r "$stat" ] || continue
+    IFS= read -r value < "$stat" || continue
+    rest=${{value##*) }}
+    set -- $rest
+    state=${{1:-}}
+    actual=${{20:-}}
+    if [ "$actual" = "$expected" ] && [ "$state" != Z ]; then
+      survivors="$survivors $identity"
+    fi
+  done
+  [ -z "$survivors" ] && exit 0
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+printf 'rejected processes survived cleanup:%s\n' "$survivors" >&2
+exit 42
 """.strip()
 
 

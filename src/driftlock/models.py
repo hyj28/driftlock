@@ -27,6 +27,10 @@ class RunStatus(StrEnum):
     ROLLBACK_LIMIT = "rollback_limit"
 
 
+class StepTokenBudgetExhausted(RuntimeError):
+    """Raised before a provider call when no safe output-token allowance remains."""
+
+
 @dataclass(frozen=True, slots=True)
 class Checkpoint:
     """A durable workspace and agent-state snapshot."""

@@ -12,6 +12,7 @@ from driftlock.models import (
     RunStatus,
     StepContext,
     StepOutcome,
+    StepTokenBudgetExhausted,
     Verdict,
 )
 from driftlock.runner import DriftlockRunner, RunnerConfig
@@ -133,6 +134,26 @@ async def test_runner_enforces_token_budget(tmp_path: Path) -> None:
     assert result.agent_tokens_used == 10
     assert result.judge_tokens_used == 0
     assert remaining == [10, 3]
+
+
+async def test_runner_stops_cleanly_when_step_preflight_exhausts_budget(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(_context: StepContext) -> StepOutcome:
+        raise StepTokenBudgetExhausted("input consumes the remaining budget")
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        config=RunnerConfig(max_steps=3, max_tokens=10),
+    ).run(goal="bounded", step=agent_step, initial_state={"safe": True})
+
+    assert result.status is RunStatus.TOKEN_LIMIT
+    assert result.state == {"safe": True}
+    assert result.steps == ()
+    assert result.tokens_used == 0
 
 
 async def test_completion_cannot_claim_success_over_token_budget(
