@@ -1,13 +1,13 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000..f4e601d
+index 0000000..a353bf1
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 4
++DRIFTLOCK_HARBOR_PATCH_VERSION = 5
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
 index bcd0473..b3daf62 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
@@ -44,10 +44,21 @@ index bcd0473..b3daf62 100644
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
 diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-index 74f836b..94e0016 100644
+index 74f836b..39f194f 100644
 --- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
 +++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-@@ -335,7 +335,7 @@ class TmuxSession:
+@@ -13,7 +13,9 @@ class TmuxSession:
+     _ENTER_KEYS = {"Enter", "C-m", "KPEnter", "C-j", "^M", "^J"}
+     _ENDS_WITH_NEWLINE_PATTERN = r"[\r\n]$"
+     _NEWLINE_CHARS = "\r\n"
+-    _TMUX_COMPLETION_COMMAND = "; tmux wait -S done"
++    _TMUX_COMPLETION_COMMAND = (
++        '__driftlock_status=$?; tmux wait -S done; (exit "$__driftlock_status")'
++    )
+     # tmux silently drops commands exceeding its internal buffer (~16 KB since
+     # tmux 1.9, see https://github.com/tmux/tmux/issues/254). Keep a
+     # conservative margin below that hard ceiling.
+@@ -335,7 +337,7 @@ class TmuxSession:
              f"export SHELL=/bin/bash && "
              f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
              f"pipe-pane -t {self._session_name} "
@@ -56,6 +67,18 @@ index 74f836b..94e0016 100644
          )
  
      def _tmux_send_keys(self, keys: list[str]) -> list[str]:
+@@ -563,7 +565,10 @@ class TmuxSession:
+         if not block or not keys or not self._is_executing_command(keys[-1]):
+             return keys, False
+ 
+-        keys = self._prevent_execution(keys)
++        # Queue the marker as a separate shell input line. Editing the accepted
++        # command itself corrupts heredoc terminators such as a final ``EOF``.
++        # The marker's final subshell restores the accepted command's exit status.
++        keys = keys.copy()
+         keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
+ 
+         return keys, True
 diff --git a/harbor/src/harbor/llms/base.py b/harbor/src/harbor/llms/base.py
 index 6aae215..9f532e0 100644
 --- a/harbor/src/harbor/llms/base.py
@@ -227,13 +250,16 @@ index 7442a5f..6d9a900 100644
 +        return llm_response
 diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 new file mode 100644
-index 0000000..f312d1c
+index 0000000..fadfab9
 --- /dev/null
 +++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,96 @@
++import subprocess
++
 +import pytest
 +
 +from harbor.agents.terminus_2.terminus_2 import Command, Terminus2
++from harbor.agents.terminus_2.tmux_session import TmuxSession
 +
 +
 +class FakeSession:
@@ -291,6 +317,39 @@ index 0000000..f312d1c
 +        (["C-c"], {"block": False, "min_timeout_sec": 0.1}),
 +        ([":", "Enter"], {"block": True, "max_timeout_sec": 10.0}),
 +    ]
++
++
++def tmux_session_stub() -> TmuxSession:
++    session = object.__new__(TmuxSession)
++    return session
++
++
++def test_blocking_keys_preserve_heredoc_terminator():
++    command = "cat <<'EOF'\nhello\nEOF\n"
++
++    prepared, blocking = tmux_session_stub()._prepare_keys(command, block=True)
++
++    assert blocking
++    assert prepared[0] == command
++    assert prepared[1:] == [TmuxSession._TMUX_COMPLETION_COMMAND, "Enter"]
++    assert "EOF;" not in "".join(prepared)
++
++
++def test_completion_marker_restores_original_exit_status():
++    marker_without_tmux = TmuxSession._TMUX_COMPLETION_COMMAND.replace(
++        "tmux wait -S done", ":"
++    )
++    script = "false\n" + marker_without_tmux + "\nprintf '%s' $?\n"
++
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc"],
++        input=script,
++        text=True,
++        capture_output=True,
++        check=True,
++    )
++
++    assert result.stdout == "1"
 diff --git a/harbor/tests/unit/llms/test_chat.py b/harbor/tests/unit/llms/test_chat.py
 index b34b4fc..20cc6ac 100644
 --- a/harbor/tests/unit/llms/test_chat.py

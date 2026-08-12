@@ -44,7 +44,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 4
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 5
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -94,9 +94,10 @@ response plus its terminal commands, and restores the configured limit. It reser
 a conservative bound for input tokens before setting the chat or Responses API
 output ceiling. Harbor waits for a shell completion marker before the runtime takes
 its post-episode workspace snapshot, preventing a foreground command from racing an
-accepted checkpoint. Rollback restores semantic chat state while physical calls,
-usage, trajectory steps, pane logs, cast segments, and session identifiers remain
-monotonic.
+accepted checkpoint. The marker is queued on its own input line, so multiline and
+heredoc commands remain byte-for-byte intact, and it restores the original command's
+exit status. Rollback restores semantic chat state while physical calls, usage,
+trajectory steps, pane logs, cast segments, and session identifiers remain monotonic.
 
 Use `step.before_workspace_restore` as the remote checkpoint store's `before_restore`
 hook. Before the first episode the runtime records PID/start-time identities for
