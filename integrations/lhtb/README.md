@@ -1,7 +1,7 @@
 # Pinned LHTB Harbor integration
 
 `driftlock` targets the LHTB repository at commit
-`0d9918f6b66eda0752f8c7d17c9a73a18ee32f98`. The companion patch does four
+`0d9918f6b66eda0752f8c7d17c9a73a18ee32f98`. The companion patch does five
 things the boundary runtime cannot safely infer from stock Harbor:
 
 1. it adds a revision marker checked when `LHTBTerminusRuntime` starts;
@@ -10,7 +10,9 @@ things the boundary runtime cannot safely infer from stock Harbor:
 3. it counts calls immediately around `acompletion` / `aresponses` and disables
    LiteLLM's parameter-fallback retry while driftlock owns a one-response boundary;
 4. it appends to the tmux pane log so replacing a rejected shell cannot erase the
-   earlier physical trajectory.
+   earlier physical trajectory; and
+5. it waits for a shell completion marker before exposing a command boundary, and
+   interrupts plus verifies quiescence after a command timeout.
 
 The patch also factors Harbor's normal chat accounting into `Chat.record_response()`
 so a billed truncated response can be recorded exactly once without a retry.
@@ -42,7 +44,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 3
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 4
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -51,8 +53,9 @@ PY
 Run the no-network integration smoke test against Harbor's real Terminus loop:
 
 ```bash
-uv run --with pytest --with pytest-asyncio \
-  pytest -q /absolute/path/to/driftlock/integrations/lhtb/test_runtime_smoke.py
+uv pip install --python harbor/.venv/bin/python pytest pytest-asyncio
+harbor/.venv/bin/python -m pytest -q \
+  /absolute/path/to/driftlock/integrations/lhtb/test_runtime_smoke.py
 ```
 
 The runtime supports LHTB's LiteLLM backend. Construct Terminus-2 with
@@ -89,8 +92,11 @@ runtime rejects router, fallback, or retry configuration and validates LiteLLM
 sets Harbor's episode limit to the next physical episode, executes one provider
 response plus its terminal commands, and restores the configured limit. It reserves
 a conservative bound for input tokens before setting the chat or Responses API
-output ceiling. Rollback restores semantic chat state while physical calls, usage,
-trajectory steps, pane logs, cast segments, and session identifiers remain monotonic.
+output ceiling. Harbor waits for a shell completion marker before the runtime takes
+its post-episode workspace snapshot, preventing a foreground command from racing an
+accepted checkpoint. Rollback restores semantic chat state while physical calls,
+usage, trajectory steps, pane logs, cast segments, and session identifiers remain
+monotonic.
 
 Use `step.before_workspace_restore` as the remote checkpoint store's `before_restore`
 hook. Before the first episode the runtime records PID/start-time identities for

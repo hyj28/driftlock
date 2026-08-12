@@ -274,7 +274,9 @@ otherwise discarded LiteLLM usage on output truncation, counts the lowest-level
 provider attempt, disables both retry layers, and installs a revision marker that the
 runtime checks before making a provider call. The runtime also verifies Harbor's
 frozen LiteLLM version, reserves input tokens before capping output, and retains pane
-and cast audit history across shell replacement. Installation and construction
+and cast audit history across shell replacement. The patch also makes terminal
+commands reach a shell completion marker before a workspace boundary is observed.
+Installation and construction
 instructions are in [`integrations/lhtb/README.md`](integrations/lhtb/README.md).
 `HarborWorkspaceDeltaObserver` hashes content and POSIX metadata for the full remote
 workspace around each episode and records a before/after Git view, so the heuristics

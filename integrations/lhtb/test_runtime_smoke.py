@@ -22,6 +22,9 @@ class Session:
     _session_name = "terminus-2"
     _user = "root"
 
+    def __init__(self) -> None:
+        self.sent_keys: list[tuple[Any, dict[str, Any]]] = []
+
     async def get_incremental_output(self) -> str:
         return "Current Terminal Screen:\nroot@container:/app#"
 
@@ -29,7 +32,7 @@ class Session:
         return True
 
     async def send_keys(self, keys: Any, **kwargs: Any) -> None:
-        return None
+        self.sent_keys.append((keys, kwargs))
 
 
 class Observer:
@@ -63,7 +66,8 @@ async def test_real_pinned_terminus_loop_yields_after_one_response(
         enable_summarize=False,
         record_terminal_session=False,
     )
-    agent._session = Session()
+    session = Session()
+    agent._session = session
     agent._dump_trajectory = lambda: None
     calls = 0
 
@@ -85,7 +89,8 @@ async def test_real_pinned_terminus_loop_yields_after_one_response(
                         "message": {
                             "content": (
                                 '{"analysis":"inspect","plan":"list files",'
-                                '"commands":[],"task_complete":false}'
+                                '"commands":[{"keystrokes":"pwd\\n",'
+                                '"duration":0.1}],"task_complete":false}'
                             ),
                             "reasoning_content": None,
                         },
@@ -121,3 +126,4 @@ async def test_real_pinned_terminus_loop_yields_after_one_response(
     assert boundary.conversation.episode == 1
     assert boundary.conversation.messages[-2]["content"] == prompt
     assert len(agent._trajectory_steps) == 2
+    assert any(kwargs.get("block") is True for _, kwargs in session.sent_keys)
