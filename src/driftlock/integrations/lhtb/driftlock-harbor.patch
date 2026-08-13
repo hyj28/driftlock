@@ -1,18 +1,18 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000..e355433
+index 0000000..6741a39
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 8
++DRIFTLOCK_HARBOR_PATCH_VERSION = 9
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-index bcd0473..4ad2df8 100644
+index bcd0473..f6ba8fe 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
 +++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-@@ -1250,14 +1250,49 @@ so ask everything you need to know."""
+@@ -1250,14 +1250,55 @@ so ask everything you need to know."""
          Returns:
              Tuple of (timeout_occurred, terminal_output)
          """
@@ -34,11 +34,18 @@ index bcd0473..4ad2df8 100644
 +
 +        for index, command in enumerate(commands):
 +            block = index == boundary_index
++            keys = command.keystrokes
++            if block and keys in TmuxSession._SHELL_RETURN_KEYS:
++                # A control key is a valid action but not proof that an interactive
++                # program returned to Bash. Queue a no-op whose completion marker
++                # can only run after the control key actually reaches the shell.
++                keys = [keys, ":", "Enter"]
              try:
                  await session.send_keys(
-                     command.keystrokes,
+-                    command.keystrokes,
 -                    block=False,
 -                    min_timeout_sec=command.duration_sec,
++                    keys,
 +                    block=block,
 +                    min_timeout_sec=0.0 if block else command.duration_sec,
 +                    max_timeout_sec=max(180.0, command.duration_sec),
@@ -66,7 +73,7 @@ index bcd0473..4ad2df8 100644
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
 diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-index 74f836b..a1d4c75 100644
+index 74f836b..718b984 100644
 --- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
 +++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
 @@ -1,5 +1,6 @@
@@ -148,7 +155,7 @@ index 74f836b..a1d4c75 100644
  
 -        keys = self._prevent_execution(keys)
 -        keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
-+        if not self.can_end_command_batch(keys[-1]):
++        if not self.is_executing_command(keys[-1]):
 +            raise ValueError("blocking keys must end at a shell command boundary")
  
 -        return keys, True
@@ -379,10 +386,10 @@ index 7442a5f..6d9a900 100644
 +        return llm_response
 diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 new file mode 100644
-index 0000000..46984eb
+index 0000000..7edf06c
 --- /dev/null
 +++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,324 @@
 +import os
 +import pty
 +import select
@@ -504,7 +511,7 @@ index 0000000..46984eb
 +    )
 +
 +    assert session.calls[-1] == (
-+        control_key,
++        [control_key, ":", "Enter"],
 +        {"block": True, "min_timeout_sec": 0.0, "max_timeout_sec": 180.0},
 +    )
 +
@@ -550,15 +557,9 @@ index 0000000..46984eb
 +
 +
 +@pytest.mark.parametrize("control_key", ["C-c", "C-d"])
-+def test_blocking_keys_queue_marker_after_shell_return_control_key(control_key):
-+    prepared, completion_channel = tmux_session_stub()._prepare_keys(
-+        control_key, block=True
-+    )
-+
-+    assert completion_channel is not None
-+    assert prepared[0] == control_key
-+    assert f"tmux wait -S {completion_channel}" in prepared[1]
-+    assert prepared[2] == "Enter"
++def test_blocking_keys_reject_unverified_shell_return_control_key(control_key):
++    with pytest.raises(ValueError, match="shell command boundary"):
++        tmux_session_stub()._prepare_keys(control_key, block=True)
 +
 +
 +def test_completion_marker_restores_original_exit_status():
@@ -628,6 +629,39 @@ index 0000000..46984eb
 +
 +        assert b"DRIFTLOCK_MARKER" in output
 +        assert b"SyntaxError" not in output
++    finally:
++        os.write(descriptor, b"exit\n")
++        os.close(descriptor)
++        os.waitpid(pid, 0)
++
++
++def test_control_key_boundary_marker_runs_after_shell_noop():
++    pid, descriptor = pty.fork()
++    if pid == 0:
++        os.execvp("bash", ["bash", "--noprofile", "--norc"])
++
++    output = bytearray()
++
++    def read_available(duration: float) -> None:
++        deadline = time.monotonic() + duration
++        while time.monotonic() < deadline:
++            readable, _, _ = select.select([descriptor], [], [], 0.05)
++            if readable:
++                output.extend(os.read(descriptor, 65_536))
++
++    try:
++        read_available(0.1)
++        os.write(descriptor, b"sleep 10\n")
++        read_available(0.1)
++        os.write(descriptor, b"\x03")
++        read_available(0.1)
++        marker = TmuxSession._TMUX_COMPLETION_COMMAND.format(
++            completion_channel="test-channel"
++        ).replace("tmux wait -S test-channel", "echo DRIFTLOCK_MARKER")
++        os.write(descriptor, f":\n{marker}\n".encode())
++        read_available(1.0)
++
++        assert b"DRIFTLOCK_MARKER" in output
 +    finally:
 +        os.write(descriptor, b"exit\n")
 +        os.close(descriptor)

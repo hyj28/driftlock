@@ -44,7 +44,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 8
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 9
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -99,10 +99,11 @@ channel so task commands and concurrent sessions cannot release another boundary
 waiter. The marker is queued on its own input line, so multiline and heredoc commands
 remain byte-for-byte intact, and it restores the original command's exit status. A
 batch whose final non-empty keystroke does not execute a shell command is rejected
-before any part of that batch is sent; Harbor's documented `C-c` and `C-d` control
-keys are accepted as explicit ways to return from an interactive program before the
-marker is queued. Intermediate commands keep Harbor's requested duration, allowing
-an interactive program to be opened, used, and exited within one response.
+before any part of that batch is sent. Harbor's documented `C-c` and `C-d` control
+keys remain valid final actions, but are not trusted as proof of shell return: the
+runtime queues an internal no-op and requires its marker to complete before exposing
+the boundary. Intermediate commands keep Harbor's requested duration, allowing an
+interactive program to be opened, used, and exited within one response.
 Persistent interactive state across provider responses is intentionally unsupported
 because it cannot be represented by workspace and conversation checkpoints; the
 runtime adds this constraint to the agent prompt. Rollback restores semantic chat
