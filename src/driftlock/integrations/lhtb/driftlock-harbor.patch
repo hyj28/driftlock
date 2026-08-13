@@ -1,15 +1,15 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000..88c720f
+index 0000000..e355433
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 7
++DRIFTLOCK_HARBOR_PATCH_VERSION = 8
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-index bcd0473..7020e12 100644
+index bcd0473..4ad2df8 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
 +++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
 @@ -1250,14 +1250,49 @@ so ask everything you need to know."""
@@ -25,7 +25,7 @@ index bcd0473..7020e12 100644
 +            ),
 +            None,
 +        )
-+        if boundary_index is not None and not TmuxSession.is_executing_command(
++        if boundary_index is not None and not TmuxSession.can_end_command_batch(
 +            commands[boundary_index].keystrokes
 +        ):
 +            raise ValueError(
@@ -66,7 +66,7 @@ index bcd0473..7020e12 100644
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
 diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-index 74f836b..1c8385f 100644
+index 74f836b..a1d4c75 100644
 --- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
 +++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
 @@ -1,5 +1,6 @@
@@ -76,8 +76,11 @@ index 74f836b..1c8385f 100644
  import shlex
  import time
  from pathlib import Path, PurePosixPath
-@@ -13,7 +14,9 @@ class TmuxSession:
+@@ -11,9 +12,12 @@ from harbor.utils.logger import logger
+ 
+ class TmuxSession:
      _ENTER_KEYS = {"Enter", "C-m", "KPEnter", "C-j", "^M", "^J"}
++    _SHELL_RETURN_KEYS = {"C-c", "C-d"}
      _ENDS_WITH_NEWLINE_PATTERN = r"[\r\n]$"
      _NEWLINE_CHARS = "\r\n"
 -    _TMUX_COMPLETION_COMMAND = "; tmux wait -S done"
@@ -87,7 +90,7 @@ index 74f836b..1c8385f 100644
      # tmux silently drops commands exceeding its internal buffer (~16 KB since
      # tmux 1.9, see https://github.com/tmux/tmux/issues/254). Keep a
      # conservative margin below that hard ceiling.
-@@ -335,7 +338,7 @@ class TmuxSession:
+@@ -335,7 +339,7 @@ class TmuxSession:
              f"export SHELL=/bin/bash && "
              f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
              f"pipe-pane -t {self._session_name} "
@@ -96,7 +99,7 @@ index 74f836b..1c8385f 100644
          )
  
      def _tmux_send_keys(self, keys: list[str]) -> list[str]:
-@@ -523,8 +526,15 @@ class TmuxSession:
+@@ -523,8 +527,19 @@ class TmuxSession:
          )
          return result.return_code == 0
  
@@ -107,13 +110,17 @@ index 74f836b..1c8385f 100644
 +            or re.search(cls._ENDS_WITH_NEWLINE_PATTERN, key) is not None
 +        )
 +
++    @classmethod
++    def can_end_command_batch(cls, key: str) -> bool:
++        return cls.is_executing_command(key) or key in cls._SHELL_RETURN_KEYS
++
      def _is_executing_command(self, key: str) -> bool:
 -        return self._is_enter_key(key) or self._ends_with_newline(key)
 +        return self.is_executing_command(key)
  
      def _prevent_execution(self, keys: list[str]) -> list[str]:
          keys = keys.copy()
-@@ -545,7 +555,7 @@ class TmuxSession:
+@@ -545,7 +560,7 @@ class TmuxSession:
          self,
          keys: str | list[str],
          block: bool,
@@ -122,7 +129,7 @@ index 74f836b..1c8385f 100644
          """
          Prepare keys for sending to the terminal.
  
-@@ -554,24 +564,39 @@ class TmuxSession:
+@@ -554,24 +569,39 @@ class TmuxSession:
              block (bool): Whether to wait for the command to complete.
  
          Returns:
@@ -138,12 +145,13 @@ index 74f836b..1c8385f 100644
 -            return keys, False
 +        if not block or not keys:
 +            return keys, None
-+
-+        if not self._is_executing_command(keys[-1]):
-+            raise ValueError("blocking keys must end at a shell command boundary")
  
 -        keys = self._prevent_execution(keys)
 -        keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
++        if not self.can_end_command_batch(keys[-1]):
++            raise ValueError("blocking keys must end at a shell command boundary")
+ 
+-        return keys, True
 +        # Queue the marker as a separate shell input line. Editing the accepted
 +        # command itself corrupts heredoc terminators such as a final ``EOF``.
 +        # The marker's final subshell restores the accepted command's exit status.
@@ -157,8 +165,7 @@ index 74f836b..1c8385f 100644
 +                "Enter",
 +            ]
 +        )
- 
--        return keys, True
++
 +        return keys, completion_channel
  
      async def _send_blocking_keys(
@@ -169,7 +176,7 @@ index 74f836b..1c8385f 100644
      ):
          start_time_sec = time.time()
  
-@@ -583,7 +608,8 @@ class TmuxSession:
+@@ -583,7 +613,8 @@ class TmuxSession:
                  )
  
          result = await self.environment.exec(
@@ -179,7 +186,7 @@ index 74f836b..1c8385f 100644
          )
          if result.return_code != 0:
              raise TimeoutError(f"Command timed out after {max_timeout_sec} seconds")
-@@ -631,7 +657,7 @@ class TmuxSession:
+@@ -631,7 +662,7 @@ class TmuxSession:
          if block and min_timeout_sec > 0.0:
              self._logger.debug("min_timeout_sec will be ignored because block is True.")
  
@@ -188,7 +195,7 @@ index 74f836b..1c8385f 100644
              keys=keys,
              block=block,
          )
-@@ -642,10 +668,11 @@ class TmuxSession:
+@@ -642,10 +673,11 @@ class TmuxSession:
              f" max_timeout_sec: {max_timeout_sec}"
          )
  
@@ -372,10 +379,10 @@ index 7442a5f..6d9a900 100644
 +        return llm_response
 diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 new file mode 100644
-index 0000000..e3c660d
+index 0000000..46984eb
 --- /dev/null
 +++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,297 @@
 +import os
 +import pty
 +import select
@@ -401,6 +408,7 @@ index 0000000..e3c660d
 +
 +    async def get_incremental_output(self):
 +        return "terminal output"
++
 +
 +def agent_stub() -> Terminus2:
 +    agent = object.__new__(Terminus2)
@@ -483,6 +491,25 @@ index 0000000..e3c660d
 +
 +
 +@pytest.mark.asyncio
++@pytest.mark.parametrize("control_key", ["C-c", "C-d"])
++async def test_execute_commands_accepts_shell_return_control_key(control_key):
++    session = FakeSession()
++
++    await agent_stub()._execute_commands(
++        [
++            Command("python3 -q\n", 1.0),
++            Command(control_key, 0.1),
++        ],
++        session,
++    )
++
++    assert session.calls[-1] == (
++        control_key,
++        {"block": True, "min_timeout_sec": 0.0, "max_timeout_sec": 180.0},
++    )
++
++
++@pytest.mark.asyncio
 +async def test_execute_commands_quiesces_a_timed_out_foreground_job():
 +    session = FakeSession(time_out_first=True)
 +
@@ -520,6 +547,18 @@ index 0000000..e3c660d
 +        "Enter",
 +    ]
 +    assert "EOF;" not in "".join(prepared)
++
++
++@pytest.mark.parametrize("control_key", ["C-c", "C-d"])
++def test_blocking_keys_queue_marker_after_shell_return_control_key(control_key):
++    prepared, completion_channel = tmux_session_stub()._prepare_keys(
++        control_key, block=True
++    )
++
++    assert completion_channel is not None
++    assert prepared[0] == control_key
++    assert f"tmux wait -S {completion_channel}" in prepared[1]
++    assert prepared[2] == "Enter"
 +
 +
 +def test_completion_marker_restores_original_exit_status():
@@ -641,6 +680,42 @@ index 0000000..e3c660d
 +        "timeout 1.0s tmux wait driftlock-test-channel",
 +        "root",
 +    )
+diff --git a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
+index 8dcd203..cc358f2 100644
+--- a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
++++ b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
+@@ -139,7 +139,8 @@ async def test_send_non_blocking_keys_raises_on_failed_chunk(tmux_session):
+ async def test_send_blocking_keys_waits_after_chunked_send(tmux_session):
+     long_key = "x" * (tmux_session._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH * 2)
+     expected_commands = tmux_session._tmux_send_keys([long_key, "Enter"])
+-    wait_command = "timeout 1.0s tmux wait done"
++    completion_channel = "driftlock-test-channel"
++    wait_command = f"timeout 1.0s tmux wait {completion_channel}"
+ 
+     tmux_session.environment.exec = AsyncMock(
+         side_effect=[
+@@ -151,6 +152,7 @@ async def test_send_blocking_keys_waits_after_chunked_send(tmux_session):
+     await tmux_session._send_blocking_keys(
+         keys=[long_key, "Enter"],
+         max_timeout_sec=1.0,
++        completion_channel=completion_channel,
+     )
+ 
+     executed_commands = [
+@@ -176,6 +178,7 @@ async def test_send_blocking_keys_raises_on_failed_chunk(tmux_session):
+         await tmux_session._send_blocking_keys(
+             keys=[long_key, "Enter"],
+             max_timeout_sec=1.0,
++            completion_channel="driftlock-test-channel",
+         )
+ 
+     # Stops on first failure — never reaches tmux wait
+@@ -194,4 +197,5 @@ async def test_send_blocking_keys_raises_timeout_on_wait_failure(tmux_session):
+         await tmux_session._send_blocking_keys(
+             keys=["echo hello", "Enter"],
+             max_timeout_sec=1.0,
++            completion_channel="driftlock-test-channel",
+         )
 diff --git a/harbor/tests/unit/llms/test_chat.py b/harbor/tests/unit/llms/test_chat.py
 index b34b4fc..20cc6ac 100644
 --- a/harbor/tests/unit/llms/test_chat.py

@@ -44,7 +44,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 7
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 8
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -99,13 +99,15 @@ channel so task commands and concurrent sessions cannot release another boundary
 waiter. The marker is queued on its own input line, so multiline and heredoc commands
 remain byte-for-byte intact, and it restores the original command's exit status. A
 batch whose final non-empty keystroke does not execute a shell command is rejected
-before any part of that batch is sent. Intermediate commands keep Harbor's requested
-duration, allowing an interactive program to be opened, used, and exited within one
-response. Persistent interactive state across provider responses is intentionally
-unsupported because it cannot be represented by workspace and conversation
-checkpoints; the runtime adds this constraint to the agent prompt. Rollback restores
-semantic chat state while physical calls, usage, trajectory steps, pane logs, cast
-segments, and session identifiers remain monotonic.
+before any part of that batch is sent; Harbor's documented `C-c` and `C-d` control
+keys are accepted as explicit ways to return from an interactive program before the
+marker is queued. Intermediate commands keep Harbor's requested duration, allowing
+an interactive program to be opened, used, and exited within one response.
+Persistent interactive state across provider responses is intentionally unsupported
+because it cannot be represented by workspace and conversation checkpoints; the
+runtime adds this constraint to the agent prompt. Rollback restores semantic chat
+state while physical calls, usage, trajectory steps, pane logs, cast segments, and
+session identifiers remain monotonic.
 
 Use `step.before_workspace_restore` as the remote checkpoint store's `before_restore`
 hook. Before the first episode the runtime records PID/start-time identities for
