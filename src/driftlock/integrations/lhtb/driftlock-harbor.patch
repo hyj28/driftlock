@@ -1,0 +1,863 @@
+diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
+new file mode 100644
+index 0000000..6741a39
+--- /dev/null
++++ b/harbor/src/harbor/_driftlock_pin.py
+@@ -0,0 +1,4 @@
++"""Compatibility marker for driftlock's pinned LHTB integration."""
++
++LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
++DRIFTLOCK_HARBOR_PATCH_VERSION = 9
+diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
+index bcd0473..f6ba8fe 100644
+--- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
++++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
+@@ -1250,14 +1250,55 @@ so ask everything you need to know."""
+         Returns:
+             Tuple of (timeout_occurred, terminal_output)
+         """
+-        for command in commands:
++        boundary_index = next(
++            (
++                index
++                for index in range(len(commands) - 1, -1, -1)
++                if commands[index].keystrokes
++            ),
++            None,
++        )
++        if boundary_index is not None and not TmuxSession.can_end_command_batch(
++            commands[boundary_index].keystrokes
++        ):
++            raise ValueError(
++                "the final non-empty command must execute at a shell boundary"
++            )
++
++        for index, command in enumerate(commands):
++            block = index == boundary_index
++            keys = command.keystrokes
++            if block and keys in TmuxSession._SHELL_RETURN_KEYS:
++                # A control key is a valid action but not proof that an interactive
++                # program returned to Bash. Queue a no-op whose completion marker
++                # can only run after the control key actually reaches the shell.
++                keys = [keys, ":", "Enter"]
+             try:
+                 await session.send_keys(
+-                    command.keystrokes,
+-                    block=False,
+-                    min_timeout_sec=command.duration_sec,
++                    keys,
++                    block=block,
++                    min_timeout_sec=0.0 if block else command.duration_sec,
++                    max_timeout_sec=max(180.0, command.duration_sec),
+                 )
+             except TimeoutError:
++                # A checkpoint boundary cannot observe or archive a workspace while
++                # the accepted command is still changing it. Interrupt the timed-out
++                # foreground job, then prove the replacement no-op reached the shell.
++                await session.send_keys(
++                    ["C-c"],
++                    block=False,
++                    min_timeout_sec=0.1,
++                )
++                try:
++                    await session.send_keys(
++                        [":", "Enter"],
++                        block=True,
++                        max_timeout_sec=10.0,
++                    )
++                except TimeoutError as error:
++                    raise RuntimeError(
++                        "timed-out command could not be quiesced for checkpointing"
++                    ) from error
+                 return True, self._timeout_template.format(
+                     timeout_sec=command.duration_sec,
+                     command=command.keystrokes,
+diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
+index 74f836b..718b984 100644
+--- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
++++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import re
++import secrets
+ import shlex
+ import time
+ from pathlib import Path, PurePosixPath
+@@ -11,9 +12,12 @@ from harbor.utils.logger import logger
+ 
+ class TmuxSession:
+     _ENTER_KEYS = {"Enter", "C-m", "KPEnter", "C-j", "^M", "^J"}
++    _SHELL_RETURN_KEYS = {"C-c", "C-d"}
+     _ENDS_WITH_NEWLINE_PATTERN = r"[\r\n]$"
+     _NEWLINE_CHARS = "\r\n"
+-    _TMUX_COMPLETION_COMMAND = "; tmux wait -S done"
++    _TMUX_COMPLETION_COMMAND = (
++        '(set -- "$?"; tmux wait -S {completion_channel}; exit "$1")'
++    )
+     # tmux silently drops commands exceeding its internal buffer (~16 KB since
+     # tmux 1.9, see https://github.com/tmux/tmux/issues/254). Keep a
+     # conservative margin below that hard ceiling.
+@@ -335,7 +339,7 @@ class TmuxSession:
+             f"export SHELL=/bin/bash && "
+             f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
+             f"pipe-pane -t {self._session_name} "
+-            f"'cat > {self._logging_path}'"
++            f"'cat >> {self._logging_path}'"
+         )
+ 
+     def _tmux_send_keys(self, keys: list[str]) -> list[str]:
+@@ -523,8 +527,19 @@ class TmuxSession:
+         )
+         return result.return_code == 0
+ 
++    @classmethod
++    def is_executing_command(cls, key: str) -> bool:
++        return (
++            key in cls._ENTER_KEYS
++            or re.search(cls._ENDS_WITH_NEWLINE_PATTERN, key) is not None
++        )
++
++    @classmethod
++    def can_end_command_batch(cls, key: str) -> bool:
++        return cls.is_executing_command(key) or key in cls._SHELL_RETURN_KEYS
++
+     def _is_executing_command(self, key: str) -> bool:
+-        return self._is_enter_key(key) or self._ends_with_newline(key)
++        return self.is_executing_command(key)
+ 
+     def _prevent_execution(self, keys: list[str]) -> list[str]:
+         keys = keys.copy()
+@@ -545,7 +560,7 @@ class TmuxSession:
+         self,
+         keys: str | list[str],
+         block: bool,
+-    ) -> tuple[list[str], bool]:
++    ) -> tuple[list[str], str | None]:
+         """
+         Prepare keys for sending to the terminal.
+ 
+@@ -554,24 +569,39 @@ class TmuxSession:
+             block (bool): Whether to wait for the command to complete.
+ 
+         Returns:
+-            tuple[list[str], bool]: The keys to send to the terminal and whether the
+-                the keys are blocking.
++            tuple[list[str], str | None]: The keys to send to the terminal and the
++                unique tmux channel to wait on for a blocking send.
+         """
+         if isinstance(keys, str):
+             keys = [keys]
+ 
+-        if not block or not keys or not self._is_executing_command(keys[-1]):
+-            return keys, False
++        if not block or not keys:
++            return keys, None
+ 
+-        keys = self._prevent_execution(keys)
+-        keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
++        if not self.is_executing_command(keys[-1]):
++            raise ValueError("blocking keys must end at a shell command boundary")
+ 
+-        return keys, True
++        # Queue the marker as a separate shell input line. Editing the accepted
++        # command itself corrupts heredoc terminators such as a final ``EOF``.
++        # The marker's final subshell restores the accepted command's exit status.
++        completion_channel = f"driftlock-{secrets.token_hex(32)}"
++        keys = keys.copy()
++        keys.extend(
++            [
++                self._TMUX_COMPLETION_COMMAND.format(
++                    completion_channel=shlex.quote(completion_channel)
++                ),
++                "Enter",
++            ]
++        )
++
++        return keys, completion_channel
+ 
+     async def _send_blocking_keys(
+         self,
+         keys: list[str],
+         max_timeout_sec: float,
++        completion_channel: str,
+     ):
+         start_time_sec = time.time()
+ 
+@@ -583,7 +613,8 @@ class TmuxSession:
+                 )
+ 
+         result = await self.environment.exec(
+-            f"timeout {max_timeout_sec}s tmux wait done", user=self._user
++            f"timeout {max_timeout_sec}s tmux wait {shlex.quote(completion_channel)}",
++            user=self._user,
+         )
+         if result.return_code != 0:
+             raise TimeoutError(f"Command timed out after {max_timeout_sec} seconds")
+@@ -631,7 +662,7 @@ class TmuxSession:
+         if block and min_timeout_sec > 0.0:
+             self._logger.debug("min_timeout_sec will be ignored because block is True.")
+ 
+-        prepared_keys, is_blocking = self._prepare_keys(
++        prepared_keys, completion_channel = self._prepare_keys(
+             keys=keys,
+             block=block,
+         )
+@@ -642,10 +673,11 @@ class TmuxSession:
+             f" max_timeout_sec: {max_timeout_sec}"
+         )
+ 
+-        if is_blocking:
++        if completion_channel is not None:
+             await self._send_blocking_keys(
+                 keys=prepared_keys,
+                 max_timeout_sec=max_timeout_sec,
++                completion_channel=completion_channel,
+             )
+         else:
+             await self._send_non_blocking_keys(
+diff --git a/harbor/src/harbor/llms/base.py b/harbor/src/harbor/llms/base.py
+index 6aae215..9f532e0 100644
+--- a/harbor/src/harbor/llms/base.py
++++ b/harbor/src/harbor/llms/base.py
+@@ -46,9 +46,15 @@ class ContextLengthExceededError(Exception):
+ class OutputLengthExceededError(Exception):
+     """Raised when the LLM response was truncated due to max_tokens limit."""
+ 
+-    def __init__(self, message: str, truncated_response: str | None = None):
++    def __init__(
++        self,
++        message: str,
++        truncated_response: str | None = None,
++        response: LLMResponse | None = None,
++    ):
+         super().__init__(message)
+         self.truncated_response = truncated_response
++        self.response = response
+ 
+ 
+ class BaseLLM(ABC):
+diff --git a/harbor/src/harbor/llms/chat.py b/harbor/src/harbor/llms/chat.py
+index 51eddf3..c376ade 100644
+--- a/harbor/src/harbor/llms/chat.py
++++ b/harbor/src/harbor/llms/chat.py
+@@ -94,6 +94,17 @@ class Chat:
+             **kwargs,
+         )
+ 
++        self.record_response(prompt, llm_response)
++        return llm_response
++
++    def record_response(self, prompt: str, llm_response: LLMResponse) -> None:
++        """Record a provider response that was billed.
++
++        A boundary runtime also uses this for a truncated response retained on
++        ``OutputLengthExceededError``.  Keeping this logic in one method ensures
++        those billed responses advance usage and chat history exactly once.
++        """
++
+         # Track response chain for Responses API
+         if llm_response.response_id is not None:
+             self._last_response_id = llm_response.response_id
+@@ -120,7 +131,6 @@ class Chat:
+                 assistant_message,
+             ]
+         )
+-        return llm_response
+ 
+     def reset_response_chain(self) -> None:
+         """Reset the response chain so the next call sends full message history.
+diff --git a/harbor/src/harbor/llms/lite_llm.py b/harbor/src/harbor/llms/lite_llm.py
+index 7442a5f..6d9a900 100644
+--- a/harbor/src/harbor/llms/lite_llm.py
++++ b/harbor/src/harbor/llms/lite_llm.py
+@@ -120,6 +120,8 @@ class LiteLLM(BaseLLM):
+         self._collect_rollout_details = collect_rollout_details
+         self._max_thinking_tokens = max_thinking_tokens
+         self._reasoning_effort = reasoning_effort
++        self._driftlock_single_attempt = False
++        self._driftlock_provider_call_count = 0
+ 
+         if self._supported_params is not None:
+             self._supports_response_format = "response_format" in self._supported_params
+@@ -356,6 +358,7 @@ class LiteLLM(BaseLLM):
+                 extra_body["session_id"] = self._session_id
+ 
+             try:
++                self._driftlock_provider_call_count += 1
+                 response = await litellm.acompletion(**completion_kwargs)
+             except LiteLLMBadRequestError as e:
+                 # If provider (e.g., OpenAI) rejects extra_body parameters, retry without them
+@@ -375,6 +378,8 @@ class LiteLLM(BaseLLM):
+                         rejected_params.append("logprobs")
+ 
+                     if rejected_params:
++                        if self._driftlock_single_attempt:
++                            raise
+                         self._logger.warning(
+                             f"Provider {self._model_name} rejected request parameters: {', '.join(rejected_params)}. "
+                             f"Retrying without them. Rollout details may be incomplete."
+@@ -392,6 +397,7 @@ class LiteLLM(BaseLLM):
+                         if "logprobs" in rejected_params:
+                             completion_kwargs.pop("logprobs", None)
+ 
++                        self._driftlock_provider_call_count += 1
+                         response = await litellm.acompletion(**completion_kwargs)
+                     else:
+                         raise e
+@@ -422,6 +428,17 @@ class LiteLLM(BaseLLM):
+         content = message.get("content") or ""
+         reasoning_content = message.get("reasoning_content")
+ 
++        llm_response = LLMResponse(
++            content=content,
++            reasoning_content=reasoning_content,
++            model_name=response.get("model"),
++            usage=usage_info,
++            prompt_token_ids=prompt_token_ids,
++            completion_token_ids=completion_token_ids,
++            logprobs=logprobs,
++            extra=extra,
++        )
++
+         # Sometimes the LLM returns a response with a finish reason of "length"
+         # This typically means we hit the max_tokens limit, not the context window
+         if choice.get("finish_reason") == "length":
+@@ -430,19 +447,11 @@ class LiteLLM(BaseLLM):
+                 f"Model {self._model_name} hit max_tokens limit. "
+                 f"Response was truncated. Consider increasing max_tokens if possible.",
+                 truncated_response=content,
++                response=llm_response,
+             )
+             raise exc
+ 
+-        return LLMResponse(
+-            content=content,
+-            reasoning_content=reasoning_content,
+-            model_name=response.get("model"),
+-            usage=usage_info,
+-            prompt_token_ids=prompt_token_ids,
+-            completion_token_ids=completion_token_ids,
+-            logprobs=logprobs,
+-            extra=extra,
+-        )
++        return llm_response
+ 
+     def _extract_token_ids(self, response) -> tuple[list[int] | None, list[int] | None]:
+         """Extract token IDs from a response.
+@@ -729,6 +738,7 @@ class LiteLLM(BaseLLM):
+                 input_items.append({"role": "user", "content": prompt})
+                 responses_kwargs["input"] = input_items
+ 
++            self._driftlock_provider_call_count += 1
+             response = await litellm.aresponses(**responses_kwargs)
+ 
+         except Exception as e:
+@@ -746,6 +756,14 @@ class LiteLLM(BaseLLM):
+         # Extract usage information
+         usage_info = self._extract_responses_usage_info(response)
+ 
++        llm_response = LLMResponse(
++            content=content,
++            reasoning_content=reasoning_content,
++            model_name=getattr(response, "model", None),
++            usage=usage_info,
++            response_id=getattr(response, "id", None),
++        )
++
+         # Check for truncation via response status
+         response_status = getattr(response, "status", None)
+         if response_status == "incomplete":
+@@ -760,14 +778,7 @@ class LiteLLM(BaseLLM):
+                     f"Model {self._model_name} hit max_tokens limit. "
+                     f"Response was truncated.",
+                     truncated_response=content,
++                    response=llm_response,
+                 )
+ 
+-        response_id = getattr(response, "id", None)
+-
+-        return LLMResponse(
+-            content=content,
+-            reasoning_content=reasoning_content,
+-            model_name=getattr(response, "model", None),
+-            usage=usage_info,
+-            response_id=response_id,
+-        )
++        return llm_response
+diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
+new file mode 100644
+index 0000000..7edf06c
+--- /dev/null
++++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
+@@ -0,0 +1,324 @@
++import os
++import pty
++import select
++import subprocess
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from harbor.agents.terminus_2.terminus_2 import Command, Terminus2
++from harbor.agents.terminus_2.tmux_session import TmuxSession
++
++
++class FakeSession:
++    def __init__(self, *, time_out_first: bool = False) -> None:
++        self.calls = []
++        self.time_out_first = time_out_first
++
++    async def send_keys(self, keys, **kwargs):
++        self.calls.append((keys, kwargs))
++        if self.time_out_first and len(self.calls) == 1:
++            raise TimeoutError
++
++    async def get_incremental_output(self):
++        return "terminal output"
++
++
++def agent_stub() -> Terminus2:
++    agent = object.__new__(Terminus2)
++    agent._limit_output_length = lambda value: value
++    agent._timeout_template = "timeout {timeout_sec}: {command}: {terminal_state}"
++    return agent
++
++
++@pytest.mark.asyncio
++async def test_execute_commands_waits_for_shell_completion_marker():
++    session = FakeSession()
++
++    timed_out, output = await agent_stub()._execute_commands(
++        [Command("sleep 10; echo late > /app/late\n", 0.1)],
++        session,
++    )
++
++    assert not timed_out
++    assert output == "terminal output"
++    assert session.calls == [
++        (
++            "sleep 10; echo late > /app/late\n",
++            {
++                "block": True,
++                "min_timeout_sec": 0.0,
++                "max_timeout_sec": 180.0,
++            },
++        )
++    ]
++
++
++@pytest.mark.asyncio
++async def test_execute_commands_preserves_interactive_batch_timing():
++    session = FakeSession()
++
++    await agent_stub()._execute_commands(
++        [
++            Command("python3 -q\n", 1.0),
++            Command("print('hello')\n", 2.0),
++            Command("exit()\n", 0.1),
++            Command("", 3.0),
++        ],
++        session,
++    )
++
++    assert session.calls == [
++        (
++            "python3 -q\n",
++            {"block": False, "min_timeout_sec": 1.0, "max_timeout_sec": 180.0},
++        ),
++        (
++            "print('hello')\n",
++            {"block": False, "min_timeout_sec": 2.0, "max_timeout_sec": 180.0},
++        ),
++        (
++            "exit()\n",
++            {"block": True, "min_timeout_sec": 0.0, "max_timeout_sec": 180.0},
++        ),
++        (
++            "",
++            {"block": False, "min_timeout_sec": 3.0, "max_timeout_sec": 180.0},
++        ),
++    ]
++
++
++@pytest.mark.asyncio
++async def test_execute_commands_rejects_partial_final_key_before_sending_anything():
++    session = FakeSession()
++
++    with pytest.raises(ValueError, match="final non-empty command"):
++        await agent_stub()._execute_commands(
++            [
++                Command("touch /app/should-not-exist\n", 0.1),
++                Command("printf PARTIAL", 0.1),
++            ],
++            session,
++        )
++
++    assert session.calls == []
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("control_key", ["C-c", "C-d"])
++async def test_execute_commands_accepts_shell_return_control_key(control_key):
++    session = FakeSession()
++
++    await agent_stub()._execute_commands(
++        [
++            Command("python3 -q\n", 1.0),
++            Command(control_key, 0.1),
++        ],
++        session,
++    )
++
++    assert session.calls[-1] == (
++        [control_key, ":", "Enter"],
++        {"block": True, "min_timeout_sec": 0.0, "max_timeout_sec": 180.0},
++    )
++
++
++@pytest.mark.asyncio
++async def test_execute_commands_quiesces_a_timed_out_foreground_job():
++    session = FakeSession(time_out_first=True)
++
++    timed_out, output = await agent_stub()._execute_commands(
++        [Command("sleep 999\n", 0.1)],
++        session,
++    )
++
++    assert timed_out
++    assert "terminal output" in output
++    assert session.calls[1:] == [
++        (["C-c"], {"block": False, "min_timeout_sec": 0.1}),
++        ([":", "Enter"], {"block": True, "max_timeout_sec": 10.0}),
++    ]
++
++
++def tmux_session_stub() -> TmuxSession:
++    session = object.__new__(TmuxSession)
++    return session
++
++
++def test_blocking_keys_preserve_heredoc_terminator():
++    command = "cat <<'EOF'\nhello\nEOF\n"
++
++    prepared, completion_channel = tmux_session_stub()._prepare_keys(
++        command, block=True
++    )
++
++    assert completion_channel is not None
++    assert prepared[0] == command
++    assert prepared[1:] == [
++        TmuxSession._TMUX_COMPLETION_COMMAND.format(
++            completion_channel=completion_channel
++        ),
++        "Enter",
++    ]
++    assert "EOF;" not in "".join(prepared)
++
++
++@pytest.mark.parametrize("control_key", ["C-c", "C-d"])
++def test_blocking_keys_reject_unverified_shell_return_control_key(control_key):
++    with pytest.raises(ValueError, match="shell command boundary"):
++        tmux_session_stub()._prepare_keys(control_key, block=True)
++
++
++def test_completion_marker_restores_original_exit_status():
++    marker_without_tmux = TmuxSession._TMUX_COMPLETION_COMMAND.format(
++        completion_channel="test-channel"
++    ).replace("tmux wait -S test-channel", ":")
++    script = "false\n" + marker_without_tmux + "\nprintf '%s' $?\n"
++
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc"],
++        input=script,
++        text=True,
++        capture_output=True,
++        check=True,
++    )
++
++    assert result.stdout == "1"
++
++
++def test_completion_marker_does_not_touch_task_variables():
++    marker_without_tmux = TmuxSession._TMUX_COMPLETION_COMMAND.format(
++        completion_channel="test-channel"
++    ).replace("tmux wait -S test-channel", ":")
++    script = (
++        "readonly __driftlock_status=99\n"
++        "true\n"
++        + marker_without_tmux
++        + '\nprintf \'%s:%s\' "$?" "$__driftlock_status"\n'
++    )
++
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc"],
++        input=script,
++        text=True,
++        capture_output=True,
++        check=True,
++    )
++
++    assert result.stdout == "0:99"
++
++
++def test_completion_marker_runs_after_interactive_program_exits():
++    pid, descriptor = pty.fork()
++    if pid == 0:
++        os.execvp("bash", ["bash", "--noprofile", "--norc"])
++
++    output = bytearray()
++
++    def read_available(duration: float) -> None:
++        deadline = time.monotonic() + duration
++        while time.monotonic() < deadline:
++            readable, _, _ = select.select([descriptor], [], [], 0.05)
++            if readable:
++                output.extend(os.read(descriptor, 65_536))
++
++    try:
++        read_available(0.1)
++        os.write(descriptor, b"python3 -q\n")
++        read_available(0.1)
++        os.write(descriptor, b"print('hello')\n")
++        read_available(0.1)
++        marker = TmuxSession._TMUX_COMPLETION_COMMAND.format(
++            completion_channel="test-channel"
++        ).replace("tmux wait -S test-channel", "echo DRIFTLOCK_MARKER")
++        os.write(descriptor, f"exit()\n{marker}\n".encode())
++        read_available(1.0)
++
++        assert b"DRIFTLOCK_MARKER" in output
++        assert b"SyntaxError" not in output
++    finally:
++        os.write(descriptor, b"exit\n")
++        os.close(descriptor)
++        os.waitpid(pid, 0)
++
++
++def test_control_key_boundary_marker_runs_after_shell_noop():
++    pid, descriptor = pty.fork()
++    if pid == 0:
++        os.execvp("bash", ["bash", "--noprofile", "--norc"])
++
++    output = bytearray()
++
++    def read_available(duration: float) -> None:
++        deadline = time.monotonic() + duration
++        while time.monotonic() < deadline:
++            readable, _, _ = select.select([descriptor], [], [], 0.05)
++            if readable:
++                output.extend(os.read(descriptor, 65_536))
++
++    try:
++        read_available(0.1)
++        os.write(descriptor, b"sleep 10\n")
++        read_available(0.1)
++        os.write(descriptor, b"\x03")
++        read_available(0.1)
++        marker = TmuxSession._TMUX_COMPLETION_COMMAND.format(
++            completion_channel="test-channel"
++        ).replace("tmux wait -S test-channel", "echo DRIFTLOCK_MARKER")
++        os.write(descriptor, f":\n{marker}\n".encode())
++        read_available(1.0)
++
++        assert b"DRIFTLOCK_MARKER" in output
++    finally:
++        os.write(descriptor, b"exit\n")
++        os.close(descriptor)
++        os.waitpid(pid, 0)
++
++
++def test_blocking_keys_use_a_fresh_channel_not_command_controlled_name(monkeypatch):
++    tokens = iter(["a" * 64, "b" * 64])
++    monkeypatch.setattr("secrets.token_hex", lambda size: next(tokens))
++    session = tmux_session_stub()
++
++    first, first_channel = session._prepare_keys(
++        "tmux wait -S done; printf first\n", block=True
++    )
++    second, second_channel = session._prepare_keys("printf second\n", block=True)
++
++    assert first_channel == f"driftlock-{'a' * 64}"
++    assert second_channel == f"driftlock-{'b' * 64}"
++    assert first_channel != second_channel
++    assert f"tmux wait -S {first_channel}" in first[-2]
++    assert f"tmux wait -S {second_channel}" in second[-2]
++    assert "tmux wait -S done" not in first[-2]
++
++
++@pytest.mark.asyncio
++async def test_blocking_wait_uses_the_generated_completion_channel():
++    class Environment:
++        session_id = "test-session"
++
++        def __init__(self):
++            self.commands = []
++
++        async def exec(self, command, user=None):
++            self.commands.append((command, user))
++            return SimpleNamespace(return_code=0, stderr="")
++
++    session = tmux_session_stub()
++    session.environment = Environment()
++    session._user = "root"
++    session._logger = SimpleNamespace(debug=lambda message: None)
++    session._tmux_send_keys = lambda keys: ["send-keys"]
++
++    await session._send_blocking_keys(
++        ["prepared"],
++        max_timeout_sec=1.0,
++        completion_channel="driftlock-test-channel",
++    )
++
++    assert session.environment.commands[-1] == (
++        "timeout 1.0s tmux wait driftlock-test-channel",
++        "root",
++    )
+diff --git a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
+index 8dcd203..cc358f2 100644
+--- a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
++++ b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
+@@ -139,7 +139,8 @@ async def test_send_non_blocking_keys_raises_on_failed_chunk(tmux_session):
+ async def test_send_blocking_keys_waits_after_chunked_send(tmux_session):
+     long_key = "x" * (tmux_session._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH * 2)
+     expected_commands = tmux_session._tmux_send_keys([long_key, "Enter"])
+-    wait_command = "timeout 1.0s tmux wait done"
++    completion_channel = "driftlock-test-channel"
++    wait_command = f"timeout 1.0s tmux wait {completion_channel}"
+ 
+     tmux_session.environment.exec = AsyncMock(
+         side_effect=[
+@@ -151,6 +152,7 @@ async def test_send_blocking_keys_waits_after_chunked_send(tmux_session):
+     await tmux_session._send_blocking_keys(
+         keys=[long_key, "Enter"],
+         max_timeout_sec=1.0,
++        completion_channel=completion_channel,
+     )
+ 
+     executed_commands = [
+@@ -176,6 +178,7 @@ async def test_send_blocking_keys_raises_on_failed_chunk(tmux_session):
+         await tmux_session._send_blocking_keys(
+             keys=[long_key, "Enter"],
+             max_timeout_sec=1.0,
++            completion_channel="driftlock-test-channel",
+         )
+ 
+     # Stops on first failure — never reaches tmux wait
+@@ -194,4 +197,5 @@ async def test_send_blocking_keys_raises_timeout_on_wait_failure(tmux_session):
+         await tmux_session._send_blocking_keys(
+             keys=["echo hello", "Enter"],
+             max_timeout_sec=1.0,
++            completion_channel="driftlock-test-channel",
+         )
+diff --git a/harbor/tests/unit/llms/test_chat.py b/harbor/tests/unit/llms/test_chat.py
+index b34b4fc..20cc6ac 100644
+--- a/harbor/tests/unit/llms/test_chat.py
++++ b/harbor/tests/unit/llms/test_chat.py
+@@ -52,6 +52,31 @@ async def test_chat_tracks_response_id():
+     assert chat._last_response_id == "resp_001"
+ 
+ 
++def test_chat_records_retained_billed_response():
++    """A truncated response can use the same accounting path exactly once."""
++    chat = Chat(model=FakeLLM())
++    response = LLMResponse(
++        content="partial",
++        usage=UsageInfo(
++            prompt_tokens=11,
++            completion_tokens=7,
++            cache_tokens=2,
++            cost_usd=0.25,
++        ),
++    )
++
++    chat.record_response("prompt", response)
++
++    assert chat.messages == [
++        {"role": "user", "content": "prompt"},
++        {"role": "assistant", "content": "partial"},
++    ]
++    assert chat.total_input_tokens == 11
++    assert chat.total_output_tokens == 7
++    assert chat.total_cache_tokens == 2
++    assert chat.total_cost == 0.25
++
++
+ @pytest.mark.asyncio
+ async def test_chat_passes_previous_response_id():
+     """Verify previous_response_id is passed as kwarg to model.call()."""
+diff --git a/harbor/tests/unit/llms/test_lite_llm.py b/harbor/tests/unit/llms/test_lite_llm.py
+index 03266fb..dcf3332 100644
+--- a/harbor/tests/unit/llms/test_lite_llm.py
++++ b/harbor/tests/unit/llms/test_lite_llm.py
+@@ -349,6 +349,70 @@ async def test_litellm_responses_api_output_length_error(monkeypatch):
+         await llm.call(prompt="hello", message_history=[])
+ 
+     assert exc_info.value.truncated_response == "partial output..."
++    assert exc_info.value.response is not None
++    assert exc_info.value.response.content == "partial output..."
++    assert exc_info.value.response.usage is not None
++
++
++@pytest.mark.asyncio
++async def test_litellm_chat_output_length_error_retains_response(monkeypatch):
++    async def fake_acompletion(**kwargs):
++        class Completion(dict):
++            pass
++
++        response = Completion({
++            "model": "provider-model",
++            "choices": [
++                {
++                    "message": {
++                        "content": "partial chat output",
++                        "reasoning_content": None,
++                    },
++                    "finish_reason": "length",
++                }
++            ],
++        })
++        response.usage = SimpleNamespace(prompt_tokens=13, completion_tokens=8)
++        return response
++
++    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
++    llm = LiteLLM(model_name="fake-provider/fake-model")
++
++    with pytest.raises(OutputLengthExceededError) as exc_info:
++        await llm.call(prompt="hello", message_history=[])
++
++    assert exc_info.value.truncated_response == "partial chat output"
++    assert exc_info.value.response is not None
++    assert exc_info.value.response.content == "partial chat output"
++    assert exc_info.value.response.model_name == "provider-model"
++    assert exc_info.value.response.usage is not None
++    assert exc_info.value.response.usage.prompt_tokens == 13
++    assert exc_info.value.response.usage.completion_tokens == 8
++    assert llm._driftlock_provider_call_count == 1
++
++
++@pytest.mark.asyncio
++async def test_driftlock_single_attempt_disables_parameter_fallback(monkeypatch):
++    calls = 0
++
++    async def fake_acompletion(**kwargs):
++        nonlocal calls
++        calls += 1
++        raise LiteLLMBadRequestError(
++            message="Unrecognized request argument: session_id",
++            model="fake-model",
++            llm_provider="openai",
++        )
++
++    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
++    llm = LiteLLM(model_name="openai/fake-model", session_id="session")
++    llm._driftlock_single_attempt = True
++
++    with pytest.raises(LiteLLMBadRequestError):
++        await llm.call.__wrapped__(llm, prompt="hello", message_history=[])
++
++    assert calls == 1
++    assert llm._driftlock_provider_call_count == 1
+ 
+ 
+ @pytest.mark.asyncio

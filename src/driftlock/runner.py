@@ -20,6 +20,7 @@ from driftlock.models import (
     StepContext,
     StepOutcome,
     StepRecord,
+    StepTokenBudgetExhausted,
     Verdict,
 )
 
@@ -104,7 +105,18 @@ class DriftlockRunner:
                 ),
             )
             rollback_feedback = None
-            outcome = await step(context)
+            try:
+                outcome = await step(context)
+            except StepTokenBudgetExhausted:
+                return self._result(
+                    RunStatus.TOKEN_LIMIT,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                )
             state = dict(outcome.state)
             agent_tokens_used += outcome.tokens
             logical_step += 1
