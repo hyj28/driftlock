@@ -44,7 +44,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 5
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 6
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -96,7 +96,12 @@ output ceiling. Harbor waits for a shell completion marker before the runtime ta
 its post-episode workspace snapshot, preventing a foreground command from racing an
 accepted checkpoint. The marker is queued on its own input line, so multiline and
 heredoc commands remain byte-for-byte intact, and it restores the original command's
-exit status. Rollback restores semantic chat state while physical calls, usage,
+exit status. Intermediate commands keep Harbor's requested duration, allowing an
+interactive program to be opened, used, and exited within one response. Persistent
+interactive state across provider responses is intentionally unsupported because it
+cannot be represented by workspace and conversation checkpoints; the runtime adds
+this constraint to the agent prompt. Rollback restores semantic chat state while
+physical calls, usage,
 trajectory steps, pane logs, cast segments, and session identifiers remain monotonic.
 
 Use `step.before_workspace_restore` as the remote checkpoint store's `before_restore`

@@ -1,24 +1,39 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000..a353bf1
+index 0000000..503c38c
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 5
++DRIFTLOCK_HARBOR_PATCH_VERSION = 6
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-index bcd0473..b3daf62 100644
+index bcd0473..1dcfe05 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
 +++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-@@ -1254,10 +1254,28 @@ so ask everything you need to know."""
+@@ -1250,14 +1250,42 @@ so ask everything you need to know."""
+         Returns:
+             Tuple of (timeout_occurred, terminal_output)
+         """
+-        for command in commands:
++        boundary_index = next(
++            (
++                index
++                for index in range(len(commands) - 1, -1, -1)
++                if commands[index].keystrokes
++            ),
++            None,
++        )
++        for index, command in enumerate(commands):
++            block = index == boundary_index
              try:
                  await session.send_keys(
                      command.keystrokes,
 -                    block=False,
 -                    min_timeout_sec=command.duration_sec,
-+                    block=True,
++                    block=block,
++                    min_timeout_sec=0.0 if block else command.duration_sec,
 +                    max_timeout_sec=max(180.0, command.duration_sec),
                  )
              except TimeoutError:
@@ -44,21 +59,19 @@ index bcd0473..b3daf62 100644
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
 diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-index 74f836b..39f194f 100644
+index 74f836b..114bea6 100644
 --- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
 +++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-@@ -13,7 +13,9 @@ class TmuxSession:
+@@ -13,7 +13,7 @@ class TmuxSession:
      _ENTER_KEYS = {"Enter", "C-m", "KPEnter", "C-j", "^M", "^J"}
      _ENDS_WITH_NEWLINE_PATTERN = r"[\r\n]$"
      _NEWLINE_CHARS = "\r\n"
 -    _TMUX_COMPLETION_COMMAND = "; tmux wait -S done"
-+    _TMUX_COMPLETION_COMMAND = (
-+        '__driftlock_status=$?; tmux wait -S done; (exit "$__driftlock_status")'
-+    )
++    _TMUX_COMPLETION_COMMAND = '(set -- "$?"; tmux wait -S done; exit "$1")'
      # tmux silently drops commands exceeding its internal buffer (~16 KB since
      # tmux 1.9, see https://github.com/tmux/tmux/issues/254). Keep a
      # conservative margin below that hard ceiling.
-@@ -335,7 +337,7 @@ class TmuxSession:
+@@ -335,7 +335,7 @@ class TmuxSession:
              f"export SHELL=/bin/bash && "
              f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
              f"pipe-pane -t {self._session_name} "
@@ -67,8 +80,12 @@ index 74f836b..39f194f 100644
          )
  
      def _tmux_send_keys(self, keys: list[str]) -> list[str]:
-@@ -563,7 +565,10 @@ class TmuxSession:
-         if not block or not keys or not self._is_executing_command(keys[-1]):
+@@ -560,10 +560,13 @@ class TmuxSession:
+         if isinstance(keys, str):
+             keys = [keys]
+ 
+-        if not block or not keys or not self._is_executing_command(keys[-1]):
++        if not block or not keys:
              return keys, False
  
 -        keys = self._prevent_execution(keys)
@@ -250,11 +267,15 @@ index 7442a5f..6d9a900 100644
 +        return llm_response
 diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 new file mode 100644
-index 0000000..fadfab9
+index 0000000..10b245a
 --- /dev/null
 +++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,194 @@
++import os
++import pty
++import select
 +import subprocess
++import time
 +
 +import pytest
 +
@@ -297,8 +318,46 @@ index 0000000..fadfab9
 +    assert session.calls == [
 +        (
 +            "sleep 10; echo late > /app/late\n",
-+            {"block": True, "max_timeout_sec": 180.0},
++            {
++                "block": True,
++                "min_timeout_sec": 0.0,
++                "max_timeout_sec": 180.0,
++            },
 +        )
++    ]
++
++
++@pytest.mark.asyncio
++async def test_execute_commands_preserves_interactive_batch_timing():
++    session = FakeSession()
++
++    await agent_stub()._execute_commands(
++        [
++            Command("python3 -q\n", 1.0),
++            Command("print('hello')\n", 2.0),
++            Command("exit()\n", 0.1),
++            Command("", 3.0),
++        ],
++        session,
++    )
++
++    assert session.calls == [
++        (
++            "python3 -q\n",
++            {"block": False, "min_timeout_sec": 1.0, "max_timeout_sec": 180.0},
++        ),
++        (
++            "print('hello')\n",
++            {"block": False, "min_timeout_sec": 2.0, "max_timeout_sec": 180.0},
++        ),
++        (
++            "exit()\n",
++            {"block": True, "min_timeout_sec": 0.0, "max_timeout_sec": 180.0},
++        ),
++        (
++            "",
++            {"block": False, "min_timeout_sec": 3.0, "max_timeout_sec": 180.0},
++        ),
 +    ]
 +
 +
@@ -350,6 +409,62 @@ index 0000000..fadfab9
 +    )
 +
 +    assert result.stdout == "1"
++
++
++def test_completion_marker_does_not_touch_task_variables():
++    marker_without_tmux = TmuxSession._TMUX_COMPLETION_COMMAND.replace(
++        "tmux wait -S done", ":"
++    )
++    script = (
++        "readonly __driftlock_status=99\n"
++        "true\n"
++        + marker_without_tmux
++        + "\nprintf '%s:%s' \"$?\" \"$__driftlock_status\"\n"
++    )
++
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc"],
++        input=script,
++        text=True,
++        capture_output=True,
++        check=True,
++    )
++
++    assert result.stdout == "0:99"
++
++
++def test_completion_marker_runs_after_interactive_program_exits():
++    pid, descriptor = pty.fork()
++    if pid == 0:
++        os.execvp("bash", ["bash", "--noprofile", "--norc"])
++
++    output = bytearray()
++
++    def read_available(duration: float) -> None:
++        deadline = time.monotonic() + duration
++        while time.monotonic() < deadline:
++            readable, _, _ = select.select([descriptor], [], [], 0.05)
++            if readable:
++                output.extend(os.read(descriptor, 65_536))
++
++    try:
++        read_available(0.1)
++        os.write(descriptor, b"python3 -q\n")
++        read_available(0.1)
++        os.write(descriptor, b"print('hello')\n")
++        read_available(0.1)
++        marker = TmuxSession._TMUX_COMPLETION_COMMAND.replace(
++            "tmux wait -S done", "echo DRIFTLOCK_MARKER"
++        )
++        os.write(descriptor, f"exit()\n{marker}\n".encode())
++        read_available(1.0)
++
++        assert b"DRIFTLOCK_MARKER" in output
++        assert b"SyntaxError" not in output
++    finally:
++        os.write(descriptor, b"exit\n")
++        os.close(descriptor)
++        os.waitpid(pid, 0)
 diff --git a/harbor/tests/unit/llms/test_chat.py b/harbor/tests/unit/llms/test_chat.py
 index b34b4fc..20cc6ac 100644
 --- a/harbor/tests/unit/llms/test_chat.py

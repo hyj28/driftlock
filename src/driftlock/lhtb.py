@@ -30,7 +30,7 @@ from driftlock.terminus import (
 
 LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
 LHTB_LITELLM_VERSION = "1.83.14"
-DRIFTLOCK_HARBOR_PATCH_VERSION = 5
+DRIFTLOCK_HARBOR_PATCH_VERSION = 6
 
 _RETRY_OR_FALLBACK_KEYS = frozenset(
     {
@@ -438,6 +438,13 @@ class LHTBTerminusRuntime:
                 "\n\nThe prior trajectory was rolled back. Choose a different "
                 f"approach using this feedback:\n{rollback_feedback}"
             )
+        augmented_instruction += (
+            "\n\nCheckpoint boundary constraint:\n"
+            "Each response's terminal-command batch must return to the login shell "
+            "before it ends. You may use an interactive program only when the same "
+            "response also exits it. Do not leave a REPL, pager, foreground job, "
+            "partial command, or pending stdin read across responses."
+        )
         augmented_instruction += _mcp_section(agent)
         skills_section = await agent._build_skills_section(self.environment)
         if skills_section:

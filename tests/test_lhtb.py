@@ -379,6 +379,7 @@ async def test_runtime_yields_one_response_and_restores_semantic_chat(
     prompt = await runtime.prepare_start(
         "fix it", plan="inspect then test", rollback_feedback=None
     )
+    assert "must return to the login shell" in prompt
     first = await runtime.start(prompt=prompt, tokens_remaining=10_000)
     second = await runtime.resume(
         first.conversation,
@@ -646,9 +647,10 @@ def test_packaged_harbor_patch_is_available() -> None:
     patch = lhtb.lhtb_harbor_patch_path()
 
     assert patch.is_file()
-    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 5" in patch.read_text()
+    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 6" in patch.read_text()
     assert "cat >>" in patch.read_text()
     assert "block=True" in patch.read_text()
+    assert "__driftlock_status=$?" not in patch.read_text()
 
 
 def test_recording_rotation_stays_based_on_original_path() -> None:
