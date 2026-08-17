@@ -4,7 +4,7 @@
 > This is the working plan and gets updated as the project moves. For the
 > public-facing introduction, see `README.md`.
 
-**Last updated:** 2026-08-09
+**Last updated:** 2026-08-16
 
 ### Implementation status
 
@@ -17,9 +17,13 @@
   archives; SHA-256-verified host fallback and exact failed-restore recovery;
   versioned Terminus-2 semantic conversation codec and one-episode boundary adapter;
   pinned LHTB Harbor runtime with exact physical-call accounting, truncation usage,
-  per-episode workspace evidence, and tmux lifecycle cleanup; unit tests.
-- **Next:** run the week-1 LHTB smoke tests, then select experiment tasks by measured
-  partial credit.
+  per-episode workspace evidence, and tmux lifecycle cleanup; Harbor import-path
+  agent plugin; native-amd64/credential/Docker preflight; reproducible stock and
+  trial-budgeted driftlock job generation; measured partial-credit task selector;
+  unit and pinned-Harbor integration tests.
+- **Next:** run the credentialed week-1 stock LHTB smoke and roughly 20-task screen
+  on native amd64, then commit the measured task-selection artifact. No result has
+  been measured yet.
 
 ---
 

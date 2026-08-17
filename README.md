@@ -2,9 +2,10 @@
 
 **A checkpoint-and-rollback layer for long-horizon agents.**
 
-> 🚧 **Status: early. No benchmark results yet.** The first library slice implements
-> the checkpoint/rollback control loop and local filesystem snapshots. The LHTB
-> integration and experiments are still in progress. Nothing here is a result claim.
+> 🚧 **Status: experimental. No benchmark results yet.** The runner, remote
+> checkpoints, pinned LHTB/Terminus runtime, Harbor agent plugin, and experiment
+> harness are implemented. Credentialed amd64 screening has not run, so nothing here
+> is a result claim.
 
 ---
 
@@ -290,6 +291,31 @@ Unexpected adapter exceptions propagate because treating them as zero-token agen
 steps would corrupt compute-matched experiments. For fine judges, return
 `JudgeCompletion(text=..., tokens=...)` from the completion callback to include judge
 usage; returning a bare string is supported when usage is genuinely unavailable.
+
+### One-command LHTB runs
+
+Install driftlock into the pinned Harbor virtual environment and apply the companion
+patch as described in
+[`integrations/lhtb/README.md`](integrations/lhtb/README.md). On a native amd64 host,
+the experiment CLI checks the exact LHTB revision, patch, LiteLLM version, Docker
+architecture, and credential presence before a paid request. It never accepts or
+writes a credential value.
+
+```bash
+: "${OPENROUTER_API_KEY:?inject OPENROUTER_API_KEY with your secret manager}"
+driftlock-lhtb run \
+  --lhtb-dir /srv/LHTB \
+  --arm driftlock \
+  --job-name driftlock-smoke \
+  --tasks 2048 chess-mate \
+  --max-total-tokens 2000000
+```
+
+The driftlock budget is shared across all Harbor `continue_until_timeout` phases in
+one trial. A stock Terminus run has no comparable total-token ceiling; the CLI
+therefore requires an explicit `--ack-unbounded-stock-tokens` after a provider-side
+spend cap is configured. After screening, `driftlock-lhtb select JOB_DIR` ranks tasks
+by measured mean partial credit and records the trial result files behind the choice.
 
 Development uses Python 3.11+ and `uv`:
 
