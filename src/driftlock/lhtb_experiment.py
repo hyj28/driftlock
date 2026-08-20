@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -24,6 +25,41 @@ from driftlock.lhtb import (
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-pro"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
+
+# SHA-256 of every Harbor file after applying the packaged version-9 patch to the
+# pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
+_PATCHED_HARBOR_SHA256 = {
+    "harbor/src/harbor/_driftlock_pin.py": (
+        "4a7dbce646259b4ea6430048d3229717d75883a28d12b1fb52be760305f98fb5"
+    ),
+    "harbor/src/harbor/agents/terminus_2/terminus_2.py": (
+        "2b1b9aabac4b4ec40ba6b9c63b17a7d04e5a5a15e78dbf39efa361541e42c2f4"
+    ),
+    "harbor/src/harbor/agents/terminus_2/tmux_session.py": (
+        "3efd8216f7c9e276178b474a5c73e4a050026910af8876fa06b4f1bfae8b24f1"
+    ),
+    "harbor/src/harbor/llms/base.py": (
+        "cb8d0e482933eb78c18e95d0f6f4f0e10b36d91522a990ddaab382eb71a38cf0"
+    ),
+    "harbor/src/harbor/llms/chat.py": (
+        "066b0826b4604a4f23762776916b7cde547ee3708ab922669c2d513e73490297"
+    ),
+    "harbor/src/harbor/llms/lite_llm.py": (
+        "f33145a1d3f875239523e9a72ad401b09379364fb38e611d6b0b57c0143b1e1a"
+    ),
+    "harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py": (
+        "6e65a65dd74195ad962401b425504831d412225e011e12f54d6701bd91cb81b5"
+    ),
+    "harbor/tests/unit/agents/terminus_2/test_tmux_session.py": (
+        "0412e289ae6e8de7d2fc92fb1d1762761b1862b42102755638ce2a451d737d07"
+    ),
+    "harbor/tests/unit/llms/test_chat.py": (
+        "1b759fbd5ca57a7ef4199dcc958f50d05f8280e8b81c5648df01a3a45112a0a5"
+    ),
+    "harbor/tests/unit/llms/test_lite_llm.py": (
+        "9bc10a5e3b0021a808f56c32aa0ebd2f6d7a27e2b1e3a41413abc194db5103ea"
+    ),
+}
 
 
 class PreflightError(RuntimeError):
@@ -78,6 +114,7 @@ def build_job_config(
     }
     if arm == "stock":
         agent["name"] = "terminus-2"
+        agent["env"] = {"HB_CONTINUE_MODE": "fresh"}
         agent["kwargs"].update(
             {
                 "enable_summarize": True,
@@ -87,6 +124,7 @@ def build_job_config(
         agent["kwargs"]["llm_call_kwargs"]["num_retries"] = 4
     else:
         agent["import_path"] = "driftlock.harbor_agent:LHTBDriftlockAgent"
+        agent["env"] = {"HB_CONTINUE_MODE": "same_conversation"}
         agent["kwargs"].update(
             {
                 "enable_summarize": False,
@@ -128,9 +166,11 @@ def preflight(
         raise PreflightError(
             f"LHTB revision is {revision}, expected {LHTB_REPOSITORY_REVISION}"
         )
+    _validate_checkout_contents(root)
     try:
         from importlib.metadata import version
 
+        import harbor
         from harbor._driftlock_pin import (
             DRIFTLOCK_HARBOR_PATCH_VERSION as installed_patch,
         )
@@ -147,6 +187,12 @@ def preflight(
         )
     if installed_patch != DRIFTLOCK_HARBOR_PATCH_VERSION:
         raise PreflightError("installed Harbor patch version does not match driftlock")
+    imported_harbor = Path(harbor.__file__ or "").resolve()
+    expected_harbor = (root / "harbor" / "src" / "harbor").resolve()
+    if not imported_harbor.is_relative_to(expected_harbor):
+        raise PreflightError(
+            f"imported Harbor is outside the requested LHTB checkout: {imported_harbor}"
+        )
     if version("litellm") != LHTB_LITELLM_VERSION:
         raise PreflightError(f"litellm must be exactly {LHTB_LITELLM_VERSION}")
     if require_credential and not os.environ.get(credential_env):
@@ -302,13 +348,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"wrote {config_path}")
             if args.command == "prepare":
                 return 0
-            harbor = shutil.which("harbor")
-            if harbor is None:
-                raise PreflightError("harbor executable not found in PATH")
+            harbor_command = _pinned_harbor_command()
+            child_env = os.environ.copy()
+            child_env.pop("HB_PROCESS_REWARD", None)
+            if args.arm == "driftlock":
+                child_env["HB_CONTINUE_MODE"] = "same_conversation"
+            else:
+                child_env.pop("HB_CONTINUE_MODE", None)
             completed = subprocess.run(
-                [harbor, "run", "-c", str(config_path)],
+                [*harbor_command, "run", "-c", str(config_path)],
                 cwd=args.lhtb_dir.expanduser().resolve(),
                 check=False,
+                env=child_env,
             )
             return completed.returncode
         if args.command == "select":
@@ -411,7 +462,75 @@ def _run_checked(command: list[str], *, cwd: Path, description: str) -> str:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise PreflightError(f"failed to {description}: {detail}")
-    return result.stdout.strip()
+    return result.stdout.rstrip("\r\n")
+
+
+def _validate_checkout_contents(root: Path) -> None:
+    allowed = set(_PATCHED_HARBOR_SHA256)
+    harbor_status = _run_checked(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            "harbor",
+        ],
+        cwd=root,
+        description="inspect Harbor checkout",
+    )
+    changed = {line[3:] for line in harbor_status.splitlines() if len(line) >= 4}
+    unexpected = sorted(changed - allowed)
+    if unexpected:
+        raise PreflightError(
+            "Harbor checkout has changes outside the companion patch: "
+            + ", ".join(unexpected)
+        )
+    missing = sorted(allowed - changed)
+    if missing:
+        raise PreflightError(
+            "Harbor companion patch is incomplete: " + ", ".join(missing)
+        )
+    for relative, expected in _PATCHED_HARBOR_SHA256.items():
+        path = root / relative
+        if not path.is_file() or _file_sha256(path) != expected:
+            raise PreflightError(
+                f"Harbor file does not match companion patch v9: {relative}"
+            )
+    task_status = _run_checked(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            "tasks",
+        ],
+        cwd=root,
+        description="inspect benchmark task tree",
+    )
+    if task_status:
+        raise PreflightError(
+            "benchmark task tree differs from the pinned revision: "
+            + task_status.splitlines()[0]
+        )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _pinned_harbor_command() -> list[str]:
+    script = Path(sys.executable).parent / "harbor"
+    if not script.is_file():
+        raise PreflightError(
+            "harbor console script is not installed beside the current Python"
+        )
+    return [sys.executable, str(script)]
 
 
 if __name__ == "__main__":

@@ -71,7 +71,10 @@ driftlock-lhtb preflight --lhtb-dir /srv/LHTB
 One command writes the resolved Harbor JSON config and launches a budgeted driftlock
 job. The plugin is loaded through Harbor's documented `import_path` mechanism, uses
 the task's absolute workdir, keeps host checkpoints outside the agent log mount, and
-shares the total-token ceiling across verifier-driven continuation phases.
+shares the total-token ceiling across verifier-driven continuation phases. The
+harness records and forces `HB_CONTINUE_MODE=same_conversation` for this arm, removes
+process-reward ambient state, and launches the Harbor console script with the same
+Python interpreter that passed preflight.
 
 ```bash
 driftlock-lhtb run \
@@ -97,6 +100,12 @@ Stock Terminus matches the official leaderboard's summarization and four interna
 retries, so it cannot enforce a trial-wide token ceiling. A live stock run requires
 `--ack-unbounded-stock-tokens`; configure a hard spend cap with the provider first.
 Neither generated arm enables Harbor job retries.
+
+Preflight requires the benchmark `tasks/` tree to match the pinned commit byte for
+byte. Harbor may differ only by the packaged version-9 companion patch: every patch
+target is checked against its expected SHA-256 and any other tracked or untracked
+Harbor change is rejected. The imported `harbor` module must also resolve inside the
+requested LHTB checkout.
 
 After a roughly 20-task stock screen, select the 8–12 tasks with measured headroom:
 

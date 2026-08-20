@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from driftlock.lhtb_experiment import build_job_config, main, select_tasks
+import driftlock.lhtb_experiment as experiment
+from driftlock.lhtb_experiment import (
+    PreflightError,
+    build_job_config,
+    main,
+    select_tasks,
+)
 
 
 def _lhtb_tree(tmp_path: Path, *tasks: str) -> Path:
@@ -34,6 +42,7 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
     assert agent["import_path"] == "driftlock.harbor_agent:LHTBDriftlockAgent"
     assert agent["kwargs"]["driftlock_max_tokens"] == 123_456
     assert agent["kwargs"]["enable_summarize"] is False
+    assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
     assert "num_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert "max_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert config["retry"]["max_retries"] == 0
@@ -52,6 +61,7 @@ def test_build_stock_config_matches_leaderboard_retry_behavior(tmp_path: Path) -
 
     agent = config["agents"][0]
     assert agent["name"] == "terminus-2"
+    assert agent["env"]["HB_CONTINUE_MODE"] == "fresh"
     assert agent["kwargs"]["enable_summarize"] is True
     assert agent["kwargs"]["llm_call_kwargs"]["num_retries"] == 4
 
@@ -127,3 +137,102 @@ def test_prepare_cli_writes_json_without_credentials_or_harbor(
         == 0
     )
     assert json.loads(output.read_text())["job_name"] == "prepared"
+
+
+@pytest.mark.parametrize(
+    ("arm", "expected_mode"),
+    [("driftlock", "same_conversation"), ("stock", None)],
+)
+def test_run_uses_current_python_harbor_and_pins_continuation_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+    expected_mode: str | None,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(experiment, "preflight", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        experiment,
+        "_pinned_harbor_command",
+        lambda: ["/pinned/python", "/pinned/bin/harbor"],
+    )
+    monkeypatch.setenv("HB_CONTINUE_MODE", "ambient-wrong-mode")
+    monkeypatch.setenv("HB_PROCESS_REWARD", "30,300")
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append({"command": command, **kwargs})
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(experiment.subprocess, "run", fake_run)
+    arguments = [
+        "run",
+        "--lhtb-dir",
+        str(root),
+        "--config",
+        str(tmp_path / f"{arm}.json"),
+        "--job-name",
+        f"{arm}-run",
+        "--arm",
+        arm,
+        "--tasks",
+        "task-a",
+    ]
+    if arm == "stock":
+        arguments.append("--ack-unbounded-stock-tokens")
+
+    assert main(arguments) == 0
+    assert calls[0]["command"][:2] == [
+        "/pinned/python",
+        "/pinned/bin/harbor",
+    ]
+    child_env = calls[0]["env"]
+    assert isinstance(child_env, dict)
+    assert child_env.get("HB_CONTINUE_MODE") == expected_mode
+    assert "HB_PROCESS_REWARD" not in child_env
+
+
+def test_checkout_validation_rejects_task_and_non_patch_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "LHTB"
+    patched = root / "harbor" / "patched.py"
+    task = root / "tasks" / "task-a" / "task.toml"
+    patched.parent.mkdir(parents=True)
+    task.parent.mkdir(parents=True)
+    patched.write_text("base\n", encoding="utf-8")
+    task.write_text("base\n", encoding="utf-8")
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "test@example.com"],
+        ["git", "config", "user.name", "Test"],
+        ["git", "add", "."],
+        ["git", "commit", "-qm", "base"],
+    ):
+        subprocess.run(command, cwd=root, check=True)
+    patched.write_text("expected patch\n", encoding="utf-8")
+    monkeypatch.setattr(
+        experiment,
+        "_PATCHED_HARBOR_SHA256",
+        {"harbor/patched.py": experiment._file_sha256(patched)},
+    )
+
+    experiment._validate_checkout_contents(root)
+
+    task.write_text("modified task\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="task tree"):
+        experiment._validate_checkout_contents(root)
+    task.write_text("base\n", encoding="utf-8")
+    patched.write_text("unexpected Harbor edit\n", encoding="utf-8")
+    with pytest.raises(PreflightError, match="companion patch"):
+        experiment._validate_checkout_contents(root)
+
+
+def test_patched_harbor_manifest_contains_sha256_values() -> None:
+    assert experiment._PATCHED_HARBOR_SHA256
+    assert all(
+        len(value) == 64
+        and value.isascii()
+        and all(character in "0123456789abcdef" for character in value)
+        for value in experiment._PATCHED_HARBOR_SHA256.values()
+    )

@@ -312,7 +312,10 @@ driftlock-lhtb run \
 ```
 
 The driftlock budget is shared across all Harbor `continue_until_timeout` phases in
-one trial. A stock Terminus run has no comparable total-token ceiling; the CLI
+one trial. The harness pins driftlock to Harbor's `same_conversation` continuation
+mode and starts Harbor with the same Python environment that passed preflight. It
+also rejects task-tree changes and any Harbor bytes beyond the packaged patch. A
+stock Terminus run has no comparable total-token ceiling; the CLI
 therefore requires an explicit `--ack-unbounded-stock-tokens` after a provider-side
 spend cap is configured. After screening, `driftlock-lhtb select JOB_DIR` ranks tasks
 by measured mean partial credit and records the trial result files behind the choice.
