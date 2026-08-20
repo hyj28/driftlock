@@ -68,13 +68,13 @@ Run preflight from the same frozen Harbor environment before spending model toke
 driftlock-lhtb preflight --lhtb-dir /srv/LHTB
 ```
 
-One command writes the resolved Harbor JSON config and launches a budgeted driftlock
+One command writes the resolved Harbor JSON config and launches a budgeted controlled
 job. The plugin is loaded through Harbor's documented `import_path` mechanism, uses
 the task's absolute workdir, keeps host checkpoints outside the agent log mount, and
 shares the total-token ceiling across verifier-driven continuation phases. The
-harness records and forces `HB_CONTINUE_MODE=same_conversation` for this arm, removes
-process-reward ambient state, and launches the Harbor console script with the same
-Python interpreter that passed preflight.
+harness records and forces `HB_CONTINUE_MODE=same_conversation` for controlled arms,
+removes process-reward ambient state, and launches the Harbor console script with the
+same Python interpreter that passed preflight.
 
 ```bash
 driftlock-lhtb run \
@@ -99,7 +99,27 @@ driftlock-lhtb prepare \
 Stock Terminus matches the official leaderboard's summarization and four internal
 retries, so it cannot enforce a trial-wide token ceiling. A live stock run requires
 `--ack-unbounded-stock-tokens`; configure a hard spend cap with the provider first.
-Neither generated arm enables Harbor job retries.
+No generated arm enables Harbor job retries.
+
+The runnable arms are:
+
+- `stock`: official Terminus-2 behavior, including summarization and internal retry;
+- `retry`: on binary verifier rejection, discard its text, restore the initial
+  workspace, start a fresh conversation, and spend the same shared token budget;
+- `driftlock-heuristic`: checkpoint rollback driven directly by coarse signals; and
+- `driftlock`: the two-tier controller, with DeepSeek V4-Flash 0731 as the default
+  fine judge. Override it with `--judge-model` and `--judge-api-base`.
+
+The fine judge bypasses Harbor's retry wrapper, sends at most one physical provider
+request, reserves a conservative prompt bound before choosing its output ceiling,
+and reports its prompt/cache/completion tokens and cost in both the shared driftlock
+budget and Harbor result metadata. Missing provider usage is conservatively charged
+at the reserved bound instead of being treated as a free call.
+
+The oracle upper bound is intentionally not a runnable online-agent arm. A valid
+hindsight oracle requires isolated replay of retained checkpoints with the hidden
+verifier; generating an ordinary agent configuration under the `oracle` label would
+invalidate the comparison.
 
 Preflight requires the benchmark `tasks/` tree to match the pinned commit byte for
 byte. Harbor may differ only by the packaged version-9 companion patch: every patch

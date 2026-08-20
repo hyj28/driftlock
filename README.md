@@ -311,14 +311,23 @@ driftlock-lhtb run \
   --max-total-tokens 2000000
 ```
 
-The driftlock budget is shared across all Harbor `continue_until_timeout` phases in
-one trial. The harness pins driftlock to Harbor's `same_conversation` continuation
-mode and starts Harbor with the same Python environment that passed preflight. It
-also rejects task-tree changes and any Harbor bytes beyond the packaged patch. A
-stock Terminus run has no comparable total-token ceiling; the CLI
+The `retry`, `driftlock-heuristic`, and `driftlock` arms share one total-token budget
+across all Harbor `continue_until_timeout` phases. `retry` discards verifier text and
+blindly restores the original workspace and fresh conversation after a binary
+rejection. `driftlock-heuristic` is the zero-judge-token ablation; `driftlock` adds a
+single-attempt DeepSeek V4-Flash fine judge and folds its input, cache, output, and
+dollar usage into Harbor's trial accounting. The harness pins controlled arms to
+Harbor's `same_conversation` mode and starts Harbor with the same Python environment
+that passed preflight. It also rejects task-tree changes and any Harbor bytes beyond
+the packaged patch. A stock Terminus run has no comparable total-token ceiling; the CLI
 therefore requires an explicit `--ack-unbounded-stock-tokens` after a provider-side
 spend cap is configured. After screening, `driftlock-lhtb select JOB_DIR` ranks tasks
 by measured mean partial credit and records the trial result files behind the choice.
+
+The planned hindsight oracle is not exposed as an online agent arm. A valid oracle
+must replay retained candidate checkpoints in isolated copies against the hidden
+verifier, then choose with hindsight; the CLI rejects attempts to label an ordinary
+agent config as that upper bound.
 
 Development uses Python 3.11+ and `uv`:
 

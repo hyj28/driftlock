@@ -9,23 +9,32 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
 from harbor.agents.terminus_2 import Terminus2
+from harbor.llms.lite_llm import LiteLLM
 
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
+from driftlock.judges import CallableLLMJudge
 from driftlock.lhtb import HarborWorkspaceDeltaObserver, LHTBTerminusRuntime
-from driftlock.models import RunResult, RunStatus
+from driftlock.models import (
+    DriftContext,
+    JudgeCompletion,
+    JudgeVerdict,
+    RunResult,
+    RunStatus,
+)
 from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 
 
 class LHTBDriftlockAgent(Terminus2):
-    """Pinned Terminus-2 with checkpointed, heuristics-only rollback.
+    """Pinned Terminus-2 with checkpointed two-tier rollback.
 
     Configuration uses ``driftlock_*`` keyword arguments so a generated Harbor
     config can distinguish the controller budget from Terminus' own parameters.
@@ -46,6 +55,11 @@ class LHTBDriftlockAgent(Terminus2):
         driftlock_loop_repetitions: int = 3,
         driftlock_error_window: int = 5,
         driftlock_error_rate: float = 0.6,
+        driftlock_reward_stall_steps: int = 5,
+        driftlock_judge_model: str | None = None,
+        driftlock_judge_api_base: str | None = None,
+        driftlock_judge_max_output_tokens: int = 512,
+        driftlock_judge_timeout_sec: float = 120.0,
         **kwargs: Any,
     ) -> None:
         if enable_summarize:
@@ -63,6 +77,22 @@ class LHTBDriftlockAgent(Terminus2):
             loop_repetitions=driftlock_loop_repetitions,
             error_window=driftlock_error_window,
             error_rate=driftlock_error_rate,
+            reward_stall_steps=driftlock_reward_stall_steps,
+        )
+        self._driftlock_judge_client = (
+            None
+            if driftlock_judge_model is None
+            else _LHTBJudgeClient(
+                model=driftlock_judge_model,
+                api_base=driftlock_judge_api_base,
+                max_output_tokens=driftlock_judge_max_output_tokens,
+                timeout_sec=driftlock_judge_timeout_sec,
+            )
+        )
+        self._driftlock_fine_judge = (
+            None
+            if self._driftlock_judge_client is None
+            else _LHTBFineJudge(self._driftlock_judge_client)
         )
         self._driftlock_plan = driftlock_plan
         self._driftlock_retain_checkpoints = driftlock_retain_checkpoints
@@ -168,6 +198,7 @@ class LHTBDriftlockAgent(Terminus2):
         runner = DriftlockRunner(
             store,
             HeuristicJudge(self._driftlock_heuristic_config),
+            fine_judge=self._driftlock_fine_judge,
             config=replace(self._driftlock_runner_config, max_tokens=remaining_budget),
         )
         try:
@@ -187,16 +218,22 @@ class LHTBDriftlockAgent(Terminus2):
 
         self._driftlock_last_result = result
         self._driftlock_tokens_consumed += result.tokens_used
+        if self._driftlock_judge_client is not None:
+            self._driftlock_judge_client.apply_accounting(context)
         raw = _AccountingSnapshot.capture(context)
         if not same_context:
             _make_phase_accounting(context, self._driftlock_accounting, raw)
         self._driftlock_accounting = raw
         self._driftlock_last_context_id = id(context)
         self._set_result_metadata(context, result)
-        retained = self._driftlock_retain_checkpoints
+        retained = self._retain_phase_checkpoints(len(self._driftlock_phases))
         self._write_phase_record(result, phase_store, retained=retained)
         if not retained:
             shutil.rmtree(phase_store)
+
+    def _retain_phase_checkpoints(self, phase: int) -> bool:
+        del phase
+        return self._driftlock_retain_checkpoints
 
     def _ensure_runtime(self, environment: Any, context: Any) -> None:
         if self._driftlock_runtime is not None:
@@ -279,6 +316,242 @@ class LHTBDriftlockAgent(Terminus2):
             json.dumps({"phases": self._driftlock_phases}, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+class LHTBBlindRetryAgent(LHTBDriftlockAgent):
+    """Compute-matched control that restarts blindly after verifier rejection.
+
+    The binary rejection is used only as the retry trigger.  Its textual verifier
+    feedback is deliberately discarded, and every retry restores the original
+    workspace plus a fresh Terminus conversation while preserving physical token
+    accounting across attempts.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        driftlock_max_steps: int = 500,
+        **kwargs: Any,
+    ) -> None:
+        horizon = driftlock_max_steps + 1
+        kwargs.update(
+            {
+                "driftlock_max_rollbacks": 0,
+                "driftlock_checkpoint_interval": horizon,
+                "driftlock_no_change_steps": horizon,
+                "driftlock_loop_window": horizon,
+                "driftlock_loop_repetitions": horizon,
+                "driftlock_error_window": horizon,
+                "driftlock_reward_stall_steps": horizon,
+                "driftlock_judge_model": None,
+                "driftlock_retain_checkpoints": False,
+            }
+        )
+        super().__init__(
+            *args,
+            driftlock_max_steps=driftlock_max_steps,
+            **kwargs,
+        )
+        self._driftlock_retry_checkpoint: Any | None = None
+        self._driftlock_retry_count = 0
+
+    @staticmethod
+    def name() -> str:
+        return "compute-matched-blind-retry-terminus-2"
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        await super().run(instruction, environment, context)
+        result = self._driftlock_last_result
+        if result is None or not result.checkpoints:
+            raise RuntimeError("blind retry initial run did not create a checkpoint")
+        self._driftlock_retry_checkpoint = result.checkpoints[0]
+        self._set_retry_metadata(context)
+
+    async def resume_after_verifier_rejection(
+        self, user_prompt: str, context: Any
+    ) -> None:
+        del user_prompt
+        checkpoint = self._driftlock_retry_checkpoint
+        if checkpoint is None or self._driftlock_environment is None:
+            raise RuntimeError("cannot retry before the initial run")
+        if id(context) != self._driftlock_last_context_id:
+            raise RuntimeError("blind retry must reuse AgentContext")
+        assert self._driftlock_step is not None
+        phase_root = checkpoint.path.parent.parent
+        store = RemoteArchiveCheckpointStore(
+            self._driftlock_environment,
+            remote_workspace=self._driftlock_workspace or "",
+            store_dir=phase_root,
+            user=self._driftlock_environment.default_user,
+            before_restore=self._driftlock_step.before_workspace_restore,
+        )
+        initial_state = await store.restore(checkpoint)
+        self._driftlock_retry_count += 1
+        await self._run_driftlock_phase(
+            instruction=self._original_instruction,
+            environment=self._driftlock_environment,
+            context=context,
+            initial_state=initial_state,
+        )
+        self._set_retry_metadata(context)
+
+    def _retain_phase_checkpoints(self, phase: int) -> bool:
+        return phase == 0
+
+    def _set_retry_metadata(self, context: Any) -> None:
+        metadata = dict(context.metadata or {})
+        metadata["driftlock_blind_retry"] = {
+            "retries_started": self._driftlock_retry_count,
+            "verifier_feedback_used": False,
+            "restart_checkpoint": "initial",
+        }
+        context.metadata = metadata
+
+
+class _LHTBFineJudge:
+    def __init__(self, client: _LHTBJudgeClient) -> None:
+        self.client = client
+
+    async def judge(self, context: DriftContext) -> JudgeVerdict:
+        async def complete(prompt: str) -> JudgeCompletion:
+            return await self.client.complete(
+                prompt, tokens_remaining=context.tokens_remaining
+            )
+
+        return await CallableLLMJudge(complete).judge(context)
+
+
+class _LHTBJudgeClient:
+    """Single-attempt LiteLLM judge with conservative budget and cost accounting."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_base: str | None,
+        max_output_tokens: int,
+        timeout_sec: float,
+    ) -> None:
+        if not model:
+            raise ValueError("driftlock_judge_model cannot be empty")
+        if max_output_tokens <= 0 or timeout_sec <= 0:
+            raise ValueError("judge output limit and timeout must be positive")
+        self.model = model
+        self.max_output_tokens = max_output_tokens
+        self.timeout_sec = timeout_sec
+        self.llm = LiteLLM(
+            model_name=model,
+            api_base=api_base,
+            temperature=0.0,
+            model_info={
+                "max_input_tokens": 1_000_000,
+                "max_output_tokens": 8_192,
+                "input_cost_per_token": 0.14 / 1_000_000,
+                "cache_read_input_token_cost": 0.0028 / 1_000_000,
+                "output_cost_per_token": 0.28 / 1_000_000,
+            },
+        )
+        self.llm._driftlock_single_attempt = True
+        self.n_input_tokens = 0
+        self.n_cache_tokens = 0
+        self.n_output_tokens = 0
+        self.cost_usd = 0.0
+        self.request_times_msec: list[float] = []
+        self.usage_fallbacks = 0
+
+    async def complete(
+        self, prompt: str, *, tokens_remaining: int | None
+    ) -> JudgeCompletion:
+        input_bound = len(prompt.encode("utf-8")) + 256
+        ceiling = self.max_output_tokens
+        if tokens_remaining is not None:
+            ceiling = min(ceiling, max(0, tokens_remaining - input_bound))
+        if ceiling <= 0:
+            return JudgeCompletion(text="", tokens=0)
+
+        started = time.monotonic()
+        response: Any | None = None
+        try:
+            call = getattr(self.llm.call, "__wrapped__", None)
+            if call is None:
+                raise RuntimeError("pinned LiteLLM.call lacks single-attempt access")
+            response = await call(
+                self.llm,
+                prompt=prompt,
+                max_tokens=ceiling,
+                num_retries=0,
+                max_retries=0,
+                timeout=self.timeout_sec,
+            )
+            content = response.content
+        except Exception as error:
+            response = getattr(error, "response", None)
+            content = getattr(error, "truncated_response", None) or ""
+        finally:
+            self.request_times_msec.append((time.monotonic() - started) * 1000)
+
+        usage = getattr(response, "usage", None)
+        if self._valid_usage(usage):
+            prompt_tokens = usage.prompt_tokens
+            completion_tokens = usage.completion_tokens
+            cache_tokens = usage.cache_tokens
+            cost_usd = float(usage.cost_usd)
+        else:
+            prompt_tokens = input_bound
+            completion_tokens = ceiling
+            cache_tokens = 0
+            cost_usd = 0.0
+            self.usage_fallbacks += 1
+        self.n_input_tokens += prompt_tokens
+        self.n_cache_tokens += cache_tokens
+        self.n_output_tokens += completion_tokens
+        self.cost_usd += cost_usd
+        return JudgeCompletion(
+            text=content,
+            tokens=prompt_tokens + completion_tokens,
+        )
+
+    @staticmethod
+    def _valid_usage(usage: Any) -> bool:
+        if usage is None:
+            return False
+        integer_values = (
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+            getattr(usage, "cache_tokens", None),
+        )
+        cost = getattr(usage, "cost_usd", None)
+        return (
+            all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in integer_values
+            )
+            and isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and cost >= 0
+        )
+
+    def apply_accounting(self, context: Any) -> None:
+        context.n_input_tokens = (context.n_input_tokens or 0) + self.n_input_tokens
+        context.n_cache_tokens = (context.n_cache_tokens or 0) + self.n_cache_tokens
+        context.n_output_tokens = (context.n_output_tokens or 0) + self.n_output_tokens
+        total_cost = (context.cost_usd or 0.0) + self.cost_usd
+        context.cost_usd = total_cost if total_cost > 0 else None
+        metadata = dict(context.metadata or {})
+        request_times = list(metadata.get("api_request_times_msec") or [])
+        request_times.extend(self.request_times_msec)
+        metadata["api_request_times_msec"] = request_times
+        metadata["llm_time_sec"] = sum(request_times) / 1000.0
+        metadata["driftlock_judge_usage"] = {
+            "model": self.model,
+            "input_tokens": self.n_input_tokens,
+            "cache_tokens": self.n_cache_tokens,
+            "output_tokens": self.n_output_tokens,
+            "cost_usd": self.cost_usd,
+            "request_count": len(self.request_times_msec),
+            "conservative_usage_fallbacks": self.usage_fallbacks,
+        }
+        context.metadata = metadata
 
 
 class _AccountingSnapshot:

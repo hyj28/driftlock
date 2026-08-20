@@ -41,12 +41,74 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
     agent = config["agents"][0]
     assert agent["import_path"] == "driftlock.harbor_agent:LHTBDriftlockAgent"
     assert agent["kwargs"]["driftlock_max_tokens"] == 123_456
+    assert agent["kwargs"]["driftlock_judge_model"] == experiment.DEFAULT_JUDGE_MODEL
+    assert agent["kwargs"]["driftlock_judge_api_base"] == experiment.DEFAULT_API_BASE
     assert agent["kwargs"]["enable_summarize"] is False
     assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
     assert "num_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert "max_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert config["retry"]["max_retries"] == 0
     assert config["datasets"][0]["task_names"] == ["task-a", "task-b"]
+
+
+@pytest.mark.parametrize(
+    ("arm", "import_path", "has_fine_judge"),
+    [
+        (
+            "retry",
+            "driftlock.harbor_agent:LHTBBlindRetryAgent",
+            False,
+        ),
+        (
+            "driftlock-heuristic",
+            "driftlock.harbor_agent:LHTBDriftlockAgent",
+            False,
+        ),
+        (
+            "driftlock",
+            "driftlock.harbor_agent:LHTBDriftlockAgent",
+            True,
+        ),
+    ],
+)
+def test_build_controlled_arm_configs(
+    tmp_path: Path,
+    arm: str,
+    import_path: str,
+    has_fine_judge: bool,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name=f"arm-{arm}",
+        arm=arm,
+        tasks=["task-a"],
+        max_total_tokens=999,
+        judge_model="openrouter/test/judge",
+        judge_api_base="https://judge.invalid/v1",
+    )
+
+    agent = config["agents"][0]
+    assert agent["import_path"] == import_path
+    assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
+    assert agent["kwargs"]["driftlock_max_tokens"] == 999
+    assert ("driftlock_judge_model" in agent["kwargs"]) is has_fine_judge
+    if has_fine_judge:
+        assert agent["kwargs"]["driftlock_judge_model"] == "openrouter/test/judge"
+        assert agent["kwargs"]["driftlock_judge_api_base"] == "https://judge.invalid/v1"
+
+
+def test_oracle_cannot_be_misrepresented_as_an_online_agent(tmp_path: Path) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    with pytest.raises(ValueError, match="hidden-verifier checkpoint replay"):
+        build_job_config(
+            lhtb_dir=root,
+            jobs_dir=tmp_path / "jobs",
+            job_name="not-an-oracle",
+            arm="oracle",
+            tasks=["task-a"],
+        )
 
 
 def test_build_stock_config_matches_leaderboard_retry_behavior(tmp_path: Path) -> None:
@@ -141,7 +203,12 @@ def test_prepare_cli_writes_json_without_credentials_or_harbor(
 
 @pytest.mark.parametrize(
     ("arm", "expected_mode"),
-    [("driftlock", "same_conversation"), ("stock", None)],
+    [
+        ("driftlock", "same_conversation"),
+        ("driftlock-heuristic", "same_conversation"),
+        ("retry", "same_conversation"),
+        ("stock", None),
+    ],
 )
 def test_run_uses_current_python_harbor_and_pins_continuation_environment(
     tmp_path: Path,

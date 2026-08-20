@@ -23,8 +23,10 @@ from driftlock.lhtb import (
 )
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-pro"
+DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
+RUNNABLE_ARMS = ("stock", "retry", "driftlock-heuristic", "driftlock")
 
 # SHA-256 of every Harbor file after applying the packaged version-9 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
@@ -78,14 +80,21 @@ def build_job_config(
     n_concurrent_trials: int = 1,
     timeout_sec: int = 5400,
     max_total_tokens: int = 10_000_000,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
+    judge_api_base: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact JSON-compatible Harbor configuration for one run."""
     root = lhtb_dir.expanduser().resolve()
     task_root = root / "tasks"
     _validate_job_name(job_name)
     selected = _validate_tasks(task_root, tasks)
-    if arm not in {"stock", "driftlock"}:
-        raise ValueError("arm must be 'stock' or 'driftlock'")
+    if arm == "oracle":
+        raise ValueError(
+            "oracle requires isolated hidden-verifier checkpoint replay; an online "
+            "agent configuration would not be a hindsight-perfect oracle"
+        )
+    if arm not in RUNNABLE_ARMS:
+        raise ValueError("arm must be one of " + ", ".join(RUNNABLE_ARMS))
     if n_concurrent_trials <= 0:
         raise ValueError("n_concurrent_trials must be positive")
     if timeout_sec <= 0 or max_total_tokens <= 0:
@@ -123,7 +132,11 @@ def build_job_config(
         )
         agent["kwargs"]["llm_call_kwargs"]["num_retries"] = 4
     else:
-        agent["import_path"] = "driftlock.harbor_agent:LHTBDriftlockAgent"
+        agent["import_path"] = (
+            "driftlock.harbor_agent:LHTBBlindRetryAgent"
+            if arm == "retry"
+            else "driftlock.harbor_agent:LHTBDriftlockAgent"
+        )
         agent["env"] = {"HB_CONTINUE_MODE": "same_conversation"}
         agent["kwargs"].update(
             {
@@ -134,6 +147,14 @@ def build_job_config(
                 "driftlock_checkpoint_interval": 5,
             }
         )
+        if arm == "driftlock":
+            agent["kwargs"].update(
+                {
+                    "driftlock_judge_model": judge_model,
+                    "driftlock_judge_api_base": judge_api_base or api_base,
+                    "driftlock_judge_max_output_tokens": 512,
+                }
+            )
 
     return {
         "job_name": job_name,
@@ -339,6 +360,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 n_concurrent_trials=args.concurrency,
                 timeout_sec=args.timeout_sec,
                 max_total_tokens=args.max_total_tokens,
+                judge_model=args.judge_model,
+                judge_api_base=args.judge_api_base,
             )
             config_path = args.config.expanduser().resolve()
             config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,7 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             harbor_command = _pinned_harbor_command()
             child_env = os.environ.copy()
             child_env.pop("HB_PROCESS_REWARD", None)
-            if args.arm == "driftlock":
+            if args.arm != "stock":
                 child_env["HB_CONTINUE_MODE"] = "same_conversation"
             else:
                 child_env.pop("HB_CONTINUE_MODE", None)
@@ -392,10 +415,12 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
         command.add_argument("--config", type=Path, default=Path("driftlock-job.json"))
         command.add_argument("--job-name", required=True)
-        command.add_argument("--arm", choices=("stock", "driftlock"), required=True)
+        command.add_argument("--arm", choices=RUNNABLE_ARMS, required=True)
         command.add_argument("--tasks", nargs="+", required=True)
         command.add_argument("--model", default=DEFAULT_MODEL)
         command.add_argument("--api-base", default=DEFAULT_API_BASE)
+        command.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
+        command.add_argument("--judge-api-base")
         command.add_argument("--credential-env", default=DEFAULT_CREDENTIAL_ENV)
         command.add_argument("--concurrency", type=int, default=1)
         command.add_argument("--timeout-sec", type=int, default=5400)
