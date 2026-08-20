@@ -55,8 +55,70 @@ Run the no-network integration smoke test against Harbor's real Terminus loop:
 ```bash
 uv pip install --python harbor/.venv/bin/python pytest pytest-asyncio
 harbor/.venv/bin/python -m pytest -q \
-  /absolute/path/to/driftlock/integrations/lhtb/test_runtime_smoke.py
+  /absolute/path/to/driftlock/integrations/lhtb/test_runtime_smoke.py \
+  /absolute/path/to/driftlock/integrations/lhtb/test_harbor_agent.py
 ```
+
+## Experiment harness
+
+Run preflight from the same frozen Harbor environment before spending model tokens:
+
+```bash
+: "${OPENROUTER_API_KEY:?inject OPENROUTER_API_KEY with your secret manager}"
+driftlock-lhtb preflight --lhtb-dir /srv/LHTB
+```
+
+One command writes the resolved Harbor JSON config and launches a budgeted driftlock
+job. The plugin is loaded through Harbor's documented `import_path` mechanism, uses
+the task's absolute workdir, keeps host checkpoints outside the agent log mount, and
+shares the total-token ceiling across verifier-driven continuation phases. The
+harness records and forces `HB_CONTINUE_MODE=same_conversation` for this arm, removes
+process-reward ambient state, and launches the Harbor console script with the same
+Python interpreter that passed preflight.
+
+```bash
+driftlock-lhtb run \
+  --lhtb-dir /srv/LHTB \
+  --arm driftlock \
+  --job-name week1-driftlock-smoke \
+  --tasks 2048 chess-mate \
+  --max-total-tokens 2000000
+```
+
+Generate a config without credentials, Docker, or a paid call with `prepare`:
+
+```bash
+driftlock-lhtb prepare \
+  --lhtb-dir /srv/LHTB \
+  --arm stock \
+  --job-name week1-stock-smoke \
+  --tasks 2048 chess-mate \
+  --config /tmp/week1-stock.json
+```
+
+Stock Terminus matches the official leaderboard's summarization and four internal
+retries, so it cannot enforce a trial-wide token ceiling. A live stock run requires
+`--ack-unbounded-stock-tokens`; configure a hard spend cap with the provider first.
+Neither generated arm enables Harbor job retries.
+
+Preflight requires the benchmark `tasks/` tree to match the pinned commit byte for
+byte. Harbor may differ only by the packaged version-9 companion patch: every patch
+target is checked against its expected SHA-256 and any other tracked or untracked
+Harbor change is rejected. The imported `harbor` module must also resolve inside the
+requested LHTB checkout.
+
+After a roughly 20-task stock screen, select the 8–12 tasks with measured headroom:
+
+```bash
+driftlock-lhtb select /srv/LHTB/jobs/week1-screen \
+  --limit 12 --min-reward 0 --max-reward 0.95 \
+  --output selected-tasks.json
+```
+
+Selection uses the mean of every numeric `verifier_result.rewards.reward` observed
+for a task, excludes zero and solved-threshold results by default, and preserves the
+source result paths and failures in the JSON report. No benchmark number is claimed
+until the credentialed native-amd64 run completes.
 
 The runtime supports LHTB's LiteLLM backend. Construct Terminus-2 with
 `enable_summarize=False`; do not install LHTB's process-reward tracker because
