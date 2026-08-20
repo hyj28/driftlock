@@ -28,11 +28,11 @@ DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 RUNNABLE_ARMS = ("stock", "retry", "driftlock-heuristic", "driftlock")
 
-# SHA-256 of every Harbor file after applying the packaged version-9 patch to the
+# SHA-256 of every Harbor file after applying the packaged version-10 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
 _PATCHED_HARBOR_SHA256 = {
     "harbor/src/harbor/_driftlock_pin.py": (
-        "4a7dbce646259b4ea6430048d3229717d75883a28d12b1fb52be760305f98fb5"
+        "122fbebce971434c4774c26dce15d6382d1c69468c871477d2ab9c2b2d8258d8"
     ),
     "harbor/src/harbor/agents/terminus_2/terminus_2.py": (
         "2b1b9aabac4b4ec40ba6b9c63b17a7d04e5a5a15e78dbf39efa361541e42c2f4"
@@ -48,6 +48,9 @@ _PATCHED_HARBOR_SHA256 = {
     ),
     "harbor/src/harbor/llms/lite_llm.py": (
         "f33145a1d3f875239523e9a72ad401b09379364fb38e611d6b0b57c0143b1e1a"
+    ),
+    "harbor/src/harbor/trial/trial.py": (
+        "fc769a6fd7646ec8c3049e16ebb70c31e5a2a7a7ffe010ed30b4d5737184b2c5"
     ),
     "harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py": (
         "6e65a65dd74195ad962401b425504831d412225e011e12f54d6701bd91cb81b5"
@@ -80,7 +83,6 @@ def build_job_config(
     n_concurrent_trials: int = 1,
     timeout_sec: int = 5400,
     max_total_tokens: int = 10_000_000,
-    judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_api_base: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact JSON-compatible Harbor configuration for one run."""
@@ -150,7 +152,7 @@ def build_job_config(
         if arm == "driftlock":
             agent["kwargs"].update(
                 {
-                    "driftlock_judge_model": judge_model,
+                    "driftlock_judge_model": DEFAULT_JUDGE_MODEL,
                     "driftlock_judge_api_base": judge_api_base or api_base,
                     "driftlock_judge_max_output_tokens": 512,
                 }
@@ -360,7 +362,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 n_concurrent_trials=args.concurrency,
                 timeout_sec=args.timeout_sec,
                 max_total_tokens=args.max_total_tokens,
-                judge_model=args.judge_model,
                 judge_api_base=args.judge_api_base,
             )
             config_path = args.config.expanduser().resolve()
@@ -419,7 +420,6 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--tasks", nargs="+", required=True)
         command.add_argument("--model", default=DEFAULT_MODEL)
         command.add_argument("--api-base", default=DEFAULT_API_BASE)
-        command.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
         command.add_argument("--judge-api-base")
         command.add_argument("--credential-env", default=DEFAULT_CREDENTIAL_ENV)
         command.add_argument("--concurrency", type=int, default=1)

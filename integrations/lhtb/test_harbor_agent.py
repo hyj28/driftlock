@@ -35,6 +35,7 @@ class FakeStep:
 
 class FakeStore:
     restores: ClassVar[list[Any]] = []
+    creates: ClassVar[list[Any]] = []
 
     def __init__(self, *args: Any, store_dir: Path, **kwargs: Any):
         self.store_dir = Path(store_dir)
@@ -43,6 +44,13 @@ class FakeStore:
     async def restore(self, checkpoint: Any) -> dict[str, Any]:
         type(self).restores.append(checkpoint)
         return TerminusConversationCodec().initial_state()
+
+    async def create(self, state: Any, **kwargs: Any) -> Any:
+        checkpoint = SimpleNamespace(
+            path=self.store_dir / "checkpoints" / f"created-{len(self.creates)}"
+        )
+        type(self).creates.append(checkpoint)
+        return checkpoint
 
 
 class FakeRunner:
@@ -62,6 +70,7 @@ class FakeRunner:
         type(self).calls += 1
         count = type(self).calls
         context = step.runtime.context
+        step.runtime.provider_call_count += 1
         context.n_input_tokens = count * 10
         context.n_cache_tokens = count * 2
         context.n_output_tokens = count * 3
@@ -109,6 +118,7 @@ def fake_components(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeRunner.budgets = []
     FakeRunner.fine_judges = []
     FakeStore.restores = []
+    FakeStore.creates = []
     monkeypatch.setattr(plugin, "HarborWorkspaceDeltaObserver", lambda *a, **k: None)
     monkeypatch.setattr(plugin, "LHTBTerminusRuntime", FakeRuntime)
     monkeypatch.setattr(plugin, "TerminusStepAdapter", FakeStep)
@@ -228,6 +238,58 @@ async def test_blind_retry_restores_initial_state_and_discards_feedback(
 
 
 @pytest.mark.asyncio
+async def test_blind_retry_does_not_restore_when_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "agent").mkdir()
+    agent = plugin.LHTBBlindRetryAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="fake-provider/fake-model",
+        enable_summarize=False,
+        record_terminal_session=False,
+        driftlock_max_tokens=13,
+    )
+    environment = SimpleNamespace(
+        default_user="root", task_env_config=SimpleNamespace(workdir="/app")
+    )
+    context = AgentContext()
+
+    await agent.run("original task", environment, context)
+    await agent.resume_after_verifier_rejection("rejected", context)
+
+    assert FakeStore.restores == []
+    assert FakeStore.creates == []
+    assert FakeRunner.calls == 1
+    assert context.metadata["termination_reason"] == "driftlock_token_limit"
+    assert context.metadata["driftlock_blind_retry"]["retries_started"] == 0
+
+
+@pytest.mark.asyncio
+async def test_blind_retry_finalizer_removes_retained_checkpoint(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "agent").mkdir()
+    agent = plugin.LHTBBlindRetryAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="fake-provider/fake-model",
+        enable_summarize=False,
+        record_terminal_session=False,
+    )
+    environment = SimpleNamespace(
+        default_user="root", task_env_config=SimpleNamespace(workdir="/app")
+    )
+
+    await agent.run("original task", environment, AgentContext())
+    assert agent._driftlock_store_root is not None
+    assert agent._driftlock_store_root.is_dir()
+
+    await agent._driftlock_finalize_after_agent_run()
+
+    assert not agent._driftlock_store_root.exists()
+    assert agent._driftlock_retry_checkpoint is None
+
+
+@pytest.mark.asyncio
 async def test_judge_client_caps_one_call_and_merges_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -255,7 +317,7 @@ async def test_judge_client_caps_one_call_and_merges_usage(
     FakeLiteLLM.call.__wrapped__ = unwrapped  # type: ignore[attr-defined]
     monkeypatch.setattr(plugin, "LiteLLM", FakeLiteLLM)
     client = plugin._LHTBJudgeClient(
-        model="openrouter/test/judge",
+        model=plugin.PINNED_LHTB_JUDGE_MODEL,
         api_base="https://example.invalid/v1",
         max_output_tokens=50,
         timeout_sec=10,
@@ -281,6 +343,16 @@ async def test_judge_client_caps_one_call_and_merges_usage(
     assert context.cost_usd == pytest.approx(1.004)
     assert context.metadata["driftlock_judge_usage"]["request_count"] == 1
 
+    client.prepare_accounting(context)
+    assert context.n_input_tokens == 100
+    assert context.n_cache_tokens == 40
+    assert context.n_output_tokens == 10
+    assert context.cost_usd == pytest.approx(1.0)
+    assert context.metadata["api_request_times_msec"] == [5.0]
+    client.apply_accounting(context)
+    assert context.n_input_tokens == 120
+    assert context.cost_usd == pytest.approx(1.004)
+
 
 @pytest.mark.asyncio
 async def test_judge_client_skips_request_when_budget_cannot_cover_prompt(
@@ -296,7 +368,7 @@ async def test_judge_client_skips_request_when_budget_cannot_cover_prompt(
     FakeLiteLLM.call.__wrapped__ = FakeLiteLLM.call  # type: ignore[attr-defined]
     monkeypatch.setattr(plugin, "LiteLLM", FakeLiteLLM)
     client = plugin._LHTBJudgeClient(
-        model="openrouter/test/judge",
+        model=plugin.PINNED_LHTB_JUDGE_MODEL,
         api_base=None,
         max_output_tokens=50,
         timeout_sec=10,
@@ -306,6 +378,20 @@ async def test_judge_client_skips_request_when_budget_cannot_cover_prompt(
 
     assert completion.tokens == 0
     assert client.request_times_msec == []
+
+
+def test_judge_client_rejects_unaudited_model_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(plugin, "LiteLLM", lambda **kwargs: None)
+
+    with pytest.raises(ValueError, match="pinned model with audited pricing"):
+        plugin._LHTBJudgeClient(
+            model="openrouter/other/model",
+            api_base=None,
+            max_output_tokens=50,
+            timeout_sec=10,
+        )
 
 
 @pytest.mark.asyncio
@@ -344,7 +430,7 @@ async def test_real_pinned_judge_litellm_path_is_one_physical_call(
 
     monkeypatch.setattr(litellm, "acompletion", fake_completion)
     client = plugin._LHTBJudgeClient(
-        model="openrouter/test/judge",
+        model=plugin.PINNED_LHTB_JUDGE_MODEL,
         api_base="https://example.invalid/v1",
         max_output_tokens=50,
         timeout_sec=10,

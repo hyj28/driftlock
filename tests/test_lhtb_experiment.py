@@ -85,7 +85,6 @@ def test_build_controlled_arm_configs(
         arm=arm,
         tasks=["task-a"],
         max_total_tokens=999,
-        judge_model="openrouter/test/judge",
         judge_api_base="https://judge.invalid/v1",
     )
 
@@ -95,7 +94,9 @@ def test_build_controlled_arm_configs(
     assert agent["kwargs"]["driftlock_max_tokens"] == 999
     assert ("driftlock_judge_model" in agent["kwargs"]) is has_fine_judge
     if has_fine_judge:
-        assert agent["kwargs"]["driftlock_judge_model"] == "openrouter/test/judge"
+        assert (
+            agent["kwargs"]["driftlock_judge_model"] == experiment.DEFAULT_JUDGE_MODEL
+        )
         assert agent["kwargs"]["driftlock_judge_api_base"] == "https://judge.invalid/v1"
 
 

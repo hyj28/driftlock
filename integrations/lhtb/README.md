@@ -1,7 +1,7 @@
 # Pinned LHTB Harbor integration
 
 `driftlock` targets the LHTB repository at commit
-`0d9918f6b66eda0752f8c7d17c9a73a18ee32f98`. The companion patch does five
+`0d9918f6b66eda0752f8c7d17c9a73a18ee32f98`. The companion patch does six
 things the boundary runtime cannot safely infer from stock Harbor:
 
 1. it adds a revision marker checked when `LHTBTerminusRuntime` starts;
@@ -12,7 +12,9 @@ things the boundary runtime cannot safely infer from stock Harbor:
 4. it appends to the tmux pane log so replacing a rejected shell cannot erase the
    earlier physical trajectory; and
 5. it waits for a shell completion marker before exposing a command boundary, and
-   interrupts plus verifies quiescence after a command timeout.
+   interrupts plus verifies quiescence after a command timeout; and
+6. it invokes driftlock's optional end-of-agent-loop finalizer so retry-only host
+   checkpoints are removed before final verification.
 
 The patch also factors Harbor's normal chat accounting into `Chat.record_response()`
 so a billed truncated response can be recorded exactly once without a retry.
@@ -44,7 +46,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 9
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 10
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -108,7 +110,8 @@ The runnable arms are:
   workspace, start a fresh conversation, and spend the same shared token budget;
 - `driftlock-heuristic`: checkpoint rollback driven directly by coarse signals; and
 - `driftlock`: the two-tier controller, with DeepSeek V4-Flash 0731 as the default
-  fine judge. Override it with `--judge-model` and `--judge-api-base`.
+  and pricing-pinned fine judge. Override only its endpoint with
+  `--judge-api-base`.
 
 The fine judge bypasses Harbor's retry wrapper, sends at most one physical provider
 request, reserves a conservative prompt bound before choosing its output ceiling,
@@ -116,13 +119,19 @@ and reports its prompt/cache/completion tokens and cost in both the shared drift
 budget and Harbor result metadata. Missing provider usage is conservatively charged
 at the reserved bound instead of being treated as a free call.
 
+Before a blind restart, the retry arm snapshots the rejected workspace as a
+short-lived guard. If the remaining budget cannot produce a physical model request,
+it restores that guard so final grading still sees the rejected attempt's partial
+work. The original retry checkpoint is retained only across interim verifier phases
+and removed by the patched Harbor finalizer when agent execution ends.
+
 The oracle upper bound is intentionally not a runnable online-agent arm. A valid
 hindsight oracle requires isolated replay of retained checkpoints with the hidden
 verifier; generating an ordinary agent configuration under the `oracle` label would
 invalidate the comparison.
 
 Preflight requires the benchmark `tasks/` tree to match the pinned commit byte for
-byte. Harbor may differ only by the packaged version-9 companion patch: every patch
+byte. Harbor may differ only by the packaged version-10 companion patch: every patch
 target is checked against its expected SHA-256 and any other tracked or untracked
 Harbor change is rejected. The imported `harbor` module must also resolve inside the
 requested LHTB checkout.

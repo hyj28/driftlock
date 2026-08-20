@@ -32,6 +32,8 @@ from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 
+PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+
 
 class LHTBDriftlockAgent(Terminus2):
     """Pinned Terminus-2 with checkpointed two-tier rollback.
@@ -164,6 +166,7 @@ class LHTBDriftlockAgent(Terminus2):
     ) -> None:
         self._ensure_runtime(environment, context)
         assert self._driftlock_runtime is not None
+        assert self._driftlock_store_root is not None
         assert self._driftlock_step is not None
         assert self._driftlock_store_root is not None
 
@@ -188,6 +191,8 @@ class LHTBDriftlockAgent(Terminus2):
         phase_store = self._driftlock_store_root / (
             f"phase-{len(self._driftlock_phases)}"
         )
+        if self._driftlock_judge_client is not None:
+            self._driftlock_judge_client.prepare_accounting(context)
         store = RemoteArchiveCheckpointStore(
             environment,
             remote_workspace=self._driftlock_workspace or "",
@@ -377,6 +382,38 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
         if id(context) != self._driftlock_last_context_id:
             raise RuntimeError("blind retry must reuse AgentContext")
         assert self._driftlock_step is not None
+        configured_budget = self._driftlock_runner_config.max_tokens
+        if (
+            configured_budget is not None
+            and self._driftlock_tokens_consumed >= configured_budget
+        ):
+            await self._run_driftlock_phase(
+                instruction=self._original_instruction,
+                environment=self._driftlock_environment,
+                context=context,
+                initial_state=TerminusConversationCodec().initial_state(),
+            )
+            self._set_retry_metadata(context)
+            return
+        assert self._driftlock_runtime is not None
+        previous_result = self._driftlock_last_result
+        if previous_result is None:
+            raise RuntimeError("cannot retry without a completed prior attempt")
+        guard_root = self._driftlock_store_root / (
+            f"retry-guard-{self._driftlock_retry_count}"
+        )
+        guard_store = RemoteArchiveCheckpointStore(
+            self._driftlock_environment,
+            remote_workspace=self._driftlock_workspace or "",
+            store_dir=guard_root,
+            user=self._driftlock_environment.default_user,
+            before_restore=self._driftlock_step.before_workspace_restore,
+        )
+        guard_checkpoint = await guard_store.create(
+            previous_result.state,
+            step=0,
+            label="pre-retry",
+        )
         phase_root = checkpoint.path.parent.parent
         store = RemoteArchiveCheckpointStore(
             self._driftlock_environment,
@@ -385,14 +422,22 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
             user=self._driftlock_environment.default_user,
             before_restore=self._driftlock_step.before_workspace_restore,
         )
-        initial_state = await store.restore(checkpoint)
-        self._driftlock_retry_count += 1
-        await self._run_driftlock_phase(
-            instruction=self._original_instruction,
-            environment=self._driftlock_environment,
-            context=context,
-            initial_state=initial_state,
-        )
+        provider_calls_before = self._driftlock_runtime.provider_call_count
+        try:
+            initial_state = await store.restore(checkpoint)
+            await self._run_driftlock_phase(
+                instruction=self._original_instruction,
+                environment=self._driftlock_environment,
+                context=context,
+                initial_state=initial_state,
+            )
+        finally:
+            provider_calls_after = self._driftlock_runtime.provider_call_count
+            if provider_calls_after == provider_calls_before:
+                await guard_store.restore(guard_checkpoint)
+            else:
+                self._driftlock_retry_count += 1
+            shutil.rmtree(guard_root, ignore_errors=True)
         self._set_retry_metadata(context)
 
     def _retain_phase_checkpoints(self, phase: int) -> bool:
@@ -406,6 +451,12 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
             "restart_checkpoint": "initial",
         }
         context.metadata = metadata
+
+    async def _driftlock_finalize_after_agent_run(self) -> None:
+        """Release the retry-only checkpoint after Harbor's continuation loop."""
+        if self._driftlock_store_root is not None:
+            shutil.rmtree(self._driftlock_store_root, ignore_errors=True)
+        self._driftlock_retry_checkpoint = None
 
 
 class _LHTBFineJudge:
@@ -432,8 +483,11 @@ class _LHTBJudgeClient:
         max_output_tokens: int,
         timeout_sec: float,
     ) -> None:
-        if not model:
-            raise ValueError("driftlock_judge_model cannot be empty")
+        if model != PINNED_LHTB_JUDGE_MODEL:
+            raise ValueError(
+                "driftlock_judge_model must use the pinned model with audited pricing: "
+                + PINNED_LHTB_JUDGE_MODEL
+            )
         if max_output_tokens <= 0 or timeout_sec <= 0:
             raise ValueError("judge output limit and timeout must be positive")
         self.model = model
@@ -458,6 +512,12 @@ class _LHTBJudgeClient:
         self.cost_usd = 0.0
         self.request_times_msec: list[float] = []
         self.usage_fallbacks = 0
+        self._applied_context_id: int | None = None
+        self._applied_input_tokens = 0
+        self._applied_cache_tokens = 0
+        self._applied_output_tokens = 0
+        self._applied_cost_usd = 0.0
+        self._applied_request_count = 0
 
     async def complete(
         self, prompt: str, *, tokens_remaining: int | None
@@ -552,6 +612,41 @@ class _LHTBJudgeClient:
             "conservative_usage_fallbacks": self.usage_fallbacks,
         }
         context.metadata = metadata
+        self._applied_context_id = id(context)
+        self._applied_input_tokens = self.n_input_tokens
+        self._applied_cache_tokens = self.n_cache_tokens
+        self._applied_output_tokens = self.n_output_tokens
+        self._applied_cost_usd = self.cost_usd
+        self._applied_request_count = len(self.request_times_msec)
+
+    def prepare_accounting(self, context: Any) -> None:
+        """Remove the prior phase's reporting overlay before reusing a context."""
+        if id(context) != self._applied_context_id:
+            return
+        context.n_input_tokens = max(
+            0, (context.n_input_tokens or 0) - self._applied_input_tokens
+        )
+        context.n_cache_tokens = max(
+            0, (context.n_cache_tokens or 0) - self._applied_cache_tokens
+        )
+        context.n_output_tokens = max(
+            0, (context.n_output_tokens or 0) - self._applied_output_tokens
+        )
+        base_cost = (context.cost_usd or 0.0) - self._applied_cost_usd
+        context.cost_usd = base_cost if base_cost > 0 else None
+        metadata = dict(context.metadata or {})
+        request_times = list(metadata.get("api_request_times_msec") or [])
+        count = self._applied_request_count
+        expected = self.request_times_msec[:count]
+        if count:
+            if len(request_times) < count or request_times[-count:] != expected:
+                raise RuntimeError("judge request accounting overlay was modified")
+            request_times = request_times[:-count]
+        metadata["api_request_times_msec"] = request_times
+        metadata["llm_time_sec"] = sum(request_times) / 1000.0
+        metadata.pop("driftlock_judge_usage", None)
+        context.metadata = metadata
+        self._applied_context_id = None
 
 
 class _AccountingSnapshot:
