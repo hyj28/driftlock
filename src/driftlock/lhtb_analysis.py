@@ -16,6 +16,13 @@ from typing import Any
 from uuid import UUID
 
 from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
+from driftlock.oracle import (
+    OracleCheckpointError,
+    ReplayUsage,
+    load_remote_checkpoint_bundle,
+    load_source_trial_provenance,
+    validate_checkpoint_source_audit,
+)
 
 ANALYSIS_ARMS = (
     "stock",
@@ -521,6 +528,16 @@ def _validate_arm_identity(
     environment = agent.get("env")
     if not isinstance(kwargs, dict) or not isinstance(environment, dict):
         raise ValueError(f"invalid trial agent config in {result_file}")
+    if arm == "oracle":
+        return _validate_oracle_identity(
+            data=data,
+            config=config,
+            agent=agent,
+            kwargs=kwargs,
+            environment=environment,
+            model=model,
+            result_file=result_file,
+        )
 
     base_kwargs = {
         "api_base",
@@ -591,8 +608,7 @@ def _validate_arm_identity(
         expected_import_path = "driftlock.harbor_agent:LHTBDriftlockAgent"
         expected_name = "driftlock-terminus-2"
     else:
-        expected_import_path = "driftlock.harbor_agent:LHTBCheckpointReplayOracle"
-        expected_name = "driftlock-checkpoint-replay-oracle"
+        raise ValueError(f"unsupported online arm: {arm}")
 
     valid = (
         info_name == expected_name
@@ -609,16 +625,6 @@ def _validate_arm_identity(
     )
     if not valid:
         raise ValueError(f"arm {arm!r} has the wrong agent config: {result_file}")
-    if arm == "oracle":
-        if (
-            set(kwargs) != base_kwargs | {"enable_summarize", "driftlock_oracle_mode"}
-            or kwargs.get("driftlock_oracle_mode") != "isolated-checkpoint-replay"
-        ):
-            raise ValueError(
-                f"oracle result lacks isolated replay provenance: {result_file}"
-            )
-        return None, experiment_signature
-
     budget = _positive_integer(
         kwargs.get("driftlock_max_tokens"),
         f"driftlock_max_tokens in {result_file}",
@@ -642,6 +648,13 @@ def _validate_arm_identity(
         "driftlock_max_rollbacks",
         "driftlock_checkpoint_interval",
     }
+    if "driftlock_retain_checkpoints" in kwargs:
+        if (
+            arm not in {"driftlock-heuristic", "driftlock"}
+            or kwargs["driftlock_retain_checkpoints"] is not True
+        ):
+            raise ValueError(f"arm {arm!r} has invalid checkpoint retention")
+        expected_keys.add("driftlock_retain_checkpoints")
     if arm == "driftlock":
         if (
             kwargs.get("driftlock_judge_model") != _FINE_JUDGE_MODEL
@@ -660,12 +673,151 @@ def _validate_arm_identity(
     return budget, experiment_signature
 
 
+def _validate_oracle_identity(
+    *,
+    data: dict[str, Any],
+    config: dict[str, Any],
+    agent: dict[str, Any],
+    kwargs: dict[str, Any],
+    environment: dict[str, Any],
+    model: str,
+    result_file: Path,
+) -> tuple[None, str]:
+    expected_keys = {
+        "driftlock_oracle_mode",
+        "driftlock_checkpoint_dir",
+        "driftlock_checkpoint_digest",
+        "driftlock_expected_workspace",
+        "driftlock_source_trial_id",
+        "driftlock_source_task_name",
+        "driftlock_source_result",
+        "driftlock_source_result_sha256",
+        "driftlock_source_audit",
+        "driftlock_source_audit_sha256",
+        "driftlock_source_usage",
+    }
+    info = data.get("agent_info")
+    if (
+        not isinstance(info, dict)
+        or info.get("name") != "driftlock-checkpoint-replay-oracle"
+        or info.get("version") != _installed_driftlock_version()
+        or agent.get("name") is not None
+        or agent.get("import_path")
+        != "driftlock.harbor_agent:LHTBCheckpointReplayOracle"
+        or environment
+        != {
+            "HB_CONTINUE_MODE": "same_conversation",
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+        }
+        or kwargs.get("driftlock_oracle_mode") != "isolated-checkpoint-replay"
+        or set(kwargs) != expected_keys
+    ):
+        raise ValueError(f"oracle result has the wrong replay config: {result_file}")
+    timeout = agent.get("override_timeout_sec")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout <= 0
+    ):
+        raise ValueError(f"oracle result has an invalid timeout: {result_file}")
+    _validate_trial_environment(config, result_file)
+    try:
+        source = load_source_trial_provenance(
+            kwargs["driftlock_source_result"],
+            expected_sha256=kwargs["driftlock_source_result_sha256"],
+        )
+        usage = ReplayUsage.from_mapping(kwargs["driftlock_source_usage"])
+        bundle = load_remote_checkpoint_bundle(
+            kwargs["driftlock_checkpoint_dir"],
+            expected_digest=kwargs["driftlock_checkpoint_digest"],
+            expected_workspace=kwargs["driftlock_expected_workspace"],
+        )
+        phase = validate_checkpoint_source_audit(
+            bundle.checkpoint.path,
+            source_result=source.result_path,
+            source_audit=kwargs["driftlock_source_audit"],
+            expected_audit_sha256=kwargs["driftlock_source_audit_sha256"],
+        )
+    except (KeyError, OracleCheckpointError, ValueError) as error:
+        raise ValueError(
+            f"oracle replay provenance is invalid: {result_file}"
+        ) from error
+    if (
+        source.trial_id != kwargs["driftlock_source_trial_id"]
+        or source.task_name != kwargs["driftlock_source_task_name"]
+        or source.task_name != data.get("task_name")
+        or source.model_name != agent.get("model_name")
+        or source.model_name != model
+        or source.usage != usage
+    ):
+        raise ValueError(f"oracle replay differs from source trial: {result_file}")
+    direct = data.get("agent_result")
+    metadata = direct.get("metadata") if isinstance(direct, dict) else None
+    audit = metadata.get("oracle") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(audit, dict)
+        or metadata.get("termination_reason") != "oracle_checkpoint_replay"
+        or audit.get("source_trial_id") != source.trial_id
+        or audit.get("source_task_name") != source.task_name
+        or audit.get("source_result_sha256") != source.result_sha256
+        or audit.get("source_audit_sha256") != kwargs["driftlock_source_audit_sha256"]
+        or audit.get("checkpoint_id") != bundle.checkpoint.checkpoint_id
+        or audit.get("checkpoint_digest") != bundle.checkpoint.digest
+        or audit.get("workspace") != bundle.remote_workspace
+        or audit.get("source_usage") != usage.as_dict()
+        or audit.get("source_phase") != phase
+        or audit.get("usage_policy") != "full-source-trial-conservative"
+    ):
+        raise ValueError(f"oracle runtime audit is inconsistent: {result_file}")
+    source_kwargs = source.data["config"]["agent"]["kwargs"]
+    source_arm = (
+        "driftlock"
+        if "driftlock_judge_model" in source_kwargs
+        else "driftlock-heuristic"
+    )
+    _, experiment_signature = _validate_arm_identity(
+        source.data,
+        source_arm,
+        model,
+        source.result_path,
+    )
+    return None, experiment_signature
+
+
 def _experiment_signature(
     config: dict[str, Any],
     kwargs: dict[str, Any],
     model: str,
     result_file: Path,
 ) -> str:
+    environment, verifier, multipliers = _validate_trial_environment(
+        config, result_file
+    )
+
+    agent = config["agent"]
+    signature = {
+        "model": model,
+        "agent_timeout_sec": agent["override_timeout_sec"],
+        "api_base": kwargs["api_base"],
+        "parser_name": kwargs["parser_name"],
+        "temperature": kwargs["temperature"],
+        "record_terminal_session": kwargs["record_terminal_session"],
+        "llm_call_kwargs": {
+            key: kwargs["llm_call_kwargs"][key]
+            for key in ("temperature", "max_tokens", "timeout")
+        },
+        "model_info": kwargs["model_info"],
+        "environment": environment,
+        "verifier": verifier,
+        "multipliers": multipliers,
+    }
+    serialized = json.dumps(signature, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _validate_trial_environment(
+    config: dict[str, Any], result_file: Path
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     environment = config.get("environment")
     verifier = config.get("verifier")
     expected_environment = {
@@ -714,25 +866,7 @@ def _experiment_signature(
         )
     if config.get("artifacts") != []:
         raise ValueError(f"trial artifacts differ from frozen harness: {result_file}")
-    agent = config["agent"]
-    signature = {
-        "model": model,
-        "agent_timeout_sec": agent["override_timeout_sec"],
-        "api_base": kwargs["api_base"],
-        "parser_name": kwargs["parser_name"],
-        "temperature": kwargs["temperature"],
-        "record_terminal_session": kwargs["record_terminal_session"],
-        "llm_call_kwargs": {
-            key: kwargs["llm_call_kwargs"][key]
-            for key in ("temperature", "max_tokens", "timeout")
-        },
-        "model_info": kwargs["model_info"],
-        "environment": environment,
-        "verifier": verifier,
-        "multipliers": multipliers,
-    }
-    serialized = json.dumps(signature, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return environment, verifier, multipliers
 
 
 def _reward(data: dict[str, Any], result_file: Path) -> float:

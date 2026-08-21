@@ -30,7 +30,12 @@ from driftlock.models import (
     RunResult,
     RunStatus,
 )
-from driftlock.oracle import ReplayUsage, file_sha256, load_remote_checkpoint_bundle
+from driftlock.oracle import (
+    ReplayUsage,
+    load_remote_checkpoint_bundle,
+    load_source_trial_provenance,
+    validate_checkpoint_source_audit,
+)
 from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
@@ -57,8 +62,11 @@ class LHTBCheckpointReplayOracle(BaseAgent):
         driftlock_checkpoint_digest: str,
         driftlock_expected_workspace: str,
         driftlock_source_trial_id: str,
+        driftlock_source_task_name: str,
         driftlock_source_result: str,
         driftlock_source_result_sha256: str,
+        driftlock_source_audit: str,
+        driftlock_source_audit_sha256: str,
         driftlock_source_usage: dict[str, Any],
         **kwargs: Any,
     ) -> None:
@@ -77,8 +85,11 @@ class LHTBCheckpointReplayOracle(BaseAgent):
         self._oracle_checkpoint_digest = driftlock_checkpoint_digest
         self._oracle_expected_workspace = driftlock_expected_workspace
         self._oracle_source_trial_id = driftlock_source_trial_id
+        self._oracle_source_task_name = driftlock_source_task_name
         self._oracle_source_result = Path(driftlock_source_result)
         self._oracle_source_result_sha256 = driftlock_source_result_sha256
+        self._oracle_source_audit = Path(driftlock_source_audit)
+        self._oracle_source_audit_sha256 = driftlock_source_audit_sha256
         self._oracle_source_usage = ReplayUsage.from_mapping(driftlock_source_usage)
 
     @staticmethod
@@ -93,13 +104,28 @@ class LHTBCheckpointReplayOracle(BaseAgent):
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
         del instruction
+        source = load_source_trial_provenance(
+            self._oracle_source_result,
+            expected_sha256=self._oracle_source_result_sha256,
+        )
+        if (
+            source.trial_id != self._oracle_source_trial_id
+            or source.task_name != self._oracle_source_task_name
+            or source.model_name != self.model_name
+            or source.usage != self._oracle_source_usage
+        ):
+            raise ValueError("replay parameters differ from hashed source result")
         bundle = load_remote_checkpoint_bundle(
             self._oracle_checkpoint_dir,
             expected_digest=self._oracle_checkpoint_digest,
             expected_workspace=self._oracle_expected_workspace,
         )
-        if file_sha256(self._oracle_source_result) != self._oracle_source_result_sha256:
-            raise ValueError("source result differs from replay provenance")
+        phase_audit = validate_checkpoint_source_audit(
+            bundle.checkpoint.path,
+            source_result=source.result_path,
+            source_audit=self._oracle_source_audit,
+            expected_audit_sha256=self._oracle_source_audit_sha256,
+        )
         task_config = getattr(environment, "task_env_config", None)
         workspace = str(getattr(task_config, "workdir", None) or "/app")
         if workspace != bundle.remote_workspace:
@@ -125,6 +151,9 @@ class LHTBCheckpointReplayOracle(BaseAgent):
             "source_trial_id": self._oracle_source_trial_id,
             "source_result": str(self._oracle_source_result.resolve()),
             "source_result_sha256": self._oracle_source_result_sha256,
+            "source_audit": str(self._oracle_source_audit.resolve()),
+            "source_audit_sha256": self._oracle_source_audit_sha256,
+            "source_task_name": source.task_name,
             "checkpoint_id": bundle.checkpoint.checkpoint_id,
             "checkpoint_step": bundle.checkpoint.step,
             "checkpoint_digest": bundle.checkpoint.digest,
@@ -133,6 +162,7 @@ class LHTBCheckpointReplayOracle(BaseAgent):
             "workspace": workspace,
             "usage_policy": "full-source-trial-conservative",
             "source_usage": usage.as_dict(),
+            "source_phase": phase_audit,
         }
         context.metadata = metadata
         output = Path(self.logs_dir) / "oracle-replay.json"
@@ -185,6 +215,7 @@ class LHTBDriftlockAgent(Terminus2):
             max_rollbacks=driftlock_max_rollbacks,
             checkpoint_interval=driftlock_checkpoint_interval,
             max_tokens=driftlock_max_tokens,
+            checkpoint_on_exit=driftlock_retain_checkpoints,
         )
         self._driftlock_heuristic_config = HeuristicConfig(
             no_change_steps=driftlock_no_change_steps,

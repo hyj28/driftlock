@@ -17,7 +17,6 @@ from collections.abc import Sequence
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
-from uuid import UUID
 
 from driftlock.lhtb import (
     DRIFTLOCK_HARBOR_PATCH_VERSION,
@@ -30,7 +29,13 @@ from driftlock.lhtb_analysis import (
     parse_arm_directories,
     task_directory_sha256,
 )
-from driftlock.oracle import ReplayUsage, file_sha256, load_remote_checkpoint_bundle
+from driftlock.oracle import (
+    ReplayUsage,
+    file_sha256,
+    load_remote_checkpoint_bundle,
+    load_source_trial_provenance,
+    validate_checkpoint_source_audit,
+)
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-pro"
 DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
@@ -223,12 +228,9 @@ def prepare_oracle_replays(
             or result_file.resolve().parent.parent != source
         ):
             raise ValueError(f"source trial escapes its job directory: {result_file}")
-        result = _read_json_object(result_file, "source trial result")
-        source_trial_id = result.get("id")
-        try:
-            UUID(source_trial_id)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"source trial has invalid UUID: {result_file}") from error
+        provenance = load_source_trial_provenance(result_file)
+        result = provenance.data
+        source_trial_id = provenance.trial_id
         config = result.get("config")
         agent = config.get("agent") if isinstance(config, dict) else None
         kwargs = agent.get("kwargs") if isinstance(agent, dict) else None
@@ -242,12 +244,8 @@ def prepare_oracle_replays(
                 f"{result_file}"
             )
         _validate_oracle_source_agent(result, agent, kwargs, result_file)
-        model_name = agent.get("model_name")
-        if not isinstance(model_name, str) or not model_name:
-            raise ValueError(f"source trial lacks model identity: {result_file}")
-        task_name = result.get("task_name")
-        if not isinstance(task_name, str) or not task_name:
-            raise ValueError(f"source trial lacks task name: {result_file}")
+        model_name = provenance.model_name
+        task_name = provenance.task_name
         task = _task_directory_name(root / "tasks", task_name)
         task_checksum = result.get("task_checksum")
         expected_checksum = task_directory_sha256(root / "tasks" / task)
@@ -255,14 +253,22 @@ def prepare_oracle_replays(
             raise ValueError(
                 f"source task checksum differs from the pinned checkout: {result_file}"
             )
-        usage = _source_trial_usage(result, result_file)
-        source_result_digest = file_sha256(result_file)
+        usage = provenance.usage
+        source_result_digest = provenance.result_sha256
+        source_audit = result_file.parent / "agent" / "driftlock-result.json"
+        source_audit_digest = file_sha256(source_audit)
         checkpoint_root = result_file.parent / ".driftlock-checkpoints"
         checkpoint_dirs = sorted(checkpoint_root.glob("phase-*/checkpoints/*"))
         if not checkpoint_dirs:
             raise ValueError(f"source trial has no retained checkpoints: {result_file}")
         for checkpoint_dir in checkpoint_dirs:
             bundle = load_remote_checkpoint_bundle(checkpoint_dir)
+            validate_checkpoint_source_audit(
+                bundle.checkpoint.path,
+                source_result=result_file,
+                source_audit=source_audit,
+                expected_audit_sha256=source_audit_digest,
+            )
             if bundle.checkpoint.checkpoint_id in seen_checkpoints:
                 raise ValueError("checkpoint ids must be globally unique")
             seen_checkpoints.add(bundle.checkpoint.checkpoint_id)
@@ -281,8 +287,11 @@ def prepare_oracle_replays(
                 checkpoint_digest=bundle.checkpoint.digest,
                 workspace=bundle.remote_workspace,
                 source_trial_id=str(source_trial_id),
+                source_task_name=task_name,
                 source_result=result_file.resolve(),
                 source_result_sha256=source_result_digest,
+                source_audit=source_audit.resolve(),
+                source_audit_sha256=source_audit_digest,
                 source_usage=usage,
             )
             config_path = configs_dir / f"{candidate_id}.json"
@@ -293,6 +302,8 @@ def prepare_oracle_replays(
                     "source_trial_id": str(source_trial_id),
                     "source_result": str(result_file.resolve()),
                     "source_result_sha256": source_result_digest,
+                    "source_audit": str(source_audit.resolve()),
+                    "source_audit_sha256": source_audit_digest,
                     "task_name": task_name,
                     "model_name": model_name,
                     "checkpoint_id": bundle.checkpoint.checkpoint_id,
@@ -347,8 +358,11 @@ def _oracle_replay_job_config(
     checkpoint_digest: str,
     workspace: str,
     source_trial_id: str,
+    source_task_name: str,
     source_result: Path,
     source_result_sha256: str,
+    source_audit: Path,
+    source_audit_sha256: str,
     source_usage: ReplayUsage,
 ) -> dict[str, Any]:
     return {
@@ -374,62 +388,17 @@ def _oracle_replay_job_config(
                     "driftlock_checkpoint_digest": checkpoint_digest,
                     "driftlock_expected_workspace": workspace,
                     "driftlock_source_trial_id": source_trial_id,
+                    "driftlock_source_task_name": source_task_name,
                     "driftlock_source_result": str(source_result),
                     "driftlock_source_result_sha256": source_result_sha256,
+                    "driftlock_source_audit": str(source_audit),
+                    "driftlock_source_audit_sha256": source_audit_sha256,
                     "driftlock_source_usage": source_usage.as_dict(),
                 },
             }
         ],
         "datasets": [{"path": str(lhtb_dir / "tasks"), "task_names": [task]}],
     }
-
-
-def _source_trial_usage(result: dict[str, Any], path: Path) -> ReplayUsage:
-    direct = result.get("agent_result")
-    if isinstance(direct, dict):
-        contexts = [direct]
-    else:
-        steps = result.get("step_results")
-        contexts = (
-            [
-                step["agent_result"]
-                for step in steps
-                if isinstance(step, dict) and isinstance(step.get("agent_result"), dict)
-            ]
-            if isinstance(steps, list)
-            else []
-        )
-    if not contexts:
-        raise ValueError(f"source trial lacks usage accounting: {path}")
-    totals: dict[str, int | float] = {
-        "input_tokens": 0,
-        "cache_tokens": 0,
-        "output_tokens": 0,
-        "cost_usd": 0.0,
-    }
-    fields = {
-        "n_input_tokens": "input_tokens",
-        "n_cache_tokens": "cache_tokens",
-        "n_output_tokens": "output_tokens",
-        "cost_usd": "cost_usd",
-    }
-    for context in contexts:
-        for source_name, target_name in fields.items():
-            value = context.get(source_name)
-            if value is None:
-                raise ValueError(
-                    f"source trial has incomplete usage accounting: {path}"
-                )
-            if target_name != "cost_usd" and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ):
-                raise ValueError(f"source trial has invalid token usage: {path}")
-            if target_name == "cost_usd" and (
-                isinstance(value, bool) or not isinstance(value, (int, float))
-            ):
-                raise ValueError(f"source trial has invalid cost usage: {path}")
-            totals[target_name] += value
-    return ReplayUsage.from_mapping(totals)
 
 
 def _validate_oracle_source_agent(
@@ -470,18 +439,6 @@ def _validate_oracle_source_agent(
         or model_info != {"provider": provider, "name": name}
     ):
         raise ValueError(f"source trial agent identity is inconsistent: {path}")
-
-
-def _read_json_object(path: Path, description: str) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{description} is missing or a symlink: {path}")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"{description} is invalid: {path}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{description} must be an object: {path}")
-    return value
 
 
 def preflight(

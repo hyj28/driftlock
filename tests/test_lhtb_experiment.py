@@ -174,6 +174,24 @@ def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
         ),
         encoding="utf-8",
     )
+    audit_dir = trial / "agent"
+    audit_dir.mkdir()
+    (audit_dir / "driftlock-result.json").write_text(
+        json.dumps(
+            {
+                "phases": [
+                    {
+                        "phase": 0,
+                        "checkpoint_dir": str(checkpoint.parent.parent.resolve()),
+                        "checkpoints_retained": True,
+                        "status": "completed",
+                        "checkpoint_count": 1,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
     result = {
         "id": trial_id,
         "task_name": "long-horizon-terminal-bench/task-a",

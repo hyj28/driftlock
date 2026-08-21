@@ -37,6 +37,7 @@ class RunnerConfig:
     recent_steps_for_judge: int = 12
     max_tokens: int | None = None
     rollback_on_uncertain: bool = False
+    checkpoint_on_exit: bool = False
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -108,7 +109,7 @@ class DriftlockRunner:
             try:
                 outcome = await step(context)
             except StepTokenBudgetExhausted:
-                return self._result(
+                return await self._finish(
                     RunStatus.TOKEN_LIMIT,
                     state,
                     all_steps,
@@ -116,6 +117,8 @@ class DriftlockRunner:
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
             state = dict(outcome.state)
             agent_tokens_used += outcome.tokens
@@ -140,7 +143,7 @@ class DriftlockRunner:
                 and tokens_used > self.config.max_tokens
             )
             if outcome.completed and not over_token_budget:
-                return self._result(
+                return await self._finish(
                     RunStatus.COMPLETED,
                     state,
                     all_steps,
@@ -148,12 +151,14 @@ class DriftlockRunner:
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
             if (
                 self.config.max_tokens is not None
                 and tokens_used >= self.config.max_tokens
             ):
-                return self._result(
+                return await self._finish(
                     RunStatus.TOKEN_LIMIT,
                     state,
                     all_steps,
@@ -161,6 +166,8 @@ class DriftlockRunner:
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
 
             signals = self.coarse_judge.evaluate(recent_steps)
@@ -186,7 +193,7 @@ class DriftlockRunner:
                 )
                 if should_rollback:
                     if len(rollbacks) >= self.config.max_rollbacks:
-                        return self._result(
+                        return await self._finish(
                             RunStatus.ROLLBACK_LIMIT,
                             state,
                             all_steps,
@@ -194,6 +201,8 @@ class DriftlockRunner:
                             checkpoints,
                             agent_tokens_used,
                             judge_tokens_used,
+                            current_checkpoint=checkpoint,
+                            logical_step=logical_step,
                         )
                     checkpoint = rollback_checkpoint
                     state = await self._restore_checkpoint(checkpoint)
@@ -212,7 +221,7 @@ class DriftlockRunner:
                     recent_steps = list(checkpoint_histories[checkpoint.checkpoint_id])
                     rollback_feedback = verdict.reason
                     if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
-                        return self._result(
+                        return await self._finish(
                             RunStatus.TOKEN_LIMIT,
                             state,
                             all_steps,
@@ -220,12 +229,14 @@ class DriftlockRunner:
                             checkpoints,
                             agent_tokens_used,
                             judge_tokens_used,
+                            current_checkpoint=checkpoint,
+                            logical_step=logical_step,
                         )
                     continue
                 checkpoint_is_healthy = verdict.verdict is Verdict.HEALTHY
 
             if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
-                return self._result(
+                return await self._finish(
                     RunStatus.TOKEN_LIMIT,
                     state,
                     all_steps,
@@ -233,6 +244,8 @@ class DriftlockRunner:
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
 
             if (
@@ -249,7 +262,7 @@ class DriftlockRunner:
                 checkpoint_lineage.append(checkpoint)
                 checkpoint_histories[checkpoint.checkpoint_id] = list(recent_steps)
 
-        return self._result(
+        return await self._finish(
             RunStatus.STEP_LIMIT,
             state,
             all_steps,
@@ -257,6 +270,8 @@ class DriftlockRunner:
             checkpoints,
             agent_tokens_used,
             judge_tokens_used,
+            current_checkpoint=checkpoint,
+            logical_step=logical_step,
         )
 
     async def _judge(
@@ -354,4 +369,35 @@ class DriftlockRunner:
             tokens_used=agent_tokens_used + judge_tokens_used,
             agent_tokens_used=agent_tokens_used,
             judge_tokens_used=judge_tokens_used,
+        )
+
+    async def _finish(
+        self,
+        status: RunStatus,
+        state: Mapping[str, Any],
+        steps: list[StepRecord],
+        rollbacks: list[RollbackRecord],
+        checkpoints: list[Checkpoint],
+        agent_tokens_used: int,
+        judge_tokens_used: int,
+        *,
+        current_checkpoint: Checkpoint,
+        logical_step: int,
+    ) -> RunResult:
+        if self.config.checkpoint_on_exit and current_checkpoint.step != logical_step:
+            terminal = await self._create_checkpoint(
+                state,
+                step=logical_step,
+                parent_id=current_checkpoint.checkpoint_id,
+                label="terminal",
+            )
+            checkpoints.append(terminal)
+        return self._result(
+            status,
+            state,
+            steps,
+            rollbacks,
+            checkpoints,
+            agent_tokens_used,
+            judge_tokens_used,
         )

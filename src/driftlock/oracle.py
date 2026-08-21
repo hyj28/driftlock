@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import UUID
 
 from driftlock.checkpoints import SnapshotIntegrityError
 from driftlock.models import Checkpoint
@@ -91,6 +92,19 @@ class RemoteCheckpointBundle:
     state_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class SourceTrialProvenance:
+    """Identity and accounting re-derived from a hashed Harbor source result."""
+
+    trial_id: str
+    task_name: str
+    model_name: str
+    usage: ReplayUsage
+    result_path: Path
+    result_sha256: str
+    data: dict[str, Any]
+
+
 def file_sha256(path: Path | str) -> str:
     """Return a streaming SHA-256 for an ordinary, non-symlink file."""
     source = Path(path)
@@ -101,6 +115,126 @@ def file_sha256(path: Path | str) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_source_trial_provenance(
+    result_path: Path | str, *, expected_sha256: str | None = None
+) -> SourceTrialProvenance:
+    """Load source identity and usage from the result artifact that binds them."""
+    path = Path(result_path).expanduser()
+    if path.parent.is_symlink():
+        raise OracleCheckpointError("source trial directory cannot be a symlink")
+    path = path.resolve()
+    digest = file_sha256(path)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise OracleCheckpointError("source result differs from replay provenance")
+    data = _read_object(path, "source trial result")
+    trial_id = data.get("id")
+    try:
+        parsed_trial_id = UUID(trial_id)
+    except (TypeError, ValueError) as error:
+        raise OracleCheckpointError("source trial id is invalid") from error
+    if str(parsed_trial_id) != trial_id:
+        raise OracleCheckpointError("source trial id is not canonical")
+    task_name = data.get("task_name")
+    if not isinstance(task_name, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*",
+        task_name,
+    ):
+        raise OracleCheckpointError("source task name is invalid")
+    config = data.get("config")
+    agent = config.get("agent") if isinstance(config, dict) else None
+    kwargs = agent.get("kwargs") if isinstance(agent, dict) else None
+    model_name = agent.get("model_name") if isinstance(agent, dict) else None
+    if (
+        not isinstance(kwargs, dict)
+        or agent.get("import_path") != "driftlock.harbor_agent:LHTBDriftlockAgent"
+        or kwargs.get("driftlock_retain_checkpoints") is not True
+        or not isinstance(model_name, str)
+        or not model_name
+    ):
+        raise OracleCheckpointError("source result is not a retained driftlock trial")
+    info = data.get("agent_info")
+    model_info = info.get("model_info") if isinstance(info, dict) else None
+    provider, separator, name = model_name.partition("/")
+    if not separator:
+        provider, name = None, provider
+    if (
+        not isinstance(info, dict)
+        or info.get("name") != "driftlock-terminus-2"
+        or not isinstance(info.get("version"), str)
+        or model_info != {"provider": provider, "name": name}
+    ):
+        raise OracleCheckpointError("source agent identity is inconsistent")
+    return SourceTrialProvenance(
+        trial_id=trial_id,
+        task_name=task_name,
+        model_name=model_name,
+        usage=_source_usage(data),
+        result_path=path,
+        result_sha256=digest,
+        data=data,
+    )
+
+
+def validate_checkpoint_source_audit(
+    checkpoint_dir: Path | str,
+    *,
+    source_result: Path | str,
+    source_audit: Path | str,
+    expected_audit_sha256: str,
+) -> dict[str, Any]:
+    """Bind a candidate directory to its source trial and retained phase audit."""
+    result_path = Path(source_result).expanduser().resolve()
+    trial_dir = result_path.parent
+    checkpoint = Path(checkpoint_dir).expanduser()
+    if checkpoint.is_symlink():
+        raise OracleCheckpointError("checkpoint directory cannot be a symlink")
+    checkpoint = checkpoint.resolve()
+    phase_dir = checkpoint.parent.parent
+    expected_root = trial_dir / ".driftlock-checkpoints"
+    if (
+        checkpoint.parent.name != "checkpoints"
+        or phase_dir.parent != expected_root
+        or not re.fullmatch(r"phase-[0-9]+", phase_dir.name)
+    ):
+        raise OracleCheckpointError(
+            "checkpoint is outside the source trial retained tree"
+        )
+    audit_path = Path(source_audit).expanduser()
+    if audit_path.is_symlink() or audit_path.resolve() != trial_dir / "agent" / (
+        "driftlock-result.json"
+    ):
+        raise OracleCheckpointError("source audit path is not canonical")
+    audit_path = audit_path.resolve()
+    if file_sha256(audit_path) != expected_audit_sha256:
+        raise OracleCheckpointError("source audit differs from replay provenance")
+    audit = _read_object(audit_path, "source checkpoint audit")
+    phases = audit.get("phases")
+    if not isinstance(phases, list):
+        raise OracleCheckpointError("source checkpoint audit lacks phases")
+    matches = [
+        phase
+        for phase in phases
+        if isinstance(phase, dict)
+        and isinstance(phase.get("checkpoint_dir"), str)
+        and Path(phase["checkpoint_dir"]).expanduser().resolve() == phase_dir
+    ]
+    if len(matches) != 1:
+        raise OracleCheckpointError("checkpoint phase is absent from source audit")
+    phase = matches[0]
+    actual_count = sum(
+        1
+        for candidate in checkpoint.parent.iterdir()
+        if not candidate.is_symlink() and candidate.is_dir()
+    )
+    if (
+        phase.get("checkpoints_retained") is not True
+        or phase.get("checkpoint_count") != actual_count
+        or actual_count <= 0
+    ):
+        raise OracleCheckpointError("source checkpoint audit count is inconsistent")
+    return phase
 
 
 def load_remote_checkpoint_bundle(
@@ -232,3 +366,52 @@ def _archive_hashes(path: Path) -> tuple[str, Any]:
             plain.update(chunk)
             combined.update(chunk)
     return plain.hexdigest(), combined
+
+
+def _source_usage(data: dict[str, Any]) -> ReplayUsage:
+    direct = data.get("agent_result")
+    if isinstance(direct, dict):
+        contexts = [direct]
+    else:
+        steps = data.get("step_results")
+        contexts = (
+            [
+                step["agent_result"]
+                for step in steps
+                if isinstance(step, dict) and isinstance(step.get("agent_result"), dict)
+            ]
+            if isinstance(steps, list)
+            else []
+        )
+    if not contexts:
+        raise OracleCheckpointError("source trial lacks usage accounting")
+    totals: dict[str, int | float] = {
+        "input_tokens": 0,
+        "cache_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    fields = {
+        "n_input_tokens": "input_tokens",
+        "n_cache_tokens": "cache_tokens",
+        "n_output_tokens": "output_tokens",
+        "cost_usd": "cost_usd",
+    }
+    for context in contexts:
+        for source_name, target_name in fields.items():
+            value = context.get(source_name)
+            if value is None:
+                raise OracleCheckpointError("source usage accounting is incomplete")
+            if target_name != "cost_usd" and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise OracleCheckpointError("source token usage is invalid")
+            if target_name == "cost_usd" and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                raise OracleCheckpointError("source cost usage is invalid")
+            totals[target_name] += value
+    try:
+        return ReplayUsage.from_mapping(totals)
+    except ValueError as error:
+        raise OracleCheckpointError("source usage accounting is invalid") from error

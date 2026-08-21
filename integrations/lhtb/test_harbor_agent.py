@@ -154,11 +154,12 @@ async def test_oracle_restores_one_verified_checkpoint_without_model_access(
 ) -> None:
     logs = tmp_path / "agent"
     logs.mkdir()
-    source_result = tmp_path / "source-result.json"
-    source_result.write_text('{"source":true}', encoding="utf-8")
-    source_digest = hashlib.sha256(source_result.read_bytes()).hexdigest()
+    trial_id = str(uuid4())
+    source_result = tmp_path / "result.json"
     checkpoint_id = "d" * 32
-    checkpoint = tmp_path / "phase-0" / "checkpoints" / checkpoint_id
+    checkpoint = (
+        tmp_path / ".driftlock-checkpoints" / "phase-0" / "checkpoints" / checkpoint_id
+    )
     checkpoint.mkdir(parents=True)
     archive = b"archive"
     state_text = "{}"
@@ -181,7 +182,55 @@ async def test_oracle_restores_one_verified_checkpoint_without_model_access(
         ),
         encoding="utf-8",
     )
-    source_trial_id = str(uuid4())
+    source_result.write_text(
+        json.dumps(
+            {
+                "id": trial_id,
+                "task_name": "long-horizon-terminal-bench/task-a",
+                "agent_info": {
+                    "name": "driftlock-terminus-2",
+                    "version": "0.1.0",
+                    "model_info": {
+                        "provider": "openrouter",
+                        "name": "source-model",
+                    },
+                },
+                "config": {
+                    "agent": {
+                        "import_path": ("driftlock.harbor_agent:LHTBDriftlockAgent"),
+                        "model_name": "openrouter/source-model",
+                        "kwargs": {"driftlock_retain_checkpoints": True},
+                    }
+                },
+                "agent_result": {
+                    "n_input_tokens": 100,
+                    "n_cache_tokens": 20,
+                    "n_output_tokens": 30,
+                    "cost_usd": 0.75,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_digest = hashlib.sha256(source_result.read_bytes()).hexdigest()
+    source_audit = logs / "driftlock-result.json"
+    source_audit.write_text(
+        json.dumps(
+            {
+                "phases": [
+                    {
+                        "phase": 0,
+                        "checkpoint_dir": str(checkpoint.parent.parent.resolve()),
+                        "checkpoints_retained": True,
+                        "status": "completed",
+                        "checkpoint_count": 1,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_audit_digest = hashlib.sha256(source_audit.read_bytes()).hexdigest()
     agent = plugin.LHTBCheckpointReplayOracle(
         logs_dir=logs,
         model_name="openrouter/source-model",
@@ -189,9 +238,12 @@ async def test_oracle_restores_one_verified_checkpoint_without_model_access(
         driftlock_checkpoint_dir=str(checkpoint),
         driftlock_checkpoint_digest=digest.hexdigest(),
         driftlock_expected_workspace="/app",
-        driftlock_source_trial_id=source_trial_id,
+        driftlock_source_trial_id=trial_id,
+        driftlock_source_task_name="long-horizon-terminal-bench/task-a",
         driftlock_source_result=str(source_result),
         driftlock_source_result_sha256=source_digest,
+        driftlock_source_audit=str(source_audit),
+        driftlock_source_audit_sha256=source_audit_digest,
         driftlock_source_usage={
             "input_tokens": 100,
             "cache_tokens": 20,
@@ -212,7 +264,7 @@ async def test_oracle_restores_one_verified_checkpoint_without_model_access(
     assert context.n_output_tokens == 30
     assert context.cost_usd == pytest.approx(0.75)
     assert context.metadata["termination_reason"] == "oracle_checkpoint_replay"
-    assert context.metadata["oracle"]["source_trial_id"] == source_trial_id
+    assert context.metadata["oracle"]["source_trial_id"] == trial_id
     assert context.metadata["oracle"]["usage_policy"] == (
         "full-source-trial-conservative"
     )
