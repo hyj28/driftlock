@@ -120,12 +120,12 @@ def build_job_config(
         )
     if arm not in RUNNABLE_ARMS:
         raise ValueError("arm must be one of " + ", ".join(RUNNABLE_ARMS))
-    checkpoint_arms = {
-        "driftlock",
-        "driftlock-heuristic",
-        "native-driftlock",
-        "native-driftlock-heuristic",
-    }
+    checkpoint_arms = {"driftlock", "driftlock-heuristic"}
+    if retain_checkpoints and arm.startswith("native-"):
+        raise ValueError(
+            "native checkpoint retention is not supported by oracle replay; "
+            "native oracle replay is future work"
+        )
     if retain_checkpoints and arm not in checkpoint_arms:
         raise ValueError("checkpoint retention requires a driftlock arm")
     if n_concurrent_trials <= 0:
@@ -244,6 +244,19 @@ def prepare_oracle_replays(
             or result_file.resolve().parent.parent != source
         ):
             raise ValueError(f"source trial escapes its job directory: {result_file}")
+        try:
+            raw_result = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_result = None
+        raw_config = raw_result.get("config") if isinstance(raw_result, dict) else None
+        raw_agent = raw_config.get("agent") if isinstance(raw_config, dict) else None
+        if isinstance(raw_agent, dict) and raw_agent.get("import_path") == (
+            "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+        ):
+            raise ValueError(
+                "native retained checkpoints cannot be used for oracle replay; "
+                "native oracle replay is not supported"
+            )
         provenance = load_source_trial_provenance(result_file)
         result = provenance.data
         source_trial_id = provenance.trial_id

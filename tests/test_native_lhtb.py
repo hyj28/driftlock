@@ -15,16 +15,27 @@ from driftlock.heuristics import HeuristicConfig
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
 from driftlock.lhtb_analysis import _validate_arm_identity
 from driftlock.lhtb_experiment import DEFAULT_MODEL, build_job_config
-from driftlock.models import JudgeVerdict, RunStatus, Verdict
+from driftlock.models import JudgeVerdict, RunResult, RunStatus, Verdict
 from driftlock.native_lhtb import (
     BilledProviderFailure,
     BilledProviderResponse,
     ContextUsageRecorder,
     LHTBNativeAgentRuntime,
+    NativeProcessQuiescer,
     PhysicalProviderBoundaryError,
     ProviderUsage,
     SingleAttemptJSONProvider,
+    UnknownBilledProviderUsage,
+    append_verifier_feedback,
+    apply_native_accounting,
+    billed_provider_exception,
+    billed_provider_response,
+    exact_provider_usage,
+    native_checkpoint_store_root,
+    set_native_result_metadata,
+    set_native_token_limit_metadata,
 )
+from driftlock.remote import RemoteCheckpointError
 from driftlock.runner import RunnerConfig
 
 
@@ -77,6 +88,69 @@ class RecordingRemoteEnvironment:
         target = Path(target_path)
         self.downloads.append((source_path, target))
         shutil.copy2(source_path, target)
+
+
+class RestoreApplyFailureEnvironment(RecordingRemoteEnvironment):
+    def __init__(self, workspace: Path) -> None:
+        super().__init__()
+        self.workspace = workspace
+        self.failed_once = False
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+        cwd: str | None = None,
+    ) -> LocalResult:
+        if "cp -a" in command and not self.failed_once:
+            self.calls.append(
+                {
+                    "command": command,
+                    "timeout_sec": timeout_sec,
+                    "user": user,
+                    "cwd": cwd,
+                }
+            )
+            self.failed_once = True
+            (self.workspace / "rejected.txt").write_text(
+                "partial restore", encoding="utf-8"
+            )
+            return LocalResult(1, "", "injected restore failure")
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+            cwd=cwd,
+        )
+
+
+class CleanupFailureEnvironment(RecordingRemoteEnvironment):
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+        cwd: str | None = None,
+    ) -> LocalResult:
+        if "rejected processes survived cleanup" in command:
+            self.calls.append(
+                {
+                    "command": command,
+                    "timeout_sec": timeout_sec,
+                    "user": user,
+                    "cwd": cwd,
+                }
+            )
+            return LocalResult(42, "", "injected process cleanup failure")
+        return await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+            cwd=cwd,
+        )
 
 
 class LocalLiteralObserver:
@@ -181,6 +255,74 @@ def _response(
     )
 
 
+def _raw_provider_response(
+    *,
+    prompt_tokens: object = 11,
+    cache_tokens: object = 3,
+    completion_tokens: object = 5,
+    cost_usd: object = 0.25,
+    content: object = "payload",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=content,
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            cache_tokens=cache_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=cost_usd,
+        ),
+    )
+
+
+def test_exact_provider_usage_maps_only_exact_finite_provider_fields() -> None:
+    assert exact_provider_usage(_raw_provider_response()) == ProviderUsage(
+        input_tokens=11,
+        cache_tokens=3,
+        output_tokens=5,
+        cost_usd=0.25,
+    )
+    assert exact_provider_usage(_raw_provider_response(prompt_tokens=True)) is None
+    assert exact_provider_usage(_raw_provider_response(cache_tokens=-1)) is None
+    assert exact_provider_usage(_raw_provider_response(completion_tokens=2.5)) is None
+    assert exact_provider_usage(_raw_provider_response(cost_usd=float("nan"))) is None
+    assert exact_provider_usage(_raw_provider_response(cost_usd=True)) is None
+
+
+def test_provider_response_and_exception_triage_is_harbor_free() -> None:
+    response = _raw_provider_response()
+    assert billed_provider_response(response) == BilledProviderResponse(
+        "payload", ProviderUsage(11, 3, 5, 0.25)
+    )
+
+    truncated = RuntimeError("output limit")
+    truncated.response = response
+    truncated.truncated_response = '{"text":"partial"}'
+    assert billed_provider_exception(truncated) == BilledProviderResponse(
+        '{"text":"partial"}',
+        ProviderUsage(11, 3, 5, 0.25),
+        truncated=True,
+    )
+
+    failed = RuntimeError("timeout after response")
+    failed.response = response
+    with pytest.raises(BilledProviderFailure) as known:
+        billed_provider_exception(failed)
+    assert known.value.usage == ProviderUsage(11, 3, 5, 0.25)
+
+    with pytest.raises(BilledProviderFailure) as unknown:
+        billed_provider_exception(TimeoutError("connection timed out"))
+    assert unknown.value.usage is None
+
+
+def test_native_checkpoint_store_root_is_outside_agent_logs(tmp_path: Path) -> None:
+    logs = tmp_path / "trial" / "agent"
+
+    root = native_checkpoint_store_root(logs)
+
+    assert root == tmp_path / "trial" / ".driftlock-native-checkpoints"
+    assert logs not in root.parents
+
+
 def _runtime(
     tmp_path: Path,
     call: ScriptedPhysicalCall,
@@ -189,6 +331,7 @@ def _runtime(
     heuristic_config: HeuristicConfig | None = None,
     fine_judge: Any = None,
     retain_checkpoints: bool = False,
+    environment: RecordingRemoteEnvironment | None = None,
 ) -> tuple[
     Path,
     RecordingRemoteEnvironment,
@@ -199,10 +342,10 @@ def _runtime(
     remote_tmp = tmp_path / "remote-tmp"
     workspace.mkdir()
     remote_tmp.mkdir()
-    environment = RecordingRemoteEnvironment()
+    resolved_environment = environment or RecordingRemoteEnvironment()
     provider = SingleAttemptJSONProvider(call)
     runtime = LHTBNativeAgentRuntime(
-        environment,
+        resolved_environment,
         LocalLiteralObserver(workspace),
         provider,
         remote_workspace=str(workspace),
@@ -221,7 +364,7 @@ def _runtime(
         agent_max_output_tokens=100,
         agent_min_output_tokens=4,
     )
-    return workspace, environment, provider, runtime
+    return workspace, resolved_environment, provider, runtime
 
 
 async def test_native_runtime_completes_with_remote_tools_and_exact_usage(
@@ -306,6 +449,105 @@ async def test_native_runtime_completes_with_remote_tools_and_exact_usage(
     assert context.metadata["driftlock_native_usage"]["provider_request_count"] == 4
 
 
+def test_native_accounting_reconcile_guards_provider_and_judge_totals() -> None:
+    context = SimpleNamespace(
+        n_input_tokens=None,
+        n_cache_tokens=None,
+        n_output_tokens=None,
+        cost_usd=None,
+        metadata={},
+    )
+    provider = SimpleNamespace(
+        usage=ProviderUsage(8, 2, 3, 0.4),
+        exact_usage_request_count=1,
+        unknown_billed_request_count=0,
+        provider_call_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="provider usage does not reconcile"):
+        apply_native_accounting(
+            context,
+            recorder=ContextUsageRecorder(context),
+            runtime=SimpleNamespace(
+                agent_tokens_consumed=10,
+                judge_tokens_consumed=0,
+            ),
+            provider=provider,
+            agent_request_times_msec=(15.0,),
+            reconcile=True,
+        )
+
+    judge = SimpleNamespace(
+        n_input_tokens=4,
+        n_cache_tokens=1,
+        n_output_tokens=2,
+        cost_usd=0.1,
+        request_times_msec=[6.0],
+    )
+    with pytest.raises(RuntimeError, match="judge usage does not reconcile"):
+        apply_native_accounting(
+            context,
+            recorder=ContextUsageRecorder(context),
+            runtime=SimpleNamespace(
+                agent_tokens_consumed=11,
+                judge_tokens_consumed=5,
+            ),
+            provider=provider,
+            agent_request_times_msec=(15.0,),
+            judge=judge,
+            reconcile=True,
+        )
+
+
+def test_native_metadata_writers_publish_literal_result_and_budget_fields() -> None:
+    context = SimpleNamespace(metadata={"preserved": "yes"})
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={"done": True},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=17,
+        agent_tokens_used=12,
+        judge_tokens_used=5,
+    )
+    runtime = SimpleNamespace(tokens_consumed=29)
+
+    set_native_result_metadata(
+        context,
+        result=result,
+        runtime=runtime,
+        trial_token_budget=100,
+    )
+
+    assert context.metadata == {
+        "preserved": "yes",
+        "driftlock": {
+            "status": "completed",
+            "steps": 0,
+            "rollbacks": 0,
+            "tokens_used": 17,
+            "agent_tokens_used": 12,
+            "judge_tokens_used": 5,
+            "trial_tokens_used": 29,
+            "trial_token_budget": 100,
+        },
+        "termination_reason": "confirmed_task_complete",
+    }
+
+    set_native_token_limit_metadata(
+        context,
+        runtime=SimpleNamespace(tokens_consumed=88),
+        trial_token_budget=100,
+    )
+    assert context.metadata["termination_reason"] == "driftlock_token_limit"
+    assert context.metadata["driftlock"] == {
+        "status": "token_limit",
+        "tokens_used": 88,
+        "trial_token_budget": 100,
+    }
+
+
 async def test_native_runtime_rolls_back_workspace_and_ephemeral_feedback(
     tmp_path: Path,
 ) -> None:
@@ -357,11 +599,26 @@ async def test_native_runtime_rolls_back_workspace_and_ephemeral_feedback(
         if "recovery-staging" in item["command"]
     ]
     assert restore_commands
-    checkpoint_states = list((tmp_path / "host-only-checkpoints").glob("**/state.json"))
-    assert checkpoint_states
-    assert all(
-        marker not in path.read_text(encoding="utf-8") for path in checkpoint_states
+    cleanup_index = next(
+        index
+        for index, item in enumerate(environment.calls)
+        if "rejected processes survived cleanup" in item["command"]
     )
+    restore_index = next(
+        index
+        for index, item in enumerate(environment.calls)
+        if "cp -a" in item["command"] and "recovery-staging" not in item["command"]
+    )
+    assert cleanup_index < restore_index
+    manifests = list((tmp_path / "host-only-checkpoints").glob("**/manifest.json"))
+    terminal_manifests = [
+        path
+        for path in manifests
+        if json.loads(path.read_text(encoding="utf-8"))["label"] == "terminal"
+    ]
+    assert len(terminal_manifests) == 1
+    terminal_state = terminal_manifests[0].with_name("state.json")
+    assert marker not in terminal_state.read_text(encoding="utf-8")
     context = SimpleNamespace(
         n_input_tokens=None,
         n_cache_tokens=None,
@@ -448,6 +705,218 @@ async def test_native_runtime_bills_known_usage_on_provider_failure_and_continue
     assert result.agent_tokens_used == 16
     assert provider.usage == ProviderUsage(12, 0, 4, 0.09)
     assert call.physical_call_count == 3
+
+
+async def test_unknown_billed_provider_failure_is_explicit_and_not_counted_as_exact(
+    tmp_path: Path,
+) -> None:
+    call = ScriptedPhysicalCall(
+        [BilledProviderFailure("connection timed out", usage=None)]
+    )
+    _, _, provider, runtime = _runtime(tmp_path, call)
+
+    with pytest.raises(UnknownBilledProviderUsage, match="exact usage is unavailable"):
+        await runtime.run(goal="account for the failed request")
+
+    assert provider.usage == ProviderUsage()
+    assert provider.exact_usage_request_count == 0
+    assert provider.unknown_billed_request_count == 1
+    assert provider.provider_call_count == 1
+    context = SimpleNamespace(
+        n_input_tokens=None,
+        n_cache_tokens=None,
+        n_output_tokens=None,
+        cost_usd=None,
+        metadata={},
+    )
+    apply_native_accounting(
+        context,
+        recorder=ContextUsageRecorder(context),
+        runtime=runtime,
+        provider=provider,
+        agent_request_times_msec=(123.0,),
+        reconcile=False,
+    )
+    assert context.n_input_tokens == 0
+    assert context.n_output_tokens == 0
+    assert context.metadata["n_episodes"] == 0
+    assert context.metadata["driftlock_native_usage"] == {
+        "input_tokens": 0,
+        "cache_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "provider_request_count": 0,
+        "physical_provider_request_count": 1,
+        "unknown_billed_request_count": 1,
+        "usage_complete": False,
+        "judge_request_count": 0,
+    }
+
+
+async def test_failed_restore_keeps_native_phase_recovery_archive(
+    tmp_path: Path,
+) -> None:
+    marker = "avoid the rejected no-op branch"
+    environment = RestoreApplyFailureEnvironment(tmp_path / "remote-workspace")
+    call = ScriptedPhysicalCall(
+        [
+            _response(
+                "run_shell", {"command": "true"}, input_tokens=5, output_tokens=2
+            ),
+            _response(
+                "complete", {"summary": "unused"}, input_tokens=6, output_tokens=3
+            ),
+        ]
+    )
+    _, _, _, runtime = _runtime(
+        tmp_path,
+        call,
+        heuristic_config=HeuristicConfig(
+            no_change_steps=1,
+            loop_window=10,
+            loop_repetitions=10,
+            error_window=10,
+            command_failure_window=10,
+            reward_stall_steps=10,
+        ),
+        fine_judge=DriftOnceJudge(),
+        environment=environment,
+    )
+
+    with pytest.raises(RemoteCheckpointError, match="recovery archive retained"):
+        await runtime.run(goal=marker)
+
+    recovery = list(
+        (tmp_path / "host-only-checkpoints" / "phase-0" / "recovery").glob(
+            "restore-*.tar.gz"
+        )
+    )
+    assert len(recovery) == 1
+    assert recovery[0].stat().st_size > 0
+
+
+async def test_process_cleanup_failure_aborts_before_workspace_restore(
+    tmp_path: Path,
+) -> None:
+    environment = CleanupFailureEnvironment()
+    call = ScriptedPhysicalCall(
+        [
+            _response(
+                "run_shell", {"command": "true"}, input_tokens=5, output_tokens=2
+            ),
+            _response(
+                "complete", {"summary": "unused"}, input_tokens=6, output_tokens=3
+            ),
+        ]
+    )
+    workspace, _, _, runtime = _runtime(
+        tmp_path,
+        call,
+        heuristic_config=HeuristicConfig(
+            no_change_steps=1,
+            loop_window=10,
+            loop_repetitions=10,
+            error_window=10,
+            command_failure_window=10,
+            reward_stall_steps=10,
+        ),
+        fine_judge=DriftOnceJudge(),
+        environment=environment,
+    )
+    (workspace / "sentinel.txt").write_text("original", encoding="utf-8")
+    sentinel_inode = (workspace / "sentinel.txt").stat().st_ino
+
+    with pytest.raises(RuntimeError, match="quiesce rejected native-agent processes"):
+        await runtime.run(goal="rollback without surviving processes")
+
+    assert (workspace / "sentinel.txt").stat().st_ino == sentinel_inode
+    assert (workspace / "sentinel.txt").read_text(encoding="utf-8") == "original"
+    assert not any("cp -a" in item["command"] for item in environment.calls)
+
+
+async def test_native_process_quiescer_rejects_malformed_baseline() -> None:
+    class MalformedBaselineEnvironment:
+        async def exec(
+            self,
+            command: str,
+            *,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> LocalResult:
+            del command, timeout_sec, user
+            return LocalResult(0, "not-a-process\n", "")
+
+    quiescer = NativeProcessQuiescer(MalformedBaselineEnvironment(), user="agent-user")
+
+    with pytest.raises(RuntimeError, match="process baseline is malformed"):
+        await quiescer.prepare()
+
+
+async def test_native_process_quiescer_freezes_and_kills_nonbaseline_identities() -> (
+    None
+):
+    class ScriptedEnvironment:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        async def exec(
+            self,
+            command: str,
+            *,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> LocalResult:
+            assert timeout_sec == 60
+            assert user == "agent-user"
+            self.commands.append(command)
+            stdout = "2:100\n3:200\n" if len(self.commands) == 1 else ""
+            return LocalResult(0, stdout, "")
+
+    environment = ScriptedEnvironment()
+    quiescer = NativeProcessQuiescer(environment, user="agent-user")
+
+    await quiescer.prepare()
+    await quiescer.before_restore("/app")
+
+    assert len(environment.commands) == 2
+    cleanup = environment.commands[1]
+    assert "baseline='2:100 3:200'" in cleanup
+    assert 'kill -STOP "$pid"' in cleanup
+    assert 'kill -KILL "$pid"' in cleanup
+    assert "rejected processes survived cleanup" in cleanup
+
+
+def test_append_verifier_feedback_preserves_history_and_step_count() -> None:
+    state = {
+        "driftlock_tool_agent": {
+            "schema_version": 1,
+            "messages": [{"role": "assistant", "content": "initial summary"}],
+            "steps": 4,
+        }
+    }
+
+    updated = append_verifier_feedback(state, "The checksum still fails.")
+
+    assert updated == {
+        "driftlock_tool_agent": {
+            "schema_version": 1,
+            "messages": [
+                {"role": "assistant", "content": "initial summary"},
+                {
+                    "role": "user",
+                    "content": (
+                        "The task verifier rejected the previous completion. Continue "
+                        "from the current workspace and address this feedback:\n"
+                        "The checksum still fails."
+                    ),
+                },
+            ],
+            "steps": 4,
+        }
+    }
+    assert state["driftlock_tool_agent"]["messages"] == [
+        {"role": "assistant", "content": "initial summary"}
+    ]
 
 
 def _lhtb_tree(tmp_path: Path) -> Path:
@@ -561,3 +1030,50 @@ def test_existing_terminus_arm_identity_still_accepts_generated_config(
 
     assert budget == 777
     assert len(signature) == 64
+
+
+def test_terminus_config_is_rejected_when_labeled_as_native_arm(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path)
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="driftlock",
+        arm="driftlock",
+        tasks=["task-a"],
+    )
+    payload = _identity_payload(config["agents"][0], info_name="driftlock-terminus-2")
+
+    with pytest.raises(ValueError, match="wrong agent config"):
+        _validate_arm_identity(
+            payload,
+            "native-driftlock",
+            DEFAULT_MODEL,
+            tmp_path / "mislabelled-native-result.json",
+        )
+
+
+def test_native_arm_identity_rejects_unsupported_checkpoint_retention(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path)
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="native-driftlock",
+        arm="native-driftlock",
+        tasks=["task-a"],
+    )
+    config["agents"][0]["kwargs"]["driftlock_retain_checkpoints"] = True
+    payload = _identity_payload(
+        config["agents"][0], info_name="driftlock-native-tool-agent"
+    )
+
+    with pytest.raises(ValueError, match="invalid checkpoint retention"):
+        _validate_arm_identity(
+            payload,
+            "native-driftlock",
+            DEFAULT_MODEL,
+            tmp_path / "retained-native-result.json",
+        )

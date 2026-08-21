@@ -145,6 +145,23 @@ def test_checkpoint_retention_is_explicit_and_only_for_driftlock(
         )
 
 
+@pytest.mark.parametrize("arm", ["native-driftlock-heuristic", "native-driftlock"])
+def test_native_checkpoint_retention_is_rejected_before_job_generation(
+    tmp_path: Path, arm: str
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    with pytest.raises(ValueError, match="native oracle replay is future work"):
+        build_job_config(
+            lhtb_dir=root,
+            jobs_dir=tmp_path / "jobs",
+            job_name="unsupported-native-source",
+            arm=arm,
+            tasks=["task-a"],
+            retain_checkpoints=True,
+        )
+
+
 def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
     trial_id = str(uuid4())
     trial = job / "task-a.1-of-1.2026-01-01"
@@ -261,6 +278,28 @@ def test_prepare_oracle_replays_generates_one_isolated_job_per_checkpoint(
     assert agent["kwargs"]["driftlock_source_usage"]["input_tokens"] == 100
     assert config["n_concurrent_trials"] == 1
     assert config["retry"] == {"max_retries": 0}
+
+
+def test_prepare_oracle_replays_reports_native_incompatibility_explicitly(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    result_file, _ = _retained_source_trial(root, source)
+    payload = json.loads(result_file.read_text(encoding="utf-8"))
+    payload["config"]["agent"]["import_path"] = (
+        "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+    )
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError, match="native retained checkpoints cannot be used for oracle replay"
+    ):
+        prepare_oracle_replays(
+            lhtb_dir=root,
+            source_job_dir=source,
+            output_dir=tmp_path / "oracle",
+        )
 
 
 def test_oracle_run_needs_docker_but_not_provider_credentials(

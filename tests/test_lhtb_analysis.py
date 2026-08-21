@@ -134,6 +134,23 @@ def _result(
                 "driftlock_judge_max_output_tokens": 512,
             }
         )
+    elif resolved_arm in {"native-driftlock-heuristic", "native-driftlock"}:
+        agent_name = "driftlock-native-tool-agent"
+        agent_config["import_path"] = (
+            "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+        )
+        if resolved_arm == "native-driftlock":
+            kwargs = agent_config["kwargs"]
+            assert isinstance(kwargs, dict)
+            kwargs.update(
+                {
+                    "driftlock_judge_model": (
+                        "openrouter/deepseek/deepseek-v4-flash-0731"
+                    ),
+                    "driftlock_judge_api_base": "https://judge.invalid/v1",
+                    "driftlock_judge_max_output_tokens": 512,
+                }
+            )
     payload = {
         "id": str(uuid5(NAMESPACE_URL, f"{job.resolve()}:{trial}")),
         "task_name": result_task,
@@ -437,6 +454,39 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     trial = drift["trials"][0]
     assert Path(trial["result_file"]).is_absolute()
     assert len(trial["result_sha256"]) == 64
+
+
+def test_planned_arm_coverage_includes_native_arm_present_in_report(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    native = tmp_path / "native-driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(
+        native,
+        "short-1",
+        "short",
+        1.0,
+        checksum=checksum,
+        arm="native-driftlock",
+    )
+    _job_summary(stock, 1)
+    _job_summary(native, 1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "native-driftlock": native},
+    )
+
+    assert report["planned_arm_coverage"]["present"] == [
+        "stock",
+        "native-driftlock",
+    ]
+    assert "native-driftlock" in report["arms"]
+    assert "native-driftlock" in report["paired_vs_stock"]
 
 
 @pytest.mark.parametrize(

@@ -19,15 +19,19 @@ from driftlock.lhtb import (
     _validate_pinned_harbor,
     _validate_single_attempt_configuration,
 )
-from driftlock.models import RunResult, RunStatus, StepTokenBudgetExhausted
+from driftlock.models import RunResult, StepTokenBudgetExhausted
 from driftlock.native_lhtb import (
-    BilledProviderFailure,
     BilledProviderResponse,
     ContextUsageRecorder,
     LHTBNativeAgentRuntime,
-    ProviderUsage,
     SingleAttemptJSONProvider,
     append_verifier_feedback,
+    apply_native_accounting,
+    billed_provider_exception,
+    billed_provider_response,
+    native_checkpoint_store_root,
+    set_native_result_metadata,
+    set_native_token_limit_metadata,
 )
 from driftlock.runner import RunnerConfig
 
@@ -89,29 +93,11 @@ class _HarborLiteLLMSingleAttempt:
                 timeout=self.timeout_sec,
             )
         except Exception as error:
-            response = getattr(error, "response", None)
-            usage = _exact_usage(response)
-            if usage is None:
-                raise RuntimeError(
-                    "provider failed without exact billed usage; aborting instead "
-                    "of recording a zero-token step"
-                ) from error
-            partial = getattr(error, "truncated_response", None)
-            if isinstance(partial, str):
-                return BilledProviderResponse(partial, usage, truncated=True)
-            raise BilledProviderFailure(str(error), usage=usage) from error
+            return billed_provider_exception(error)
         finally:
             self.request_times_msec.append((time.monotonic() - started) * 1000)
 
-        usage = _exact_usage(response)
-        if usage is None:
-            raise RuntimeError("provider response is missing exact billed usage")
-        content = getattr(response, "content", None)
-        if not isinstance(content, str):
-            raise BilledProviderFailure(
-                "provider response content is not a string", usage=usage
-            )
-        return BilledProviderResponse(content, usage)
+        return billed_provider_response(response)
 
 
 class LHTBNativeDriftlockAgent(BaseAgent):
@@ -279,7 +265,12 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             raise
         self._native_last_result = result
         self._apply_accounting(context, reconcile=True)
-        self._set_result_metadata(context, result)
+        set_native_result_metadata(
+            context,
+            result=result,
+            runtime=runtime,
+            trial_token_budget=self._native_runner_config.max_tokens,
+        )
         record = {
             "phase": len(self._native_phases),
             "status": result.status.value,
@@ -307,10 +298,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             return self._native_runtime
         task_config = getattr(environment, "task_env_config", None)
         workspace = str(getattr(task_config, "workdir", None) or "/app")
-        logs_dir = Path(self.logs_dir).expanduser().resolve()
-        store_root = logs_dir.parent / ".driftlock-native-checkpoints"
-        if store_root == logs_dir or logs_dir in store_root.parents:
-            raise ValueError("checkpoint storage must be outside the agent log mount")
+        store_root = native_checkpoint_store_root(self.logs_dir)
         store_root.mkdir(parents=True, exist_ok=True)
         observer = HarborWorkspaceDeltaObserver(
             environment,
@@ -342,95 +330,21 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         recorder = self._native_usage_recorder
         if runtime is None or recorder is None:
             return
-        provider = self._native_provider.usage
-        judge = self._native_judge_client
-        judge_input = judge.n_input_tokens if judge is not None else 0
-        judge_cache = judge.n_cache_tokens if judge is not None else 0
-        judge_output = judge.n_output_tokens if judge is not None else 0
-        judge_cost = judge.cost_usd if judge is not None else 0.0
-        if reconcile:
-            if provider.total_tokens != runtime.agent_tokens_consumed:
-                raise RuntimeError(
-                    "native provider usage does not reconcile with steps"
-                )
-            if judge_input + judge_output != runtime.judge_tokens_consumed:
-                raise RuntimeError(
-                    "native judge usage does not reconcile with verdicts"
-                )
-        recorder.apply(
+        apply_native_accounting(
             context,
-            agent_usage=provider,
-            judge_usage=ProviderUsage(
-                input_tokens=judge_input,
-                cache_tokens=judge_cache,
-                output_tokens=judge_output,
-                cost_usd=judge_cost,
-            ),
+            recorder=recorder,
+            runtime=runtime,
+            provider=self._native_provider,
             agent_request_times_msec=tuple(self._native_low_level.request_times_msec),
-            judge_request_times_msec=(
-                tuple(judge.request_times_msec) if judge is not None else ()
-            ),
-            provider_request_count=self._native_provider.provider_call_count,
+            judge=self._native_judge_client,
+            reconcile=reconcile,
         )
-
-    def _set_result_metadata(self, context: Any, result: RunResult) -> None:
-        runtime = self._native_runtime
-        assert runtime is not None
-        metadata = dict(context.metadata or {})
-        metadata["driftlock"] = {
-            "status": result.status.value,
-            "steps": len(result.steps),
-            "rollbacks": len(result.rollbacks),
-            "tokens_used": result.tokens_used,
-            "agent_tokens_used": result.agent_tokens_used,
-            "judge_tokens_used": result.judge_tokens_used,
-            "trial_tokens_used": runtime.tokens_consumed,
-            "trial_token_budget": self._native_runner_config.max_tokens,
-        }
-        metadata["termination_reason"] = (
-            "confirmed_task_complete"
-            if result.status is RunStatus.COMPLETED
-            else f"driftlock_{result.status.value}"
-        )
-        context.metadata = metadata
 
     def _set_token_limit_metadata(self, context: Any) -> None:
         runtime = self._native_runtime
         assert runtime is not None
-        metadata = dict(context.metadata or {})
-        metadata["termination_reason"] = "driftlock_token_limit"
-        metadata["driftlock"] = {
-            "status": RunStatus.TOKEN_LIMIT.value,
-            "tokens_used": runtime.tokens_consumed,
-            "trial_token_budget": self._native_runner_config.max_tokens,
-        }
-        context.metadata = metadata
-
-
-def _exact_usage(response: Any) -> ProviderUsage | None:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return None
-    values = (
-        getattr(usage, "prompt_tokens", None),
-        getattr(usage, "cache_tokens", None),
-        getattr(usage, "completion_tokens", None),
-    )
-    cost = getattr(usage, "cost_usd", None)
-    if not all(
-        isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        for value in values
-    ):
-        return None
-    if (
-        not isinstance(cost, (int, float))
-        or isinstance(cost, bool)
-        or not float(cost) >= 0
-    ):
-        return None
-    return ProviderUsage(
-        input_tokens=values[0],
-        cache_tokens=values[1],
-        output_tokens=values[2],
-        cost_usd=float(cost),
-    )
+        set_native_token_limit_metadata(
+            context,
+            runtime=runtime,
+            trial_token_budget=self._native_runner_config.max_tokens,
+        )

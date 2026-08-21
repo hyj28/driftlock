@@ -201,7 +201,7 @@ def analyze_jobs(
         "arms": arm_reports,
         "paired_vs_stock": comparisons,
         "planned_arm_coverage": {
-            "present": [arm for arm in ANALYSIS_ARMS if arm in arm_reports],
+            "present": [arm for arm in _ACCEPTED_ANALYSIS_ARMS if arm in arm_reports],
             "missing": [arm for arm in ANALYSIS_ARMS if arm not in arm_reports],
         },
         "goal_drift_metrics": {
@@ -655,13 +655,7 @@ def _validate_arm_identity(
     }
     if "driftlock_retain_checkpoints" in kwargs:
         if (
-            arm
-            not in {
-                "driftlock-heuristic",
-                "driftlock",
-                "native-driftlock-heuristic",
-                "native-driftlock",
-            }
+            arm not in {"driftlock-heuristic", "driftlock"}
             or kwargs["driftlock_retain_checkpoints"] is not True
         ):
             raise ValueError(f"arm {arm!r} has invalid checkpoint retention")

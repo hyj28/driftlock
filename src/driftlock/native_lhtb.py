@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shlex
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -20,7 +21,7 @@ from driftlock.agent import (
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import FineJudge
 from driftlock.lhtb import WorkspaceDeltaObserver
-from driftlock.models import RunResult, StepOutcome, StepTokenBudgetExhausted
+from driftlock.models import RunResult, RunStatus, StepOutcome, StepTokenBudgetExhausted
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteEnvironment
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
@@ -98,6 +99,8 @@ class ContextUsageRecorder:
         agent_request_times_msec: tuple[float, ...] = (),
         judge_request_times_msec: tuple[float, ...] = (),
         provider_request_count: int,
+        physical_provider_request_count: int | None = None,
+        unknown_billed_request_count: int = 0,
     ) -> None:
         if id(context) != self._context_id:
             raise RuntimeError("usage recorder cannot switch contexts")
@@ -107,6 +110,22 @@ class ContextUsageRecorder:
             or provider_request_count < 0
         ):
             raise ValueError("provider_request_count must be non-negative")
+        physical_count = (
+            provider_request_count
+            if physical_provider_request_count is None
+            else physical_provider_request_count
+        )
+        for name, value in (
+            ("physical_provider_request_count", physical_count),
+            ("unknown_billed_request_count", unknown_billed_request_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if physical_count != provider_request_count + unknown_billed_request_count:
+            raise ValueError(
+                "physical provider requests must equal exact-usage plus "
+                "unknown-billed requests"
+            )
         resolved_judge_usage = judge_usage or ProviderUsage()
         combined = self._base + agent_usage + resolved_judge_usage
         context.n_input_tokens = combined.input_tokens
@@ -128,6 +147,9 @@ class ContextUsageRecorder:
             "output_tokens": agent_usage.output_tokens,
             "cost_usd": agent_usage.cost_usd,
             "provider_request_count": provider_request_count,
+            "physical_provider_request_count": physical_count,
+            "unknown_billed_request_count": unknown_billed_request_count,
+            "usage_complete": unknown_billed_request_count == 0,
             "judge_request_count": len(judge_request_times_msec),
         }
         context.metadata = metadata
@@ -151,11 +173,15 @@ class BilledProviderResponse:
 
 
 class BilledProviderFailure(RuntimeError):
-    """A failed physical provider attempt whose exact usage is known."""
+    """A failed physical attempt, with exact usage when the provider supplied it."""
 
-    def __init__(self, message: str, *, usage: ProviderUsage) -> None:
+    def __init__(self, message: str, *, usage: ProviderUsage | None) -> None:
         super().__init__(message)
         self.usage = usage
+
+
+class UnknownBilledProviderUsage(RuntimeError):
+    """A physical request was billed but its exact usage is unavailable."""
 
 
 class PhysicalProviderBoundaryError(RuntimeError):
@@ -182,6 +208,12 @@ class AuditedCompletionProvider(Protocol):
     @property
     def usage(self) -> ProviderUsage: ...
 
+    @property
+    def exact_usage_request_count(self) -> int: ...
+
+    @property
+    def unknown_billed_request_count(self) -> int: ...
+
     def prefill_estimate(self, request: AgentCompletionRequest) -> int: ...
 
     async def __call__(self, request: AgentCompletionRequest) -> AgentCompletion: ...
@@ -198,6 +230,8 @@ class SingleAttemptJSONProvider:
             raise TypeError("physical_call_count must be a non-negative integer")
         self._call = call
         self._usage = ProviderUsage()
+        self._exact_usage_request_count = 0
+        self._unknown_billed_request_count = 0
 
     @property
     def provider_call_count(self) -> int:
@@ -209,6 +243,14 @@ class SingleAttemptJSONProvider:
     @property
     def usage(self) -> ProviderUsage:
         return self._usage
+
+    @property
+    def exact_usage_request_count(self) -> int:
+        return self._exact_usage_request_count
+
+    @property
+    def unknown_billed_request_count(self) -> int:
+        return self._unknown_billed_request_count
 
     def prefill_estimate(self, request: AgentCompletionRequest) -> int:
         prompt = _provider_prompt(request)
@@ -229,15 +271,25 @@ class SingleAttemptJSONProvider:
             )
         except BilledProviderFailure as error:
             self._require_one_call(calls_before)
+            if error.usage is None:
+                self._unknown_billed_request_count += 1
+                raise UnknownBilledProviderUsage(
+                    "provider request was billed but exact usage is unavailable"
+                ) from error
+            self._exact_usage_request_count += 1
             self._usage = self._usage + error.usage
             raise AgentProviderError(
                 str(error), tokens=error.usage.total_tokens
             ) from error
-        except Exception:
+        except Exception as error:
             self._require_one_call(calls_before)
-            raise
+            self._unknown_billed_request_count += 1
+            raise UnknownBilledProviderUsage(
+                "provider request failed without auditable billed usage"
+            ) from error
 
         self._require_one_call(calls_before)
+        self._exact_usage_request_count += 1
         self._usage = self._usage + response.usage
         if response.truncated:
             return AgentCompletion(
@@ -261,10 +313,207 @@ class SingleAttemptJSONProvider:
     def _require_one_call(self, calls_before: int) -> None:
         calls = self.provider_call_count - calls_before
         if calls != 1:
+            if calls > 0:
+                self._unknown_billed_request_count += calls
             raise PhysicalProviderBoundaryError(
                 "one native-agent step must make exactly one physical provider "
                 f"request; observed {calls}"
             )
+
+
+def exact_provider_usage(response: Any) -> ProviderUsage | None:
+    """Extract exact billed usage from a duck-typed provider response."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    values = (
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "cache_tokens", None),
+        getattr(usage, "completion_tokens", None),
+    )
+    cost = getattr(usage, "cost_usd", None)
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in values
+    ):
+        return None
+    if (
+        not isinstance(cost, (int, float))
+        or isinstance(cost, bool)
+        or not math.isfinite(float(cost))
+        or float(cost) < 0
+    ):
+        return None
+    return ProviderUsage(
+        input_tokens=values[0],
+        cache_tokens=values[1],
+        output_tokens=values[2],
+        cost_usd=float(cost),
+    )
+
+
+def billed_provider_response(response: Any) -> BilledProviderResponse:
+    """Map one duck-typed successful provider response to the audited boundary."""
+    usage = exact_provider_usage(response)
+    if usage is None:
+        raise BilledProviderFailure(
+            "provider response is missing exact billed usage", usage=None
+        )
+    content = getattr(response, "content", None)
+    if not isinstance(content, str):
+        raise BilledProviderFailure(
+            "provider response content is not a string", usage=usage
+        )
+    return BilledProviderResponse(content, usage)
+
+
+def billed_provider_exception(error: Exception) -> BilledProviderResponse:
+    """Triage a duck-typed provider exception without Harbor or LiteLLM imports."""
+    usage = exact_provider_usage(getattr(error, "response", None))
+    partial = getattr(error, "truncated_response", None)
+    if usage is not None and isinstance(partial, str):
+        return BilledProviderResponse(partial, usage, truncated=True)
+    raise BilledProviderFailure(str(error), usage=usage) from error
+
+
+def native_checkpoint_store_root(logs_dir: Path | str) -> Path:
+    """Derive host-only native checkpoint storage outside the agent log mount."""
+    resolved_logs = Path(logs_dir).expanduser().resolve()
+    store_root = resolved_logs.parent / ".driftlock-native-checkpoints"
+    if store_root == resolved_logs or resolved_logs in store_root.parents:
+        raise ValueError("checkpoint storage must be outside the agent log mount")
+    return store_root
+
+
+class NativeProcessQuiescer:
+    """Stop processes created by the native agent before restoring its workspace."""
+
+    def __init__(
+        self,
+        environment: RemoteEnvironment,
+        *,
+        user: str | int | None,
+        timeout_sec: int = 60,
+    ) -> None:
+        if timeout_sec <= 0:
+            raise ValueError("process cleanup timeout must be positive")
+        self.environment = environment
+        self.user = user
+        self.timeout_sec = timeout_sec
+        self._baseline: tuple[str, ...] | None = None
+
+    async def prepare(self) -> None:
+        """Capture the pre-agent PID/start-time identities once per trial."""
+        if self._baseline is not None:
+            return
+        result = await self.environment.exec(
+            _process_identity_snapshot_script(),
+            timeout_sec=self.timeout_sec,
+            user=self.user,
+        )
+        _require_exec_success(result, "capture pre-agent process baseline")
+        identities = tuple((getattr(result, "stdout", None) or "").splitlines())
+        if any(not _valid_process_identity(value) for value in identities) or len(
+            identities
+        ) != len(set(identities)):
+            raise RuntimeError("remote process baseline is malformed")
+        self._baseline = identities
+
+    async def before_restore(self, remote_workspace: str) -> None:
+        """Freeze and kill every non-baseline process, or abort the restore."""
+        if self._baseline is None:
+            raise RuntimeError("process baseline must be captured before restore")
+        result = await self.environment.exec(
+            _quiesce_native_processes_script(
+                remote_workspace, process_baseline=self._baseline
+            ),
+            timeout_sec=self.timeout_sec,
+            user=self.user,
+        )
+        _require_exec_success(result, "quiesce rejected native-agent processes")
+
+
+def apply_native_accounting(
+    context: Any,
+    *,
+    recorder: ContextUsageRecorder,
+    runtime: Any,
+    provider: AuditedCompletionProvider,
+    agent_request_times_msec: tuple[float, ...],
+    judge: Any | None = None,
+    reconcile: bool,
+) -> None:
+    """Reconcile and publish native provider/judge accounting."""
+    provider_usage = provider.usage
+    judge_input = judge.n_input_tokens if judge is not None else 0
+    judge_cache = judge.n_cache_tokens if judge is not None else 0
+    judge_output = judge.n_output_tokens if judge is not None else 0
+    judge_cost = judge.cost_usd if judge is not None else 0.0
+    if reconcile:
+        if provider.unknown_billed_request_count:
+            raise RuntimeError("native provider has unknown billed usage")
+        if provider_usage.total_tokens != runtime.agent_tokens_consumed:
+            raise RuntimeError("native provider usage does not reconcile with steps")
+        if judge_input + judge_output != runtime.judge_tokens_consumed:
+            raise RuntimeError("native judge usage does not reconcile with verdicts")
+    recorder.apply(
+        context,
+        agent_usage=provider_usage,
+        judge_usage=ProviderUsage(
+            input_tokens=judge_input,
+            cache_tokens=judge_cache,
+            output_tokens=judge_output,
+            cost_usd=judge_cost,
+        ),
+        agent_request_times_msec=agent_request_times_msec,
+        judge_request_times_msec=(
+            tuple(judge.request_times_msec) if judge is not None else ()
+        ),
+        provider_request_count=provider.exact_usage_request_count,
+        physical_provider_request_count=provider.provider_call_count,
+        unknown_billed_request_count=provider.unknown_billed_request_count,
+    )
+
+
+def set_native_result_metadata(
+    context: Any,
+    *,
+    result: RunResult,
+    runtime: Any,
+    trial_token_budget: int,
+) -> None:
+    """Publish one successful native phase's terminal metadata."""
+    metadata = dict(context.metadata or {})
+    metadata["driftlock"] = {
+        "status": result.status.value,
+        "steps": len(result.steps),
+        "rollbacks": len(result.rollbacks),
+        "tokens_used": result.tokens_used,
+        "agent_tokens_used": result.agent_tokens_used,
+        "judge_tokens_used": result.judge_tokens_used,
+        "trial_tokens_used": runtime.tokens_consumed,
+        "trial_token_budget": trial_token_budget,
+    }
+    metadata["termination_reason"] = (
+        "confirmed_task_complete"
+        if result.status is RunStatus.COMPLETED
+        else f"driftlock_{result.status.value}"
+    )
+    context.metadata = metadata
+
+
+def set_native_token_limit_metadata(
+    context: Any, *, runtime: Any, trial_token_budget: int
+) -> None:
+    """Publish native trial budget exhaustion metadata."""
+    metadata = dict(context.metadata or {})
+    metadata["termination_reason"] = "driftlock_token_limit"
+    metadata["driftlock"] = {
+        "status": RunStatus.TOKEN_LIMIT.value,
+        "tokens_used": runtime.tokens_consumed,
+        "trial_token_budget": trial_token_budget,
+    }
+    context.metadata = metadata
 
 
 class LHTBNativeAgentRuntime:
@@ -318,6 +567,11 @@ class LHTBNativeAgentRuntime:
             shell_timeout_sec=shell_timeout_sec,
             user=user,
         )
+        self._process_quiescer = NativeProcessQuiescer(
+            environment,
+            user=user,
+            timeout_sec=shell_timeout_sec,
+        )
         self.tokens_consumed = 0
         self.agent_tokens_consumed = 0
         self.judge_tokens_consumed = 0
@@ -345,15 +599,24 @@ class LHTBNativeAgentRuntime:
             store_dir=phase_dir,
             remote_tmp_dir=self.remote_tmp_dir,
             user=self.user,
+            before_restore=self._process_quiescer.before_restore,
         )
         runner = DriftlockRunner(
             store,
             HeuristicJudge(self.heuristic_config),
             fine_judge=self.fine_judge,
-            config=replace(self.runner_config, max_tokens=self.tokens_remaining),
+            config=replace(
+                self.runner_config,
+                max_tokens=self.tokens_remaining,
+                checkpoint_on_exit=(
+                    self.runner_config.checkpoint_on_exit or self.retain_checkpoints
+                ),
+            ),
         )
         usage_before = self.provider.usage
         calls_before = self.provider.provider_call_count
+        exact_calls_before = self.provider.exact_usage_request_count
+        unknown_calls_before = self.provider.unknown_billed_request_count
 
         async def audited_step(context: Any) -> StepOutcome:
             step_calls_before = self.provider.provider_call_count
@@ -372,7 +635,9 @@ class LHTBNativeAgentRuntime:
                 )
             return outcome
 
+        phase_succeeded = False
         try:
+            await self._process_quiescer.prepare()
             result = await runner.run(
                 goal=goal,
                 plan=self.plan,
@@ -385,9 +650,19 @@ class LHTBNativeAgentRuntime:
             )
             phase_usage = self.provider.usage.delta_from(usage_before)
             phase_calls = self.provider.provider_call_count - calls_before
+            phase_exact_calls = (
+                self.provider.exact_usage_request_count - exact_calls_before
+            )
+            phase_unknown_calls = (
+                self.provider.unknown_billed_request_count - unknown_calls_before
+            )
             if phase_calls != len(result.steps):
                 raise RuntimeError(
                     "physical provider calls do not reconcile with recorded steps"
+                )
+            if phase_exact_calls != len(result.steps) or phase_unknown_calls:
+                raise RuntimeError(
+                    "exact-usage provider calls do not reconcile with recorded steps"
                 )
             if phase_usage.total_tokens != result.agent_tokens_used:
                 raise RuntimeError(
@@ -397,9 +672,10 @@ class LHTBNativeAgentRuntime:
             self.agent_tokens_consumed += result.agent_tokens_used
             self.judge_tokens_consumed += result.judge_tokens_used
             self.last_result = result
+            phase_succeeded = True
             return result
         finally:
-            if not self.retain_checkpoints:
+            if phase_succeeded and not self.retain_checkpoints:
                 shutil.rmtree(phase_dir, ignore_errors=True)
 
 
@@ -479,3 +755,119 @@ def _decode_provider_response(text: str) -> tuple[str, tuple[ToolCall, ...]]:
             )
         )
     return response_text, tuple(calls)
+
+
+def _require_exec_success(result: Any, operation: str) -> None:
+    return_code = getattr(result, "return_code", None)
+    if return_code != 0:
+        stderr = (getattr(result, "stderr", None) or "").strip()
+        raise RuntimeError(f"failed to {operation}: {stderr or f'exit {return_code}'}")
+
+
+def _valid_process_identity(value: str) -> bool:
+    pid, separator, started = value.partition(":")
+    return (
+        separator == ":"
+        and pid.isascii()
+        and pid.isdigit()
+        and int(pid) > 1
+        and started.isascii()
+        and started.isdigit()
+        and int(started) >= 0
+    )
+
+
+def _process_identity_snapshot_script() -> str:
+    return r"""
+set -eu
+for stat in /proc/[0-9]*/stat; do
+  [ -r "$stat" ] || continue
+  pid=${stat#/proc/}
+  pid=${pid%/stat}
+  IFS= read -r value < "$stat" || continue
+  rest=${value##*) }
+  set -- $rest
+  start=${20:-}
+  case "$start" in ''|*[!0-9]*) continue;; esac
+  printf '%s:%s\n' "$pid" "$start"
+done
+""".strip()
+
+
+def _quiesce_native_processes_script(
+    workspace: str, *, process_baseline: tuple[str, ...]
+) -> str:
+    if any(not _valid_process_identity(value) for value in process_baseline):
+        raise ValueError("process_baseline contains an invalid identity")
+    root = shlex.quote(workspace)
+    baseline = shlex.quote(" ".join(process_baseline))
+    return f"""
+set -eu
+workspace=$(realpath -- {root})
+[ "$workspace" != / ]
+[ -d "$workspace" ]
+baseline={baseline}
+protected=$$
+cursor=$$
+while [ "$cursor" -gt 1 ]; do
+  status=/proc/$cursor/status
+  [ -r "$status" ] || break
+  parent=
+  while IFS= read -r line; do
+    case "$line" in PPid:*) set -- $line; parent=$2; break;; esac
+  done < "$status"
+  case "$parent" in ''|*[!0-9]*) break;; esac
+  protected="$protected $parent"
+  cursor=$parent
+done
+
+candidates=
+changed=1
+while [ "$changed" -eq 1 ]; do
+  changed=0
+  for stat in /proc/[0-9]*/stat; do
+    [ -r "$stat" ] || continue
+    pid=${{stat#/proc/}}
+    pid=${{pid%/stat}}
+    case " $protected " in *" $pid "*) continue;; esac
+    IFS= read -r value < "$stat" || continue
+    rest=${{value##*) }}
+    set -- $rest
+    start=${{20:-}}
+    case "$start" in ''|*[!0-9]*) continue;; esac
+    case " $baseline " in *" $pid:$start "*) continue;; esac
+    case " $candidates " in *" $pid:$start "*) continue;; esac
+    candidates="$candidates $pid:$start"
+    kill -STOP "$pid" 2>/dev/null || true
+    changed=1
+  done
+done
+for identity in $candidates; do
+  pid=${{identity%%:*}}
+  kill -KILL "$pid" 2>/dev/null || true
+done
+
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+  survivors=
+  for identity in $candidates; do
+    pid=${{identity%%:*}}
+    expected=${{identity#*:}}
+    stat=/proc/$pid/stat
+    [ -r "$stat" ] || continue
+    IFS= read -r value < "$stat" || continue
+    rest=${{value##*) }}
+    set -- $rest
+    state=${{1:-}}
+    actual=${{20:-}}
+    if [ "$actual" = "$expected" ] && [ "$state" != Z ]; then
+      survivors="$survivors $identity"
+    fi
+  done
+  [ -z "$survivors" ] && exit 0
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+printf 'rejected processes survived cleanup:%s\n' "$survivors" >&2
+exit 42
+""".strip()
