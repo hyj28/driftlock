@@ -1,5 +1,15 @@
 """Progress-aware checkpoint and rollback for long-horizon agents."""
 
+from driftlock.agent import (
+    AgentCompletion,
+    AgentCompletionRequest,
+    AgentConversationCodec,
+    AgentProviderError,
+    AgentStateError,
+    ToolCall,
+    ToolCallingAgent,
+    ToolDefinition,
+)
 from driftlock.checkpoints import DirectoryCheckpointStore, SnapshotIntegrityError
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import CallableLLMJudge
@@ -20,6 +30,11 @@ from driftlock.lhtb_analysis import (
     analyze_jobs,
     goal_drift_actions,
     goal_drift_inaction,
+)
+from driftlock.local import (
+    LocalEnvironment,
+    LocalExecResult,
+    LocalWorkspaceDeltaObserver,
 )
 from driftlock.models import (
     Checkpoint,
@@ -50,6 +65,11 @@ __all__ = [
     "DRIFTLOCK_HARBOR_PATCH_VERSION",
     "LHTB_LITELLM_VERSION",
     "LHTB_REPOSITORY_REVISION",
+    "AgentCompletion",
+    "AgentCompletionRequest",
+    "AgentConversationCodec",
+    "AgentProviderError",
+    "AgentStateError",
     "CallableLLMJudge",
     "Checkpoint",
     "DirectoryCheckpointStore",
@@ -63,6 +83,9 @@ __all__ = [
     "JudgeVerdict",
     "LHTBRuntimeCompatibilityError",
     "LHTBTerminusRuntime",
+    "LocalEnvironment",
+    "LocalExecResult",
+    "LocalWorkspaceDeltaObserver",
     "RemoteArchiveCheckpointStore",
     "RemoteCheckpointError",
     "RunResult",
@@ -79,6 +102,9 @@ __all__ = [
     "TerminusConversationState",
     "TerminusStateError",
     "TerminusStepAdapter",
+    "ToolCall",
+    "ToolCallingAgent",
+    "ToolDefinition",
     "Verdict",
     "WorkspaceDelta",
     "WorkspaceDeltaObserver",
