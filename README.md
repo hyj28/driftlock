@@ -330,7 +330,9 @@ by measured mean partial credit and records the trial result files behind the ch
 Completed arms can be aggregated into one strict, auditable report. By default the
 analyzer requires identical task/attempt matrices, task checksums, and model identity;
 it rejects missing rewards or usage instead of silently turning infrastructure errors
-into model failures. Every input `result.json` path and SHA-256 is retained.
+into model failures. It also requires each Harbor job summary to be finished and
+error-free, and verifies each recorded task checksum against the selected LHTB
+checkout. Every input `result.json` path and SHA-256 is retained.
 
 ```bash
 driftlock-lhtb analyze --lhtb-dir /srv/LHTB \

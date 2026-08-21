@@ -93,14 +93,22 @@ def analyze_jobs(
         raise FileNotFoundError(task_root)
 
     trials_by_arm: dict[str, list[dict[str, Any]]] = {}
+    job_summaries: dict[str, dict[str, Any]] = {}
+    task_metadata_cache: dict[str, dict[str, Any]] = {}
     seen_results: set[Path] = set()
     for arm, raw_directory in arm_directories.items():
         directory = raw_directory.expanduser().resolve()
         if not directory.is_dir():
             raise FileNotFoundError(directory)
-        files = sorted(directory.rglob("result.json"))
+        job_summaries[arm] = _load_job_summary(directory, arm)
+        files = sorted(directory.glob("*/result.json"))
         if not files:
             raise ValueError(f"arm {arm!r} contains no Harbor result.json files")
+        if len(files) != job_summaries[arm]["n_total_trials"]:
+            raise ValueError(
+                f"arm {arm!r} has {len(files)} trial result files but its Harbor "
+                f"job summary declares {job_summaries[arm]['n_total_trials']}"
+            )
         trials: list[dict[str, Any]] = []
         for result_file in files:
             resolved = result_file.resolve()
@@ -114,6 +122,7 @@ def analyze_jobs(
                     result_file=resolved,
                     arm=arm,
                     task_root=task_root,
+                    task_metadata_cache=task_metadata_cache,
                     solve_threshold=solve_threshold,
                 )
             )
@@ -128,7 +137,13 @@ def analyze_jobs(
     }
     stock = arm_reports["stock"]
     comparisons = {
-        arm: _compare_to_stock(stock, report)
+        arm: _compare_to_stock(
+            stock,
+            report,
+            comparable=(
+                matrix["attempts_per_task"][arm] == matrix["attempts_per_task"]["stock"]
+            ),
+        )
         for arm, report in arm_reports.items()
         if arm != "stock"
     }
@@ -139,6 +154,7 @@ def analyze_jobs(
             arm: str(path.expanduser().resolve())
             for arm, path in arm_directories.items()
         },
+        "job_summaries": job_summaries,
         "matrix": matrix,
         "arms": arm_reports,
         "paired_vs_stock": comparisons,
@@ -159,11 +175,67 @@ def analyze_jobs(
     }
 
 
+def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
+    result_file = directory / "result.json"
+    if not result_file.is_file():
+        raise ValueError(f"arm {arm!r} lacks its Harbor job-level result.json")
+    try:
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON in {result_file}: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"Harbor job result must be an object: {result_file}")
+    n_total = _positive_integer(
+        data.get("n_total_trials"), f"n_total_trials in {result_file}"
+    )
+    finished = data.get("finished_at")
+    if not isinstance(finished, str):
+        raise ValueError(f"Harbor job is not finished: {result_file}")
+    try:
+        datetime.fromisoformat(finished.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"invalid finished_at in {result_file}") from error
+    stats = data.get("stats")
+    if not isinstance(stats, dict):
+        raise ValueError(f"missing Harbor job stats in {result_file}")
+    counts = {
+        name: _nonnegative_integer(stats.get(name), f"{name} in {result_file}")
+        for name in (
+            "n_completed_trials",
+            "n_errored_trials",
+            "n_running_trials",
+            "n_pending_trials",
+            "n_cancelled_trials",
+        )
+    }
+    if counts["n_completed_trials"] != n_total:
+        raise ValueError(
+            f"Harbor job is incomplete in {result_file}: completed "
+            f"{counts['n_completed_trials']} of {n_total} trials"
+        )
+    unfinished = {
+        name: value
+        for name, value in counts.items()
+        if name in {"n_running_trials", "n_pending_trials"} and value
+    }
+    if unfinished:
+        raise ValueError(f"Harbor job still has active trials in {result_file}")
+    if counts["n_errored_trials"] or counts["n_cancelled_trials"]:
+        raise ValueError(f"Harbor job contains errored trials in {result_file}")
+    return {
+        "result_file": str(result_file),
+        "result_sha256": _file_sha256(result_file),
+        "n_total_trials": n_total,
+        "finished_at": finished,
+    }
+
+
 def _load_trial(
     *,
     result_file: Path,
     arm: str,
     task_root: Path,
+    task_metadata_cache: dict[str, dict[str, Any]],
     solve_threshold: float,
 ) -> dict[str, Any]:
     try:
@@ -183,7 +255,14 @@ def _load_trial(
         raise ValueError(f"missing task_checksum in {result_file}")
     model = _model_identity(data, result_file)
     usage = _usage(data, result_file)
-    task_metadata = _task_metadata(task_root, task)
+    task_metadata = task_metadata_cache.get(task)
+    if task_metadata is None:
+        task_metadata = _task_metadata(task_root, task)
+        task_metadata_cache[task] = task_metadata
+    if checksum != task_metadata["task_checksum"]:
+        raise ValueError(
+            f"task checksum in {result_file} does not match checkout task {task}"
+        )
     duration = _duration_seconds(data, result_file)
     return {
         "arm": arm,
@@ -212,9 +291,9 @@ def _reward(data: dict[str, Any], result_file: Path) -> float:
         detail = _exception_name(exception)
         raise ValueError(f"missing verifier result in {result_file} ({detail})")
     rewards = verifier.get("rewards")
-    if not isinstance(rewards, dict) or not rewards:
-        raise ValueError(f"missing verifier rewards in {result_file}")
-    raw = rewards.get("reward", next(iter(rewards.values())))
+    if not isinstance(rewards, dict) or "reward" not in rewards:
+        raise ValueError(f"missing canonical verifier reward in {result_file}")
+    raw = rewards["reward"]
     return _unit_interval(raw, f"reward in {result_file}")
 
 
@@ -295,7 +374,47 @@ def _task_metadata(task_root: Path, task: str) -> dict[str, Any]:
     category = metadata.get("category")
     if not isinstance(category, str) or not category:
         raise ValueError(f"task {task} lacks metadata.category")
-    return {"expert_time_estimate_min": expert_time, "category": category}
+    return {
+        "expert_time_estimate_min": expert_time,
+        "category": category,
+        "task_checksum": _task_directory_sha256(path.parent),
+    }
+
+
+def _task_directory_sha256(directory: Path) -> str:
+    """Match Harbor's default ``dirhash(directory, "sha256")`` protocol.
+
+    LHTB's pinned task tree contains ordinary files and directories. Symlinks and
+    special files are rejected here rather than applying subtly different traversal
+    semantics from Harbor's external ``dirhash`` dependency.
+    """
+
+    def hash_directory(path: Path) -> str | None:
+        descriptors: list[str] = []
+        for entry in path.iterdir():
+            if entry.is_symlink():
+                raise ValueError(
+                    f"cannot verify Harbor checksum for symlinked task entry: {entry}"
+                )
+            if entry.is_dir():
+                child_hash = hash_directory(entry)
+                if child_hash is not None:
+                    descriptors.append(f"dirhash:{child_hash}\0name:{entry.name}")
+            elif entry.is_file():
+                descriptors.append(f"data:{_file_sha256(entry)}\0name:{entry.name}")
+            else:
+                raise ValueError(
+                    f"cannot verify Harbor checksum for special task entry: {entry}"
+                )
+        if not descriptors:
+            return None
+        descriptor = "\0\0".join(sorted(descriptors))
+        return hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
+
+    result = hash_directory(directory)
+    if result is None:
+        raise ValueError(f"cannot hash empty task directory: {directory}")
+    return result
 
 
 def _duration_seconds(data: dict[str, Any], result_file: Path) -> float | None:
@@ -419,7 +538,9 @@ def _aggregate_arm(
     }
 
 
-def _compare_to_stock(stock: dict[str, Any], arm: dict[str, Any]) -> dict[str, Any]:
+def _compare_to_stock(
+    stock: dict[str, Any], arm: dict[str, Any], *, comparable: bool
+) -> dict[str, Any]:
     stock_tasks = {item["task"]: item for item in stock["task_curve"]}
     arm_tasks = {item["task"]: item for item in arm["task_curve"]}
     shared = sorted(set(stock_tasks) & set(arm_tasks))
@@ -441,13 +562,29 @@ def _compare_to_stock(stock: dict[str, Any], arm: dict[str, Any]) -> dict[str, A
         "mean_task_failure_rate_delta": _mean_or_none(
             [item["failure_rate_delta"] for item in task_deltas]
         ),
-        "mean_total_tokens_per_trial_delta": arm["mean_total_tokens_per_trial"]
-        - stock["mean_total_tokens_per_trial"],
-        "mean_cost_usd_per_trial_delta": arm["mean_cost_usd_per_trial"]
-        - stock["mean_cost_usd_per_trial"],
-        "failure_slope_delta": _optional_delta(
-            arm["failure_slope_per_task_length_doubling"],
-            stock["failure_slope_per_task_length_doubling"],
+        "aggregate_workload_comparable": comparable,
+        "aggregate_delta_status": (
+            "complete_task_attempt_matrix"
+            if comparable
+            else "unavailable_for_incomplete_task_attempt_matrix"
+        ),
+        "mean_total_tokens_per_trial_delta": (
+            arm["mean_total_tokens_per_trial"] - stock["mean_total_tokens_per_trial"]
+            if comparable
+            else None
+        ),
+        "mean_cost_usd_per_trial_delta": (
+            arm["mean_cost_usd_per_trial"] - stock["mean_cost_usd_per_trial"]
+            if comparable
+            else None
+        ),
+        "failure_slope_delta": (
+            _optional_delta(
+                arm["failure_slope_per_task_length_doubling"],
+                stock["failure_slope_per_task_length_doubling"],
+            )
+            if comparable
+            else None
         ),
         "tasks": task_deltas,
     }
@@ -507,6 +644,13 @@ def _nonnegative_integer(value: Any, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
+
+
+def _positive_integer(value: Any, name: str) -> int:
+    number = _nonnegative_integer(value, name)
+    if number == 0:
+        raise ValueError(f"{name} must be positive")
+    return number
 
 
 def _mean(values: Sequence[float]) -> float:

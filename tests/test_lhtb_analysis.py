@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from driftlock.lhtb_analysis import (
+    _task_directory_sha256,
     analyze_jobs,
     goal_drift_actions,
     goal_drift_inaction,
@@ -69,19 +70,45 @@ def _result(
     return result
 
 
+def _job_summary(
+    job: Path,
+    n_total_trials: int,
+    *,
+    completed: int | None = None,
+    errors: int = 0,
+) -> None:
+    payload = {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "started_at": "2026-08-20T09:00:00+00:00",
+        "finished_at": "2026-08-20T11:00:00+00:00",
+        "n_total_trials": n_total_trials,
+        "stats": {
+            "n_completed_trials": (n_total_trials if completed is None else completed),
+            "n_errored_trials": errors,
+            "n_running_trials": 0,
+            "n_pending_trials": 0,
+            "n_cancelled_trials": 0,
+        },
+    }
+    (job / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
     lhtb = tmp_path / "LHTB"
     _task(lhtb, "short", expert_minutes=60, category="build")
     _task(lhtb, "long", expert_minutes=240, category="debug")
     stock = tmp_path / "stock"
     driftlock = tmp_path / "driftlock"
-    _result(stock, "short-1", "short", 1.0)
-    _result(stock, "long-1", "long", 0.0)
+    short_checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    long_checksum = _task_directory_sha256(lhtb / "tasks" / "long")
+    _result(stock, "short-1", "short", 1.0, checksum=short_checksum)
+    _result(stock, "long-1", "long", 0.0, checksum=long_checksum)
     _result(
         driftlock,
         "short-1",
         "short",
         1.0,
+        checksum=short_checksum,
         usage={
             "n_input_tokens": 80,
             "n_cache_tokens": 40,
@@ -94,6 +121,7 @@ def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
         "long-1",
         "long",
         1.0,
+        checksum=long_checksum,
         usage={
             "n_input_tokens": 120,
             "n_cache_tokens": 60,
@@ -101,6 +129,8 @@ def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
             "cost_usd": 0.3,
         },
     )
+    _job_summary(stock, 2)
+    _job_summary(driftlock, 2)
     return lhtb, stock, driftlock
 
 
@@ -126,6 +156,17 @@ def test_parse_arm_directories_is_strict() -> None:
         parse_arm_directories(["stock"])
 
 
+def test_task_checksum_matches_harbor_dirhash_protocol(tmp_path: Path) -> None:
+    task = tmp_path / "task"
+    (task / "nested").mkdir(parents=True)
+    (task / "a.txt").write_text("alpha\n", encoding="utf-8")
+    (task / "nested" / "b.bin").write_bytes(b"\x00beta")
+
+    assert _task_directory_sha256(task) == (
+        "51e6bc9129e8b8237e4c94c464058306cf66e836d26c78b32883b852f0e751da"
+    )
+
+
 def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     tmp_path: Path,
 ) -> None:
@@ -137,6 +178,8 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     )
 
     assert report["matrix"]["complete"] is True
+    assert report["job_summaries"]["stock"]["n_total_trials"] == 2
+    assert len(report["job_summaries"]["stock"]["result_sha256"]) == 64
     assert report["matrix"]["agent_model"] == ("openrouter/deepseek/deepseek-v4-pro")
     assert report["arms"]["stock"]["mean_reward"] == 0.5
     assert report["arms"]["stock"][
@@ -170,7 +213,7 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     ("mutation", "message"),
     [
         ("matrix", "attempt matrix"),
-        ("checksum", "checksum differs"),
+        ("checksum", "does not match checkout"),
         ("model", "different agent models"),
     ],
 )
@@ -179,7 +222,14 @@ def test_analyze_rejects_noncomparable_arms(
 ) -> None:
     lhtb, stock, driftlock = _complete_jobs(tmp_path)
     if mutation == "matrix":
-        _result(driftlock, "long-2", "long", 1.0)
+        _result(
+            driftlock,
+            "long-2",
+            "long",
+            1.0,
+            checksum=_task_directory_sha256(lhtb / "tasks" / "long"),
+        )
+        _job_summary(driftlock, 3)
     elif mutation == "checksum":
         payload_path = driftlock / "long-1" / "result.json"
         payload = json.loads(payload_path.read_text())
@@ -202,9 +252,45 @@ def test_analyze_rejects_infrastructure_failure_instead_of_scoring_it(
     tmp_path: Path,
 ) -> None:
     lhtb, stock, driftlock = _complete_jobs(tmp_path)
-    _result(stock, "failed", "short", None, exception="AgentTimeoutError")
+    _result(
+        stock,
+        "failed",
+        "short",
+        None,
+        checksum=_task_directory_sha256(lhtb / "tasks" / "short"),
+        exception="AgentTimeoutError",
+    )
+    _job_summary(stock, 3, errors=1)
 
-    with pytest.raises(ValueError, match="AgentTimeoutError"):
+    with pytest.raises(ValueError, match="errored trials"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_requires_canonical_reward_key(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["verifier_result"]["rewards"] = {
+        "style": 0.9,
+        "correctness": 0.1,
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical verifier reward"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_rejects_incomplete_harbor_job(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _job_summary(driftlock, 2, completed=1)
+
+    with pytest.raises(ValueError, match="job is incomplete"):
         analyze_jobs(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
@@ -267,8 +353,22 @@ def test_analyze_can_explicitly_report_an_incomplete_matrix(tmp_path: Path) -> N
     _task(lhtb, "other-only", expert_minutes=20, category="two")
     stock = tmp_path / "stock"
     retry = tmp_path / "retry"
-    _result(stock, "one", "stock-only", 1.0)
-    _result(retry, "two", "other-only", 0.0)
+    _result(
+        stock,
+        "one",
+        "stock-only",
+        1.0,
+        checksum=_task_directory_sha256(lhtb / "tasks" / "stock-only"),
+    )
+    _result(
+        retry,
+        "two",
+        "other-only",
+        0.0,
+        checksum=_task_directory_sha256(lhtb / "tasks" / "other-only"),
+    )
+    _job_summary(stock, 1)
+    _job_summary(retry, 1)
 
     report = analyze_jobs(
         lhtb_dir=lhtb,
@@ -280,6 +380,10 @@ def test_analyze_can_explicitly_report_an_incomplete_matrix(tmp_path: Path) -> N
     comparison = report["paired_vs_stock"]["retry"]
     assert comparison["shared_task_count"] == 0
     assert comparison["mean_task_reward_delta"] is None
+    assert comparison["mean_total_tokens_per_trial_delta"] is None
+    assert comparison["mean_cost_usd_per_trial_delta"] is None
+    assert comparison["failure_slope_delta"] is None
+    assert comparison["aggregate_workload_comparable"] is False
 
 
 def test_analyze_cli_writes_report(tmp_path: Path) -> None:

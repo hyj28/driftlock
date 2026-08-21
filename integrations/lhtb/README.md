@@ -163,8 +163,11 @@ The default rejects unequal task/attempt matrices, changed task checksums, mixed
 models, missing rewards, and absent or invalid token/cost usage. The report retains
 the path and SHA-256 of every source result, computes paired per-task deltas and the
 failure-rate slope per doubling of expert task time, and names any missing planned
-arm. `--allow-incomplete-matrix` is available only for explicitly exploratory
-reports and records `matrix.complete=false`.
+arm. It also verifies that each job summary is finished and error-free and recomputes
+Harbor's task-directory checksum before using the checkout's expert-time metadata.
+`--allow-incomplete-matrix` is available only for explicitly exploratory reports and
+records `matrix.complete=false`; aggregate token, cost, and slope deltas are `null`
+for any arm whose workload does not match stock.
 
 `GD_actions` and `GD_inaction` follow the commission/omission formulas in
 [Arike et al. (2025)](https://arxiv.org/abs/2505.02709). They require task-specific

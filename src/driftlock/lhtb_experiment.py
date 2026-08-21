@@ -489,9 +489,9 @@ def _primary_reward(data: dict[str, Any]) -> float | None:
     if not isinstance(verifier, dict):
         return None
     rewards = verifier.get("rewards")
-    if not isinstance(rewards, dict) or not rewards:
+    if not isinstance(rewards, dict) or "reward" not in rewards:
         return None
-    value = rewards.get("reward", next(iter(rewards.values())))
+    value = rewards["reward"]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("reward is not numeric")
     result = float(value)
