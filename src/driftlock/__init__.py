@@ -4,11 +4,13 @@ from driftlock.agent import (
     AgentCompletion,
     AgentCompletionRequest,
     AgentConversationCodec,
+    AgentPrefillEstimator,
     AgentProviderError,
     AgentStateError,
     ToolCall,
     ToolCallingAgent,
     ToolDefinition,
+    conservative_prefill_estimate,
 )
 from driftlock.checkpoints import DirectoryCheckpointStore, SnapshotIntegrityError
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
@@ -68,6 +70,7 @@ __all__ = [
     "AgentCompletion",
     "AgentCompletionRequest",
     "AgentConversationCodec",
+    "AgentPrefillEstimator",
     "AgentProviderError",
     "AgentStateError",
     "CallableLLMJudge",
@@ -110,6 +113,7 @@ __all__ = [
     "WorkspaceDeltaObserver",
     "WorkspaceSnapshot",
     "analyze_jobs",
+    "conservative_prefill_estimate",
     "goal_drift_actions",
     "goal_drift_inaction",
     "lhtb_experiment_fingerprint",

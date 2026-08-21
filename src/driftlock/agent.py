@@ -7,7 +7,7 @@ import posixpath
 import shlex
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
@@ -88,6 +88,27 @@ class AgentCompletionRequest:
 
 
 AgentCompletionCallable = Callable[[AgentCompletionRequest], Awaitable[AgentCompletion]]
+AgentPrefillEstimator = Callable[[AgentCompletionRequest], int]
+
+
+def conservative_prefill_estimate(request: AgentCompletionRequest) -> int:
+    """Conservatively estimate request prefill without a tokenizer dependency."""
+
+    payload = {
+        "messages": request.messages,
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in request.tools
+        ],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    # A UTF-8 byte is the smallest unit a byte-level tokenizer can consume. The
+    # fixed reserve covers provider-specific chat and tool framing omitted here.
+    return len(serialized.encode("utf-8")) + 256
 
 
 class _ExecResult(Protocol):
@@ -184,12 +205,20 @@ class ToolCallingAgent:
         complete: AgentCompletionCallable,
         *,
         max_output_tokens: int = 4096,
+        min_output_tokens: int = 64,
+        prefill_estimator: AgentPrefillEstimator = conservative_prefill_estimate,
         max_tool_output_chars: int = 16_000,
         shell_timeout_sec: int = 60,
         codec: AgentConversationCodec | None = None,
     ) -> None:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
+        if min_output_tokens <= 0:
+            raise ValueError("min_output_tokens must be positive")
+        if min_output_tokens > max_output_tokens:
+            raise ValueError("min_output_tokens cannot exceed max_output_tokens")
+        if not callable(prefill_estimator):
+            raise TypeError("prefill_estimator must be callable")
         if max_tool_output_chars < 128:
             raise ValueError("max_tool_output_chars must be at least 128")
         if shell_timeout_sec <= 0:
@@ -198,6 +227,8 @@ class ToolCallingAgent:
         self.observer = observer
         self._complete = complete
         self.max_output_tokens = max_output_tokens
+        self.min_output_tokens = min_output_tokens
+        self._prefill_estimator = prefill_estimator
         self.max_tool_output_chars = max_tool_output_chars
         self.shell_timeout_sec = shell_timeout_sec
         self.codec = codec or AgentConversationCodec()
@@ -206,15 +237,18 @@ class ToolCallingAgent:
         return self.codec.initial_state()
 
     async def __call__(self, context: StepContext) -> StepOutcome:
-        output_cap = self._output_cap(context.tokens_remaining)
         history, completed_steps = self.codec.decode(context.state)
-        workspace = await self.observer.canonical_workspace()
-        before, before_error = await self._snapshot_workspace()
         request = AgentCompletionRequest(
             messages=self._request_messages(context, history),
             tools=_TOOL_DEFINITIONS,
-            max_output_tokens=output_cap,
+            max_output_tokens=self.max_output_tokens,
         )
+        request = replace(
+            request,
+            max_output_tokens=self._output_cap(context.tokens_remaining, request),
+        )
+        workspace = await self.observer.canonical_workspace()
+        before, before_error = await self._snapshot_workspace()
 
         try:
             completion = await self._complete(request)
@@ -286,17 +320,30 @@ class ToolCallingAgent:
             summary=summary,
         )
 
-    def _output_cap(self, tokens_remaining: int | None) -> int:
+    def _output_cap(
+        self,
+        tokens_remaining: int | None,
+        request: AgentCompletionRequest,
+    ) -> int:
         if tokens_remaining is not None:
             if not isinstance(tokens_remaining, int) or isinstance(
                 tokens_remaining, bool
             ):
                 raise TypeError("tokens_remaining must be an integer or None")
-            if tokens_remaining <= 0:
+            estimated_prefill = self._prefill_estimator(request)
+            if not isinstance(estimated_prefill, int) or isinstance(
+                estimated_prefill, bool
+            ):
+                raise TypeError("prefill_estimator must return an integer")
+            if estimated_prefill < 0:
+                raise ValueError("prefill_estimator must return a non-negative integer")
+            if tokens_remaining < estimated_prefill + self.min_output_tokens:
                 raise StepTokenBudgetExhausted(
-                    "no output-token allowance remains for another provider call"
+                    "remaining token budget cannot cover estimated prefill "
+                    f"({estimated_prefill}) plus minimum output allowance "
+                    f"({self.min_output_tokens})"
                 )
-            return min(self.max_output_tokens, tokens_remaining)
+            return min(self.max_output_tokens, tokens_remaining - estimated_prefill)
         return self.max_output_tokens
 
     def _request_messages(

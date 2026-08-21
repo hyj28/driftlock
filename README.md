@@ -181,7 +181,7 @@ snapshots = Path("/path/to/snapshots")  # must be outside workspace
 
 async def next_step(context):
     # Ask your agent for one action, execute it, and return its new state.
-    # Cap the provider request at context.tokens_remaining when it is not None.
+    # Reserve request prefill, then cap output by the remaining token allowance.
     return StepOutcome(
         action="pytest -q",
         state={"messages": []},
@@ -351,8 +351,11 @@ receive metadata-only edits and changes made to files that were already dirty as
 as newly changed paths.
 
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
-receives `context.tokens_remaining` and must use it to cap the provider request, then
-report actual billed tokens in `StepOutcome.tokens`, including failed model calls.
+receives the total remaining budget in `context.tokens_remaining`. Before issuing a
+provider call, it must reserve the request prefill plus a usable output allowance;
+when that cannot fit, it must raise `StepTokenBudgetExhausted`. Otherwise it caps output
+at the smaller of its configured maximum and the budget left after prefill, then reports
+actual billed tokens in `StepOutcome.tokens`, including failed model calls.
 Unexpected adapter exceptions propagate because treating them as zero-token agent
 steps would corrupt compute-matched experiments. For fine judges, return
 `JudgeCompletion(text=..., tokens=...)` from the completion callback to include judge

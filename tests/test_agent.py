@@ -16,6 +16,7 @@ from driftlock.agent import (
     ToolCall,
     ToolCallingAgent,
     _truncate,
+    conservative_prefill_estimate,
 )
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
@@ -427,15 +428,38 @@ async def test_token_cap_and_preflight_exhaustion(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     provider = ScriptedCompletion([AgentCompletion(tokens=3)])
-    agent = _agent(workspace, provider, max_output_tokens=80)
+    estimated_requests: list[AgentCompletionRequest] = []
 
-    outcome = await agent(_context(agent.initial_state(), tokens_remaining=12))
+    def estimate_prefill(request: AgentCompletionRequest) -> int:
+        estimated_requests.append(request)
+        return 11
+
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        max_output_tokens=80,
+        min_output_tokens=4,
+        prefill_estimator=estimate_prefill,
+    )
+
+    with pytest.raises(
+        StepTokenBudgetExhausted,
+        match=(
+            r"remaining token budget cannot cover estimated prefill \(11\) "
+            r"plus minimum output allowance \(4\)"
+        ),
+    ):
+        await agent(_context(agent.initial_state(), tokens_remaining=14))
+
+    assert provider.requests == []
+
+    outcome = await agent(_context(agent.initial_state(), tokens_remaining=15))
 
     assert outcome.tokens == 3
-    assert provider.requests[0].max_output_tokens == 12
-    with pytest.raises(StepTokenBudgetExhausted):
-        await agent(_context(dict(outcome.state), tokens_remaining=0))
+    assert provider.requests[0].max_output_tokens == 4
     assert len(provider.requests) == 1
+    assert [request.max_output_tokens for request in estimated_requests] == [80, 80]
 
 
 async def test_failed_provider_call_is_a_billed_step(tmp_path: Path) -> None:
@@ -510,9 +534,16 @@ async def test_runner_token_limit_counts_new_agent_billing(tmp_path: Path) -> No
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     provider = ScriptedCompletion(
-        [AgentCompletion(tokens=6), AgentCompletion(tokens=4)]
+        [AgentCompletion(tokens=6), AgentCompletion(tokens=8)]
     )
-    agent = _agent(workspace, provider)
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        max_output_tokens=100,
+        min_output_tokens=3,
+        prefill_estimator=lambda _request: 5,
+    )
     result = await DriftlockRunner(
         DirectoryCheckpointStore(workspace, tmp_path / "snapshots"),
         HeuristicJudge(
@@ -524,13 +555,23 @@ async def test_runner_token_limit_counts_new_agent_billing(tmp_path: Path) -> No
                 reward_stall_steps=10,
             )
         ),
-        config=RunnerConfig(max_steps=5, max_tokens=10),
+        config=RunnerConfig(max_steps=5, max_tokens=14),
     ).run(goal="bounded", step=agent, initial_state=agent.initial_state())
 
     assert result.status is RunStatus.TOKEN_LIMIT
-    assert result.agent_tokens_used == 10
-    assert [request.max_output_tokens for request in provider.requests] == [10, 4]
-    assert [record.outcome.tokens for record in result.steps] == [6, 4]
+    assert result.agent_tokens_used == 14
+    assert [request.max_output_tokens for request in provider.requests] == [9, 3]
+    assert [record.outcome.tokens for record in result.steps] == [6, 8]
+
+
+def test_default_prefill_estimator_reserves_utf8_bytes_and_framing() -> None:
+    request = AgentCompletionRequest(
+        messages=({"role": "user", "content": "é"},),
+        tools=(),
+        max_output_tokens=100,
+    )
+
+    assert conservative_prefill_estimate(request) == 318
 
 
 async def test_runner_counts_failed_provider_usage(tmp_path: Path) -> None:
@@ -541,7 +582,7 @@ async def test_runner_counts_failed_provider_usage(tmp_path: Path) -> None:
     result = await DriftlockRunner(
         DirectoryCheckpointStore(workspace, tmp_path / "snapshots"),
         HeuristicJudge(),
-        config=RunnerConfig(max_steps=3, max_tokens=7),
+        config=RunnerConfig(max_steps=3, max_tokens=2_152),
     ).run(goal="bounded", step=agent, initial_state=agent.initial_state())
 
     assert result.status is RunStatus.TOKEN_LIMIT
