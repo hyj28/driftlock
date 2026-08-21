@@ -231,7 +231,7 @@ def _job_summary(
         lock_trials.append(
             {
                 "task": {
-                    "name": trial["task_name"],
+                    "name": trial["task_name"].split("/")[-1],
                     "type": "local",
                     "digest": f"sha256:{trial['task_checksum']}",
                     "source": None,

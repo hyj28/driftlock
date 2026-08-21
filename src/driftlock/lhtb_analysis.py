@@ -107,7 +107,7 @@ def analyze_jobs(
         directory = raw_directory.expanduser().resolve()
         if not directory.is_dir():
             raise FileNotFoundError(directory)
-        job_summaries[arm] = _load_job_summary(directory, arm)
+        job_summaries[arm] = _load_job_summary(directory, arm, task_index)
         files = sorted(directory.glob("*/result.json"))
         if not files:
             raise ValueError(f"arm {arm!r} contains no Harbor result.json files")
@@ -208,7 +208,9 @@ def analyze_jobs(
     }
 
 
-def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
+def _load_job_summary(
+    directory: Path, arm: str, task_index: Mapping[str, Path]
+) -> dict[str, Any]:
     result_file = directory / "result.json"
     if not result_file.is_file():
         raise ValueError(f"arm {arm!r} lacks its Harbor job-level result.json")
@@ -277,7 +279,7 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
     }
     if usage["cache_tokens"] > usage["input_tokens"]:
         raise ValueError(f"job cache tokens exceed input tokens in {result_file}")
-    lock = _load_job_lock(directory, arm, n_total)
+    lock = _load_job_lock(directory, arm, n_total, task_index)
     return {
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
@@ -290,7 +292,12 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
     }
 
 
-def _load_job_lock(directory: Path, arm: str, n_total: int) -> dict[str, Any]:
+def _load_job_lock(
+    directory: Path,
+    arm: str,
+    n_total: int,
+    task_index: Mapping[str, Path],
+) -> dict[str, Any]:
     lock_file = directory / "lock.json"
     if not lock_file.is_file():
         raise ValueError(f"arm {arm!r} lacks its canonical Harbor lock.json")
@@ -317,12 +324,14 @@ def _load_job_lock(directory: Path, arm: str, n_total: int) -> dict[str, Any]:
     if not isinstance(trials, list) or len(trials) != n_total:
         raise ValueError(f"Harbor lock trial count mismatch in {lock_file}")
     fingerprint = lhtb_experiment_fingerprint()
+    basename_index = {path.name: name for name, path in task_index.items()}
     task_counts: dict[str, int] = defaultdict(int)
     trial_signatures: list[str] = []
     for trial in trials:
         task = trial.get("task") if isinstance(trial, dict) else None
         agent = trial.get("agent") if isinstance(trial, dict) else None
         name = task.get("name") if isinstance(task, dict) else None
+        raw_task_path = task.get("path") if isinstance(task, dict) else None
         digest = task.get("digest") if isinstance(task, dict) else None
         environment = agent.get("env") if isinstance(agent, dict) else None
         if (
@@ -333,8 +342,17 @@ def _load_job_lock(directory: Path, arm: str, n_total: int) -> dict[str, Any]:
             or environment.get("DRIFTLOCK_EXPERIMENT_FINGERPRINT") != fingerprint
         ):
             raise ValueError(f"invalid trial provenance in Harbor lock: {lock_file}")
-        task_counts[name] += 1
-        trial_signatures.append(_lock_trial_signature(name, trial))
+        canonical_name = name if name in task_index else basename_index.get(name)
+        if canonical_name is None:
+            raise ValueError(f"unknown task in Harbor lock: {name}")
+        expected_directory = task_index[canonical_name].name
+        if (
+            not isinstance(raw_task_path, str)
+            or Path(raw_task_path).name != expected_directory
+        ):
+            raise ValueError(f"task path mismatch in Harbor lock: {lock_file}")
+        task_counts[canonical_name] += 1
+        trial_signatures.append(_lock_trial_signature(canonical_name, trial))
     signature_payload = {
         "schema_version": 1,
         "harbor": harbor,
