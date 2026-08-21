@@ -221,6 +221,8 @@ class LHTBDriftlockAgent(Terminus2):
                 ),
             )
         except BaseException:
+            if self._driftlock_judge_client is not None:
+                self._driftlock_judge_client.apply_accounting(context)
             self._write_phase_record(None, phase_store, retained=True)
             raise
 
@@ -534,6 +536,7 @@ class _LHTBJudgeClient:
 
         started = time.monotonic()
         response: Any | None = None
+        fatal_error: BaseException | None = None
         try:
             call = getattr(self.llm.call, "__wrapped__", None)
             if call is None:
@@ -547,9 +550,11 @@ class _LHTBJudgeClient:
                 timeout=self.timeout_sec,
             )
             content = response.content
-        except Exception as error:
+        except BaseException as error:
             response = getattr(error, "response", None)
             content = getattr(error, "truncated_response", None) or ""
+            if not isinstance(error, Exception):
+                fatal_error = error
         finally:
             self.request_times_msec.append((time.monotonic() - started) * 1000)
 
@@ -572,6 +577,8 @@ class _LHTBJudgeClient:
         self.n_cache_tokens += cache_tokens
         self.n_output_tokens += completion_tokens
         self.cost_usd += cost_usd
+        if fatal_error is not None:
+            raise fatal_error
         return JudgeCompletion(
             text=content,
             tokens=prompt_tokens + completion_tokens,

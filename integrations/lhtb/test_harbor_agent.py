@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -57,6 +58,7 @@ class FakeRunner:
     calls = 0
     budgets: ClassVar[list[int | None]] = []
     fine_judges: ClassVar[list[Any]] = []
+    raise_on_call: ClassVar[int | None] = None
 
     def __init__(self, store: Any, judge: Any, *, fine_judge: Any = None, config: Any):
         self.store = store
@@ -81,6 +83,8 @@ class FakeRunner:
             "api_request_times_msec": [100] * count,
             "terminal_interaction_times_msec": [20] * count,
         }
+        if count == type(self).raise_on_call:
+            raise TimeoutError("simulated later-phase timeout")
         state = TerminusConversationState(
             messages=(
                 {"role": "user", "content": f"phase {count}"},
@@ -117,6 +121,7 @@ def fake_components(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeRunner.calls = 0
     FakeRunner.budgets = []
     FakeRunner.fine_judges = []
+    FakeRunner.raise_on_call = None
     FakeStore.restores = []
     FakeStore.creates = []
     monkeypatch.setattr(plugin, "HarborWorkspaceDeltaObserver", lambda *a, **k: None)
@@ -179,6 +184,61 @@ async def test_same_conversation_resume_keeps_cumulative_accounting(
     assert context.n_output_tokens == 6
     assert context.metadata["n_episodes"] == 2
     assert len(context.rollout_details) == 2
+
+
+@pytest.mark.asyncio
+async def test_later_phase_exception_restores_cumulative_judge_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLiteLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def call(self, prompt: str, **kwargs: Any) -> Any:
+            raise AssertionError("judge provider is not called by FakeRunner")
+
+    FakeLiteLLM.call.__wrapped__ = FakeLiteLLM.call  # type: ignore[attr-defined]
+    monkeypatch.setattr(plugin, "LiteLLM", FakeLiteLLM)
+    (tmp_path / "agent").mkdir()
+    agent = plugin.LHTBDriftlockAgent(
+        logs_dir=tmp_path / "agent",
+        model_name="fake-provider/fake-model",
+        enable_summarize=False,
+        record_terminal_session=False,
+        driftlock_retain_checkpoints=True,
+        driftlock_judge_model=plugin.PINNED_LHTB_JUDGE_MODEL,
+    )
+    environment = SimpleNamespace(
+        default_user="root", task_env_config=SimpleNamespace(workdir="/app")
+    )
+    context = AgentContext()
+    client = agent._driftlock_judge_client
+    assert client is not None
+    client.n_input_tokens = 10
+    client.n_cache_tokens = 3
+    client.n_output_tokens = 2
+    client.cost_usd = 0.01
+    client.request_times_msec = [5.0]
+
+    await agent.run("task", environment, context)
+    assert context.n_input_tokens == 20
+    client.n_input_tokens = 20
+    client.n_cache_tokens = 6
+    client.n_output_tokens = 4
+    client.cost_usd = 0.02
+    client.request_times_msec = [5.0, 7.0]
+    FakeRunner.raise_on_call = 2
+
+    with pytest.raises(TimeoutError, match="later-phase timeout"):
+        await agent.resume_after_verifier_rejection("rejected", context)
+
+    assert context.n_input_tokens == 40
+    assert context.n_cache_tokens == 10
+    assert context.n_output_tokens == 10
+    assert context.cost_usd == pytest.approx(1.02)
+    assert context.metadata["api_request_times_msec"] == [100, 100, 5.0, 7.0]
+    assert context.metadata["driftlock_judge_usage"]["input_tokens"] == 20
 
 
 @pytest.mark.asyncio
@@ -426,6 +486,38 @@ async def test_judge_client_conservatively_prices_missing_usage(
     )
     assert completion.tokens == expected_input + 50
     assert client.cost_usd == pytest.approx(expected_cost)
+    assert client.usage_fallbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_judge_call_is_accounted_then_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CancelledLiteLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def call(self, prompt: str, **kwargs: Any) -> Any:
+            raise AssertionError("decorated call must be bypassed")
+
+    async def unwrapped(llm: CancelledLiteLLM, *, prompt: str, **kwargs: Any) -> Any:
+        raise asyncio.CancelledError
+
+    CancelledLiteLLM.call.__wrapped__ = unwrapped  # type: ignore[attr-defined]
+    monkeypatch.setattr(plugin, "LiteLLM", CancelledLiteLLM)
+    client = plugin._LHTBJudgeClient(
+        model=plugin.PINNED_LHTB_JUDGE_MODEL,
+        api_base=None,
+        max_output_tokens=50,
+        timeout_sec=10,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.complete("judge this", tokens_remaining=1_000)
+
+    assert client.n_input_tokens == len(b"judge this") + 256
+    assert client.n_output_tokens == 50
+    assert client.cost_usd > 0
     assert client.usage_fallbacks == 1
 
 
