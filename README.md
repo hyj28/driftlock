@@ -332,7 +332,9 @@ analyzer requires identical task/attempt matrices, task checksums, and model ide
 it rejects missing rewards or usage instead of silently turning infrastructure errors
 into model failures. It also requires each Harbor job summary to be finished and
 error-free, and verifies each recorded task checksum against the selected LHTB
-checkout. Every input `result.json` path and SHA-256 is retained.
+checkout. Arm labels are checked against the pinned agent configuration, controlled
+arms must share one total-token budget, and every trial's job ID and name must match
+its job summary and directory. Every input `result.json` path and SHA-256 is retained.
 
 ```bash
 driftlock-lhtb analyze --lhtb-dir /srv/LHTB \

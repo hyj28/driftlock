@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 ANALYSIS_ARMS = (
     "stock",
@@ -121,6 +122,7 @@ def analyze_jobs(
                 _load_trial(
                     result_file=resolved,
                     arm=arm,
+                    job_id=job_summaries[arm]["job_id"],
                     task_root=task_root,
                     task_metadata_cache=task_metadata_cache,
                     solve_threshold=solve_threshold,
@@ -185,6 +187,7 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
         raise ValueError(f"invalid JSON in {result_file}: {error}") from error
     if not isinstance(data, dict):
         raise ValueError(f"Harbor job result must be an object: {result_file}")
+    job_id = _uuid_string(data.get("id"), f"job id in {result_file}")
     n_total = _positive_integer(
         data.get("n_total_trials"), f"n_total_trials in {result_file}"
     )
@@ -225,6 +228,7 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
     return {
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
+        "job_id": job_id,
         "n_total_trials": n_total,
         "finished_at": finished,
     }
@@ -234,6 +238,7 @@ def _load_trial(
     *,
     result_file: Path,
     arm: str,
+    job_id: str,
     task_root: Path,
     task_metadata_cache: dict[str, dict[str, Any]],
     solve_threshold: float,
@@ -244,6 +249,7 @@ def _load_trial(
         raise ValueError(f"invalid JSON in {result_file}: {error}") from error
     if not isinstance(data, dict):
         raise ValueError(f"Harbor result must be an object: {result_file}")
+    _validate_trial_provenance(data, result_file, job_id)
     task = data.get("task_name")
     if not isinstance(task, str) or not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]*", task
@@ -254,6 +260,7 @@ def _load_trial(
     if not isinstance(checksum, str) or not checksum:
         raise ValueError(f"missing task_checksum in {result_file}")
     model = _model_identity(data, result_file)
+    total_token_budget = _validate_arm_identity(data, arm, model, result_file)
     usage = _usage(data, result_file)
     task_metadata = task_metadata_cache.get(task)
     if task_metadata is None:
@@ -271,6 +278,7 @@ def _load_trial(
         "solved": reward >= solve_threshold,
         "task_checksum": checksum,
         "model": model,
+        "total_token_budget": total_token_budget,
         "expert_time_estimate_min": task_metadata["expert_time_estimate_min"],
         "category": task_metadata["category"],
         "input_tokens": usage["input_tokens"],
@@ -282,6 +290,115 @@ def _load_trial(
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
     }
+
+
+def _validate_trial_provenance(
+    data: dict[str, Any], result_file: Path, job_id: str
+) -> None:
+    trial_name = data.get("trial_name")
+    if not isinstance(trial_name, str) or trial_name != result_file.parent.name:
+        raise ValueError(f"trial_name does not match directory in {result_file}")
+    config = data.get("config")
+    if not isinstance(config, dict):
+        raise ValueError(f"missing trial config in {result_file}")
+    config_trial_name = config.get("trial_name")
+    if config_trial_name != trial_name:
+        raise ValueError(f"config trial_name mismatch in {result_file}")
+    config_job_id = _uuid_string(
+        config.get("job_id"), f"trial config job_id in {result_file}"
+    )
+    if config_job_id != job_id:
+        raise ValueError(f"trial belongs to a different Harbor job: {result_file}")
+
+
+def _validate_arm_identity(
+    data: dict[str, Any], arm: str, model: str, result_file: Path
+) -> int | None:
+    agent_info = data.get("agent_info")
+    info_name = agent_info.get("name") if isinstance(agent_info, dict) else None
+    config = data.get("config")
+    agent = config.get("agent") if isinstance(config, dict) else None
+    if not isinstance(agent, dict):
+        raise ValueError(f"missing trial agent config in {result_file}")
+    if agent.get("model_name") != model:
+        raise ValueError(f"agent config model does not match result in {result_file}")
+    kwargs = agent.get("kwargs")
+    environment = agent.get("env")
+    if not isinstance(kwargs, dict) or not isinstance(environment, dict):
+        raise ValueError(f"invalid trial agent config in {result_file}")
+
+    if arm == "stock":
+        llm_kwargs = kwargs.get("llm_call_kwargs")
+        valid = (
+            info_name == "terminus-2"
+            and agent.get("name") == "terminus-2"
+            and agent.get("import_path") is None
+            and environment.get("HB_CONTINUE_MODE") == "fresh"
+            and kwargs.get("enable_summarize") is True
+            and kwargs.get("proactive_summarization_threshold") == 8000
+            and isinstance(llm_kwargs, dict)
+            and llm_kwargs.get("num_retries") == 4
+        )
+        if not valid:
+            raise ValueError(f"arm 'stock' has a non-stock agent config: {result_file}")
+        return None
+
+    expected_import_path: str
+    expected_name: str
+    if arm == "retry":
+        expected_import_path = "driftlock.harbor_agent:LHTBBlindRetryAgent"
+        expected_name = "compute-matched-blind-retry-terminus-2"
+    elif arm in {"driftlock-heuristic", "driftlock"}:
+        expected_import_path = "driftlock.harbor_agent:LHTBDriftlockAgent"
+        expected_name = "driftlock-terminus-2"
+    else:
+        expected_import_path = "driftlock.oracle:LHTBCheckpointReplayOracle"
+        expected_name = "driftlock-checkpoint-replay-oracle"
+
+    valid = (
+        info_name == expected_name
+        and agent.get("name") is None
+        and agent.get("import_path") == expected_import_path
+        and environment.get("HB_CONTINUE_MODE") == "same_conversation"
+        and kwargs.get("enable_summarize") is False
+    )
+    if not valid:
+        raise ValueError(f"arm {arm!r} has the wrong agent config: {result_file}")
+    if arm == "oracle":
+        if kwargs.get("driftlock_oracle_mode") != "isolated-checkpoint-replay":
+            raise ValueError(
+                f"oracle result lacks isolated replay provenance: {result_file}"
+            )
+        return None
+
+    budget = _positive_integer(
+        kwargs.get("driftlock_max_tokens"),
+        f"driftlock_max_tokens in {result_file}",
+    )
+    for field, expected in (
+        ("driftlock_max_steps", 500),
+        ("driftlock_max_rollbacks", 3),
+        ("driftlock_checkpoint_interval", 5),
+    ):
+        if kwargs.get(field) != expected:
+            raise ValueError(f"unexpected {field} in {result_file}")
+    judge_fields = {
+        "driftlock_judge_model",
+        "driftlock_judge_api_base",
+        "driftlock_judge_max_output_tokens",
+    }
+    if arm == "driftlock":
+        if (
+            not isinstance(kwargs.get("driftlock_judge_model"), str)
+            or not isinstance(kwargs.get("driftlock_judge_api_base"), str)
+            or kwargs.get("driftlock_judge_max_output_tokens") != 512
+        ):
+            raise ValueError(f"driftlock arm lacks its fine judge: {result_file}")
+    elif judge_fields & kwargs.keys():
+        raise ValueError(
+            f"arm {arm!r} unexpectedly enables a fine judge: {result_file}"
+        )
+    return budget
 
 
 def _reward(data: dict[str, Any], result_file: Path) -> float:
@@ -443,6 +560,7 @@ def _validate_matrix(
     task_counts: dict[str, dict[str, int]] = {}
     task_checksums: dict[str, set[str]] = defaultdict(set)
     models: set[str] = set()
+    arm_budgets: dict[str, set[int]] = defaultdict(set)
     for arm, trials in trials_by_arm.items():
         counts: dict[str, int] = defaultdict(int)
         for trial in trials:
@@ -450,6 +568,8 @@ def _validate_matrix(
             counts[task] += 1
             task_checksums[task].add(trial["task_checksum"])
             models.add(trial["model"])
+            if trial["total_token_budget"] is not None:
+                arm_budgets[arm].add(trial["total_token_budget"])
         task_counts[arm] = dict(sorted(counts.items()))
     mismatched_checksums = sorted(
         task for task, checksums in task_checksums.items() if len(checksums) != 1
@@ -462,6 +582,21 @@ def _validate_matrix(
         raise ValueError(
             "experiment arms use different agent models: " + ", ".join(sorted(models))
         )
+    inconsistent_budget_arms = sorted(
+        arm for arm, budgets in arm_budgets.items() if len(budgets) != 1
+    )
+    if inconsistent_budget_arms:
+        raise ValueError(
+            "arm uses inconsistent total-token budgets: "
+            + ", ".join(inconsistent_budget_arms)
+        )
+    controlled_budgets = {
+        next(iter(budgets))
+        for arm, budgets in arm_budgets.items()
+        if arm in {"retry", "driftlock-heuristic", "driftlock"} and budgets
+    }
+    if len(controlled_budgets) > 1:
+        raise ValueError("controlled arms do not share one total-token budget")
     reference_arm = "stock"
     reference = task_counts[reference_arm]
     mismatched_arms = [
@@ -480,6 +615,9 @@ def _validate_matrix(
             task: next(iter(checksums)) for task, checksums in task_checksums.items()
         },
         "agent_model": next(iter(models)),
+        "controlled_total_token_budget": (
+            next(iter(controlled_budgets)) if controlled_budgets else None
+        ),
     }
 
 
@@ -667,6 +805,15 @@ def _exception_name(value: Any) -> str:
     if isinstance(value, dict) and isinstance(value.get("exception_type"), str):
         return value["exception_type"]
     return "no exception metadata"
+
+
+def _uuid_string(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a UUID string")
+    try:
+        return str(UUID(value))
+    except ValueError as error:
+        raise ValueError(f"{name} must be a UUID string") from error
 
 
 def _file_sha256(path: Path) -> str:

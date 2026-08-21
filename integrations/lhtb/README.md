@@ -165,6 +165,9 @@ the path and SHA-256 of every source result, computes paired per-task deltas and
 failure-rate slope per doubling of expert task time, and names any missing planned
 arm. It also verifies that each job summary is finished and error-free and recomputes
 Harbor's task-directory checksum before using the checkout's expert-time metadata.
+Each arm label is bound to the expected agent/import path, continuation mode, budget,
+and fine-judge presence; each trial's `config.job_id` and `trial_name` must match its
+job summary and directory. Controlled arms must use the same total-token budget.
 `--allow-incomplete-matrix` is available only for explicitly exploratory reports and
 records `matrix.complete=false`; aggregate token, cost, and slope deltas are `null`
 for any arm whose workload does not match stock.

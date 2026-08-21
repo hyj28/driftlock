@@ -42,13 +42,64 @@ def _result(
     model: str = "deepseek/deepseek-v4-pro",
     usage: dict[str, int | float] | None = None,
     exception: str | None = None,
+    arm: str | None = None,
 ) -> Path:
     directory = job / trial
     directory.mkdir(parents=True)
+    resolved_arm = arm or job.name
+    agent_config: dict[str, object] = {
+        "name": None,
+        "import_path": "driftlock.harbor_agent:LHTBDriftlockAgent",
+        "model_name": "openrouter/deepseek/deepseek-v4-pro",
+        "env": {"HB_CONTINUE_MODE": "same_conversation"},
+        "kwargs": {
+            "enable_summarize": False,
+            "driftlock_max_tokens": 10_000,
+            "driftlock_max_steps": 500,
+            "driftlock_max_rollbacks": 3,
+            "driftlock_checkpoint_interval": 5,
+        },
+    }
+    agent_name = "driftlock-terminus-2"
+    if resolved_arm == "stock":
+        agent_name = "terminus-2"
+        agent_config = {
+            "name": "terminus-2",
+            "import_path": None,
+            "model_name": "openrouter/deepseek/deepseek-v4-pro",
+            "env": {"HB_CONTINUE_MODE": "fresh"},
+            "kwargs": {
+                "enable_summarize": True,
+                "proactive_summarization_threshold": 8000,
+                "llm_call_kwargs": {"num_retries": 4},
+            },
+        }
+    elif resolved_arm == "retry":
+        agent_name = "compute-matched-blind-retry-terminus-2"
+        agent_config["import_path"] = "driftlock.harbor_agent:LHTBBlindRetryAgent"
+    elif resolved_arm == "driftlock":
+        kwargs = agent_config["kwargs"]
+        assert isinstance(kwargs, dict)
+        kwargs.update(
+            {
+                "driftlock_judge_model": "openrouter/deepseek/v4-flash",
+                "driftlock_judge_api_base": "https://judge.invalid/v1",
+                "driftlock_judge_max_output_tokens": 512,
+            }
+        )
     payload = {
         "task_name": task,
+        "trial_name": trial,
         "task_checksum": checksum or f"checksum-{task}",
-        "agent_info": {"model_info": {"provider": "openrouter", "name": model}},
+        "agent_info": {
+            "name": agent_name,
+            "model_info": {"provider": "openrouter", "name": model},
+        },
+        "config": {
+            "job_id": _job_id(job),
+            "trial_name": trial,
+            "agent": agent_config,
+        },
         "agent_result": usage
         or {
             "n_input_tokens": 100,
@@ -78,7 +129,7 @@ def _job_summary(
     errors: int = 0,
 ) -> None:
     payload = {
-        "id": "00000000-0000-0000-0000-000000000001",
+        "id": _job_id(job),
         "started_at": "2026-08-20T09:00:00+00:00",
         "finished_at": "2026-08-20T11:00:00+00:00",
         "n_total_trials": n_total_trials,
@@ -91,6 +142,12 @@ def _job_summary(
         },
     }
     (job / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _job_id(job: Path) -> str:
+    identifiers = {"stock": 1, "driftlock": 2, "retry": 3}
+    value = identifiers.get(job.name, 99)
+    return f"00000000-0000-0000-0000-{value:012d}"
 
 
 def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -214,7 +271,7 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     [
         ("matrix", "attempt matrix"),
         ("checksum", "does not match checkout"),
-        ("model", "different agent models"),
+        ("model", "config model does not match"),
     ],
 )
 def test_analyze_rejects_noncomparable_arms(
@@ -245,6 +302,94 @@ def test_analyze_rejects_noncomparable_arms(
         analyze_jobs(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_rejects_swapped_arm_labels(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+
+    with pytest.raises(ValueError, match="non-stock agent config"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": driftlock, "driftlock": stock},
+        )
+
+
+def test_analyze_binds_trial_to_job_summary_and_directory(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["config"]["job_id"] = _job_id(stock)
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different Harbor job"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+    payload["config"]["job_id"] = _job_id(driftlock)
+    payload["trial_name"] = "stale-name"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="trial_name does not match directory"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_distinguishes_heuristic_and_fine_judge_arms(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, _ = _complete_jobs(tmp_path)
+    heuristic = tmp_path / "driftlock-heuristic"
+    for task, reward in (("short", 1.0), ("long", 0.5)):
+        _result(
+            heuristic,
+            f"{task}-1",
+            task,
+            reward,
+            checksum=_task_directory_sha256(lhtb / "tasks" / task),
+        )
+    _job_summary(heuristic, 2)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock-heuristic": heuristic},
+    )
+    assert "driftlock-heuristic" in report["arms"]
+
+    with pytest.raises(ValueError, match="fine judge"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": heuristic},
+        )
+
+
+def test_analyze_requires_compute_matched_controlled_budgets(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    retry = tmp_path / "retry"
+    for task, reward in (("short", 1.0), ("long", 0.0)):
+        result = _result(
+            retry,
+            f"{task}-1",
+            task,
+            reward,
+            checksum=_task_directory_sha256(lhtb / "tasks" / task),
+        )
+        payload = json.loads(result.read_text())
+        payload["config"]["agent"]["kwargs"]["driftlock_max_tokens"] = 9_000
+        result.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(retry, 2)
+
+    with pytest.raises(ValueError, match="share one total-token budget"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={
+                "stock": stock,
+                "retry": retry,
+                "driftlock": driftlock,
+            },
         )
 
 
