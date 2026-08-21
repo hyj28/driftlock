@@ -140,6 +140,8 @@ def analyze_jobs(
         arm: _aggregate_arm(trials, solve_threshold=solve_threshold)
         for arm, trials in trials_by_arm.items()
     }
+    for arm, report in arm_reports.items():
+        _validate_job_usage(arm, job_summaries[arm], report)
     stock = arm_reports["stock"]
     comparisons = {
         arm: _compare_to_stock(
@@ -228,13 +230,53 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
         raise ValueError(f"Harbor job still has active trials in {result_file}")
     if counts["n_errored_trials"] or counts["n_cancelled_trials"]:
         raise ValueError(f"Harbor job contains errored trials in {result_file}")
+    retries = _nonnegative_integer(
+        stats.get("n_retries"), f"n_retries in {result_file}"
+    )
+    if retries:
+        raise ValueError(f"Harbor job used forbidden retries in {result_file}")
+    usage = {
+        "input_tokens": _nonnegative_integer(
+            stats.get("n_input_tokens"), f"n_input_tokens in {result_file}"
+        ),
+        "cache_tokens": _nonnegative_integer(
+            stats.get("n_cache_tokens"), f"n_cache_tokens in {result_file}"
+        ),
+        "output_tokens": _nonnegative_integer(
+            stats.get("n_output_tokens"), f"n_output_tokens in {result_file}"
+        ),
+        "cost_usd": _nonnegative_number(
+            stats.get("cost_usd"), f"cost_usd in {result_file}"
+        ),
+    }
+    if usage["cache_tokens"] > usage["input_tokens"]:
+        raise ValueError(f"job cache tokens exceed input tokens in {result_file}")
     return {
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
         "job_id": job_id,
         "n_total_trials": n_total,
+        "n_retries": retries,
+        "usage": usage,
         "finished_at": finished,
     }
+
+
+def _validate_job_usage(
+    arm: str, summary: dict[str, Any], report: dict[str, Any]
+) -> None:
+    usage = summary["usage"]
+    for name in ("input_tokens", "cache_tokens", "output_tokens"):
+        if usage[name] != report[name]:
+            raise ValueError(
+                f"arm {arm!r} trial {name} total does not match Harbor job summary"
+            )
+    if not math.isclose(
+        usage["cost_usd"], report["cost_usd"], rel_tol=1e-9, abs_tol=1e-9
+    ):
+        raise ValueError(
+            f"arm {arm!r} trial cost total does not match Harbor job summary"
+        )
 
 
 def _load_trial(
@@ -559,7 +601,7 @@ def _model_identity(data: dict[str, Any], result_file: Path) -> str:
     if not isinstance(name, str) or not name:
         raise ValueError(f"missing agent model identity in {result_file}")
     if provider is None:
-        provider = "unknown"
+        return name
     if not isinstance(provider, str) or not provider:
         raise ValueError(f"invalid agent model provider in {result_file}")
     return f"{provider}/{name}"

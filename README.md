@@ -337,8 +337,9 @@ arms must share one total-token budget, and every trial's job ID and name must m
 its job summary and directory. Canonical namespaced Harbor task names are resolved
 through each `task.toml`, while agent versions and all common non-treatment settings
 (model API, temperatures, request limits, timeouts, environment, and verifier) are
-validated and summarized by a configuration SHA-256. Every input `result.json` path
-and SHA-256 is retained.
+validated and summarized by a configuration SHA-256. Harbor retries must be zero,
+and official job-level token/cache/cost totals must reconcile with the trial files.
+Every input `result.json` path and SHA-256 is retained.
 
 ```bash
 driftlock-lhtb analyze --lhtb-dir /srv/LHTB \

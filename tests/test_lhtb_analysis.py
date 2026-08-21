@@ -193,7 +193,28 @@ def _job_summary(
     *,
     completed: int | None = None,
     errors: int = 0,
+    retries: int = 0,
 ) -> None:
+    usage: dict[str, int | float] = {
+        "n_input_tokens": 0,
+        "n_cache_tokens": 0,
+        "n_output_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    for result_file in job.glob("*/result.json"):
+        trial = json.loads(result_file.read_text())
+        direct = trial.get("agent_result")
+        if isinstance(direct, dict):
+            contexts = [direct]
+        else:
+            contexts = [
+                step["agent_result"]
+                for step in trial.get("step_results", [])
+                if isinstance(step, dict) and isinstance(step.get("agent_result"), dict)
+            ]
+        for context in contexts:
+            for field in usage:
+                usage[field] += context[field]
     payload = {
         "id": _job_id(job),
         "started_at": "2026-08-20T09:00:00+00:00",
@@ -205,6 +226,8 @@ def _job_summary(
             "n_running_trials": 0,
             "n_pending_trials": 0,
             "n_cancelled_trials": 0,
+            "n_retries": retries,
+            **usage,
         },
     }
     (job / "result.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -556,6 +579,50 @@ def test_analyze_rejects_incomplete_harbor_job(tmp_path: Path) -> None:
         )
 
 
+def test_analyze_rejects_harbor_retries(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _job_summary(driftlock, 2, retries=1)
+
+    with pytest.raises(ValueError, match="forbidden retries"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_reconciles_trial_and_job_usage(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    summary_path = driftlock / "result.json"
+    summary = json.loads(summary_path.read_text())
+    summary["stats"]["n_input_tokens"] += 1
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input_tokens total does not match"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_accepts_providerless_harbor_model_identity(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    for job in (stock, driftlock):
+        for result_file in job.glob("*/result.json"):
+            payload = json.loads(result_file.read_text())
+            payload["agent_info"]["model_info"] = {
+                "provider": None,
+                "name": "gpt-5.4",
+            }
+            payload["config"]["agent"]["model_name"] = "gpt-5.4"
+            result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+    assert report["matrix"]["agent_model"] == "gpt-5.4"
+
+
 def test_analyze_rejects_invalid_usage(tmp_path: Path) -> None:
     lhtb, stock, driftlock = _complete_jobs(tmp_path)
     payload_path = driftlock / "long-1" / "result.json"
@@ -587,8 +654,8 @@ def test_analyze_aggregates_harbor_multi_step_usage(tmp_path: Path) -> None:
         },
         {
             "agent_result": {
-                "n_input_tokens": 70,
-                "n_cache_tokens": 30,
+                    "n_input_tokens": 70,
+                    "n_cache_tokens": 40,
                 "n_output_tokens": 25,
                 "cost_usd": 0.2,
             }

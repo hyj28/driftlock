@@ -171,7 +171,9 @@ job summary and directory. Namespaced Harbor task names are mapped through the
 canonical `[task].name` in each `task.toml`. Controlled arms must use the same total
 token budget. Agent versions and shared non-treatment configuration—including model
 API, temperature, request ceilings, timeout, environment, and verifier—are frozen and
-recorded through a common configuration SHA-256.
+recorded through a common configuration SHA-256. Harbor's job-level retry count must
+remain zero, and its canonical token/cache/output/cost totals are reconciled against
+the loaded trial results.
 `--allow-incomplete-matrix` is available only for explicitly exploratory reports and
 records `matrix.complete=false`; aggregate token, cost, and slope deltas are `null`
 for any arm whose workload does not match stock.
