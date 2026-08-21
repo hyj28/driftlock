@@ -395,6 +395,41 @@ def test_judge_client_rejects_unaudited_model_pricing(
 
 
 @pytest.mark.asyncio
+async def test_judge_client_conservatively_prices_missing_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingLiteLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def call(self, prompt: str, **kwargs: Any) -> Any:
+            raise AssertionError("decorated call must be bypassed")
+
+    async def unwrapped(llm: FailingLiteLLM, *, prompt: str, **kwargs: Any) -> Any:
+        raise TimeoutError("provider timed out without usage")
+
+    FailingLiteLLM.call.__wrapped__ = unwrapped  # type: ignore[attr-defined]
+    monkeypatch.setattr(plugin, "LiteLLM", FailingLiteLLM)
+    client = plugin._LHTBJudgeClient(
+        model=plugin.PINNED_LHTB_JUDGE_MODEL,
+        api_base=None,
+        max_output_tokens=50,
+        timeout_sec=10,
+    )
+
+    completion = await client.complete("judge this", tokens_remaining=1_000)
+
+    expected_input = len(b"judge this") + 256
+    expected_cost = (
+        expected_input * plugin._JUDGE_INPUT_COST_PER_TOKEN
+        + 50 * plugin._JUDGE_OUTPUT_COST_PER_TOKEN
+    )
+    assert completion.tokens == expected_input + 50
+    assert client.cost_usd == pytest.approx(expected_cost)
+    assert client.usage_fallbacks == 1
+
+
+@pytest.mark.asyncio
 async def test_real_pinned_judge_litellm_path_is_one_physical_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

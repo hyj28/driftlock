@@ -33,6 +33,9 @@ from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 
 PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+_JUDGE_INPUT_COST_PER_TOKEN = 0.14 / 1_000_000
+_JUDGE_CACHE_COST_PER_TOKEN = 0.0028 / 1_000_000
+_JUDGE_OUTPUT_COST_PER_TOKEN = 0.28 / 1_000_000
 
 
 class LHTBDriftlockAgent(Terminus2):
@@ -500,9 +503,9 @@ class _LHTBJudgeClient:
             model_info={
                 "max_input_tokens": 1_000_000,
                 "max_output_tokens": 8_192,
-                "input_cost_per_token": 0.14 / 1_000_000,
-                "cache_read_input_token_cost": 0.0028 / 1_000_000,
-                "output_cost_per_token": 0.28 / 1_000_000,
+                "input_cost_per_token": _JUDGE_INPUT_COST_PER_TOKEN,
+                "cache_read_input_token_cost": _JUDGE_CACHE_COST_PER_TOKEN,
+                "output_cost_per_token": _JUDGE_OUTPUT_COST_PER_TOKEN,
             },
         )
         self.llm._driftlock_single_attempt = True
@@ -560,7 +563,10 @@ class _LHTBJudgeClient:
             prompt_tokens = input_bound
             completion_tokens = ceiling
             cache_tokens = 0
-            cost_usd = 0.0
+            cost_usd = (
+                prompt_tokens * _JUDGE_INPUT_COST_PER_TOKEN
+                + completion_tokens * _JUDGE_OUTPUT_COST_PER_TOKEN
+            )
             self.usage_fallbacks += 1
         self.n_input_tokens += prompt_tokens
         self.n_cache_tokens += cache_tokens
