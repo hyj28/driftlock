@@ -41,7 +41,14 @@ DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-pro"
 DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
-RUNNABLE_ARMS = ("stock", "retry", "driftlock-heuristic", "driftlock")
+RUNNABLE_ARMS = (
+    "stock",
+    "retry",
+    "driftlock-heuristic",
+    "driftlock",
+    "native-driftlock-heuristic",
+    "native-driftlock",
+)
 
 # SHA-256 of every Harbor file after applying the packaged version-10 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
@@ -113,7 +120,13 @@ def build_job_config(
         )
     if arm not in RUNNABLE_ARMS:
         raise ValueError("arm must be one of " + ", ".join(RUNNABLE_ARMS))
-    if retain_checkpoints and arm not in {"driftlock", "driftlock-heuristic"}:
+    checkpoint_arms = {
+        "driftlock",
+        "driftlock-heuristic",
+        "native-driftlock",
+        "native-driftlock-heuristic",
+    }
+    if retain_checkpoints and arm not in checkpoint_arms:
         raise ValueError("checkpoint retention requires a driftlock arm")
     if n_concurrent_trials <= 0:
         raise ValueError("n_concurrent_trials must be positive")
@@ -155,11 +168,14 @@ def build_job_config(
         )
         agent["kwargs"]["llm_call_kwargs"]["num_retries"] = 4
     else:
-        agent["import_path"] = (
-            "driftlock.harbor_agent:LHTBBlindRetryAgent"
-            if arm == "retry"
-            else "driftlock.harbor_agent:LHTBDriftlockAgent"
-        )
+        if arm == "retry":
+            agent["import_path"] = "driftlock.harbor_agent:LHTBBlindRetryAgent"
+        elif arm.startswith("native-"):
+            agent["import_path"] = (
+                "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+            )
+        else:
+            agent["import_path"] = "driftlock.harbor_agent:LHTBDriftlockAgent"
         agent["env"] = {
             "HB_CONTINUE_MODE": "same_conversation",
             "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
@@ -175,7 +191,7 @@ def build_job_config(
         )
         if retain_checkpoints:
             agent["kwargs"]["driftlock_retain_checkpoints"] = True
-        if arm == "driftlock":
+        if arm in {"driftlock", "native-driftlock"}:
             agent["kwargs"].update(
                 {
                     "driftlock_judge_model": DEFAULT_JUDGE_MODEL,

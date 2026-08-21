@@ -31,6 +31,8 @@ ANALYSIS_ARMS = (
     "driftlock",
     "oracle",
 )
+NATIVE_ANALYSIS_ARMS = ("native-driftlock-heuristic", "native-driftlock")
+_ACCEPTED_ANALYSIS_ARMS = (*ANALYSIS_ARMS, *NATIVE_ANALYSIS_ARMS)
 SOLVE_THRESHOLD = 0.95
 _FINE_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 
@@ -66,10 +68,10 @@ def parse_arm_directories(values: Sequence[str]) -> dict[str, Path]:
         arm, separator, raw_path = value.partition("=")
         if separator != "=" or not raw_path:
             raise ValueError(f"invalid arm directory {value!r}; expected ARM=JOB_DIR")
-        if arm not in ANALYSIS_ARMS:
+        if arm not in _ACCEPTED_ANALYSIS_ARMS:
             raise ValueError(
                 f"unknown analysis arm {arm!r}; expected one of "
-                + ", ".join(ANALYSIS_ARMS)
+                + ", ".join(_ACCEPTED_ANALYSIS_ARMS)
             )
         if arm in result:
             raise ValueError(f"duplicate arm directory: {arm}")
@@ -96,7 +98,7 @@ def analyze_jobs(
         raise ValueError("analysis requires a stock baseline arm")
     if len(arm_directories) < 2:
         raise ValueError("analysis requires stock and at least one comparison arm")
-    unknown = sorted(set(arm_directories) - set(ANALYSIS_ARMS))
+    unknown = sorted(set(arm_directories) - set(_ACCEPTED_ANALYSIS_ARMS))
     if unknown:
         raise ValueError("unknown analysis arms: " + ", ".join(unknown))
     root = lhtb_dir.expanduser().resolve()
@@ -607,6 +609,9 @@ def _validate_arm_identity(
     elif arm in {"driftlock-heuristic", "driftlock"}:
         expected_import_path = "driftlock.harbor_agent:LHTBDriftlockAgent"
         expected_name = "driftlock-terminus-2"
+    elif arm in {"native-driftlock-heuristic", "native-driftlock"}:
+        expected_import_path = "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+        expected_name = "driftlock-native-tool-agent"
     else:
         raise ValueError(f"unsupported online arm: {arm}")
 
@@ -650,12 +655,18 @@ def _validate_arm_identity(
     }
     if "driftlock_retain_checkpoints" in kwargs:
         if (
-            arm not in {"driftlock-heuristic", "driftlock"}
+            arm
+            not in {
+                "driftlock-heuristic",
+                "driftlock",
+                "native-driftlock-heuristic",
+                "native-driftlock",
+            }
             or kwargs["driftlock_retain_checkpoints"] is not True
         ):
             raise ValueError(f"arm {arm!r} has invalid checkpoint retention")
         expected_keys.add("driftlock_retain_checkpoints")
-    if arm == "driftlock":
+    if arm in {"driftlock", "native-driftlock"}:
         if (
             kwargs.get("driftlock_judge_model") != _FINE_JUDGE_MODEL
             or not isinstance(kwargs.get("driftlock_judge_api_base"), str)
@@ -1104,7 +1115,15 @@ def _validate_matrix(
     controlled_budgets = {
         next(iter(budgets))
         for arm, budgets in arm_budgets.items()
-        if arm in {"retry", "driftlock-heuristic", "driftlock"} and budgets
+        if arm
+        in {
+            "retry",
+            "driftlock-heuristic",
+            "driftlock",
+            "native-driftlock-heuristic",
+            "native-driftlock",
+        }
+        and budgets
     }
     if len(controlled_budgets) > 1:
         raise ValueError("controlled arms do not share one total-token budget")

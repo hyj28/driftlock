@@ -215,6 +215,7 @@ class ToolCallingAgent:
         max_tool_output_chars: int = 16_000,
         shell_timeout_sec: int = 60,
         codec: AgentConversationCodec | None = None,
+        user: str | int | None = None,
     ) -> None:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -237,6 +238,7 @@ class ToolCallingAgent:
         self.max_tool_output_chars = max_tool_output_chars
         self.shell_timeout_sec = shell_timeout_sec
         self.codec = codec or AgentConversationCodec()
+        self.user = user
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state()
@@ -436,7 +438,9 @@ class ToolCallingAgent:
             raise TypeError("timeout_sec must be a positive integer")
         timeout = min(timeout, self.shell_timeout_sec)
         result = await self.environment.exec(
-            f"cd -- {shlex.quote(workspace)} && {command}", timeout_sec=timeout
+            f"cd -- {shlex.quote(workspace)} && {command}",
+            timeout_sec=timeout,
+            user=self.user,
         )
         output = _format_exec_result(result)
         content = _truncate(output, self.max_tool_output_chars)
@@ -472,6 +476,7 @@ class ToolCallingAgent:
                 )
             ),
             timeout_sec=self.shell_timeout_sec,
+            user=self.user,
         )
         if result.return_code != 0:
             detail = _format_exec_result(result)
@@ -493,7 +498,9 @@ class ToolCallingAgent:
         content = _required_string(arguments, "content")
         parent = posixpath.dirname(path)
         mkdir = await self.environment.exec(
-            f"mkdir -p -- {shlex.quote(parent)}", timeout_sec=self.shell_timeout_sec
+            f"mkdir -p -- {shlex.quote(parent)}",
+            timeout_sec=self.shell_timeout_sec,
+            user=self.user,
         )
         if mkdir.return_code != 0:
             return _tool_error(call, f"write_file failed: {_format_exec_result(mkdir)}")
@@ -535,6 +542,7 @@ class ToolCallingAgent:
                 )
             ),
             timeout_sec=self.shell_timeout_sec,
+            user=self.user,
         )
         if result.return_code != 0:
             return _tool_error(
@@ -569,6 +577,7 @@ class ToolCallingAgent:
         result = await self.environment.exec(
             f"python3 -c {shlex.quote(script)} {shlex.quote(candidate)}",
             timeout_sec=self.shell_timeout_sec,
+            user=self.user,
         )
         if result.return_code != 0:
             raise ValueError(f"could not resolve path: {_format_exec_result(result)}")
