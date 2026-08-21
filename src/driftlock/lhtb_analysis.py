@@ -591,7 +591,7 @@ def _validate_arm_identity(
         expected_import_path = "driftlock.harbor_agent:LHTBDriftlockAgent"
         expected_name = "driftlock-terminus-2"
     else:
-        expected_import_path = "driftlock.oracle:LHTBCheckpointReplayOracle"
+        expected_import_path = "driftlock.harbor_agent:LHTBCheckpointReplayOracle"
         expected_name = "driftlock-checkpoint-replay-oracle"
 
     valid = (
@@ -854,11 +854,11 @@ def _task_metadata(directory: Path, task: str) -> dict[str, Any]:
     return {
         "expert_time_estimate_min": expert_time,
         "category": category,
-        "task_checksum": _task_directory_sha256(directory),
+        "task_checksum": task_directory_sha256(directory),
     }
 
 
-def _task_directory_sha256(directory: Path) -> str:
+def task_directory_sha256(directory: Path) -> str:
     """Match Harbor's default ``dirhash(directory, "sha256")`` protocol.
 
     LHTB's pinned task tree contains ordinary files and directories. Symlinks and
@@ -892,6 +892,9 @@ def _task_directory_sha256(directory: Path) -> str:
     if result is None:
         raise ValueError(f"cannot hash empty task directory: {directory}")
     return result
+
+
+_task_directory_sha256 = task_directory_sha256
 
 
 def _duration_seconds(data: dict[str, Any], result_file: Path) -> float | None:

@@ -14,7 +14,9 @@ from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
+from harbor.agents.base import BaseAgent
 from harbor.agents.terminus_2 import Terminus2
 from harbor.llms.lite_llm import LiteLLM
 
@@ -28,6 +30,7 @@ from driftlock.models import (
     RunResult,
     RunStatus,
 )
+from driftlock.oracle import ReplayUsage, file_sha256, load_remote_checkpoint_bundle
 from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
@@ -36,6 +39,113 @@ PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 _JUDGE_INPUT_COST_PER_TOKEN = 0.14 / 1_000_000
 _JUDGE_CACHE_COST_PER_TOKEN = 0.0028 / 1_000_000
 _JUDGE_OUTPUT_COST_PER_TOKEN = 0.28 / 1_000_000
+
+
+class LHTBCheckpointReplayOracle(BaseAgent):
+    """Restore one retained checkpoint for Harbor's isolated hidden verifier.
+
+    The class never calls a model and never sees verifier output. Harbor creates a
+    fresh task environment, calls this agent once to restore a predeclared bundle,
+    and then runs the task's ordinary verifier after the agent returns.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        driftlock_oracle_mode: str,
+        driftlock_checkpoint_dir: str,
+        driftlock_checkpoint_digest: str,
+        driftlock_expected_workspace: str,
+        driftlock_source_trial_id: str,
+        driftlock_source_result: str,
+        driftlock_source_result_sha256: str,
+        driftlock_source_usage: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        if driftlock_oracle_mode != "isolated-checkpoint-replay":
+            raise ValueError("oracle mode must be isolated-checkpoint-replay")
+        try:
+            UUID(driftlock_source_trial_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("source trial id must be a UUID") from error
+        if len(driftlock_checkpoint_digest) != 64:
+            raise ValueError("checkpoint digest must be a SHA-256")
+        if len(driftlock_source_result_sha256) != 64:
+            raise ValueError("source result digest must be a SHA-256")
+        super().__init__(*args, **kwargs)
+        self._oracle_checkpoint_dir = Path(driftlock_checkpoint_dir)
+        self._oracle_checkpoint_digest = driftlock_checkpoint_digest
+        self._oracle_expected_workspace = driftlock_expected_workspace
+        self._oracle_source_trial_id = driftlock_source_trial_id
+        self._oracle_source_result = Path(driftlock_source_result)
+        self._oracle_source_result_sha256 = driftlock_source_result_sha256
+        self._oracle_source_usage = ReplayUsage.from_mapping(driftlock_source_usage)
+
+    @staticmethod
+    def name() -> str:
+        return "driftlock-checkpoint-replay-oracle"
+
+    def version(self) -> str | None:
+        return version("driftlock")
+
+    async def setup(self, environment: Any) -> None:
+        del environment
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        del instruction
+        bundle = load_remote_checkpoint_bundle(
+            self._oracle_checkpoint_dir,
+            expected_digest=self._oracle_checkpoint_digest,
+            expected_workspace=self._oracle_expected_workspace,
+        )
+        if file_sha256(self._oracle_source_result) != self._oracle_source_result_sha256:
+            raise ValueError("source result differs from replay provenance")
+        task_config = getattr(environment, "task_env_config", None)
+        workspace = str(getattr(task_config, "workdir", None) or "/app")
+        if workspace != bundle.remote_workspace:
+            raise ValueError("fresh verifier workspace differs from checkpoint")
+
+        store = RemoteArchiveCheckpointStore(
+            environment,
+            remote_workspace=workspace,
+            store_dir=bundle.checkpoint.path.parent.parent,
+            user=environment.default_user,
+        )
+        await store.restore(bundle.checkpoint)
+
+        usage = self._oracle_source_usage
+        context.n_input_tokens = usage.input_tokens
+        context.n_cache_tokens = usage.cache_tokens
+        context.n_output_tokens = usage.output_tokens
+        context.cost_usd = float(usage.cost_usd)
+        metadata = dict(context.metadata or {})
+        metadata["termination_reason"] = "oracle_checkpoint_replay"
+        metadata["oracle"] = {
+            "mode": "isolated-checkpoint-replay",
+            "source_trial_id": self._oracle_source_trial_id,
+            "source_result": str(self._oracle_source_result.resolve()),
+            "source_result_sha256": self._oracle_source_result_sha256,
+            "checkpoint_id": bundle.checkpoint.checkpoint_id,
+            "checkpoint_step": bundle.checkpoint.step,
+            "checkpoint_digest": bundle.checkpoint.digest,
+            "archive_sha256": bundle.archive_sha256,
+            "state_sha256": bundle.state_sha256,
+            "workspace": workspace,
+            "usage_policy": "full-source-trial-conservative",
+            "source_usage": usage.as_dict(),
+        }
+        context.metadata = metadata
+        output = Path(self.logs_dir) / "oracle-replay.json"
+        output.write_text(
+            json.dumps(metadata["oracle"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    async def resume_after_verifier_rejection(
+        self, user_prompt: str, context: Any
+    ) -> None:
+        del user_prompt, context
+        raise RuntimeError("oracle replay is a single terminal phase")
 
 
 class LHTBDriftlockAgent(Terminus2):
