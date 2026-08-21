@@ -279,7 +279,7 @@ def _job_summary(
         },
         "trials": lock_trials,
     }
-    (job / "lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    (job / "lock.json").write_text(json.dumps(_without_none(lock)), encoding="utf-8")
     payload = {
         "id": _job_id(job),
         "started_at": "2026-08-20T09:00:00+00:00",
@@ -302,6 +302,16 @@ def _job_id(job: Path) -> str:
     identifiers = {"stock": 1, "driftlock": 2, "retry": 3}
     value = identifiers.get(job.name, 99)
     return f"00000000-0000-0000-0000-{value:012d}"
+
+
+def _without_none(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_none(item) for key, item in value.items() if item is not None
+        }
+    if isinstance(value, list):
+        return [_without_none(item) for item in value]
+    return value
 
 
 def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:

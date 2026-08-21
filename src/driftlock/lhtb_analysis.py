@@ -470,8 +470,20 @@ def _lock_trial_signature(task_name: str, config: dict[str, Any]) -> str:
         "environment": config.get("environment"),
         "verifier": config.get("verifier"),
     }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    serialized = json.dumps(
+        _without_none(payload), sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _without_none(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_none(item) for key, item in value.items() if item is not None
+        }
+    if isinstance(value, list):
+        return [_without_none(item) for item in value]
+    return value
 
 
 def _validate_trial_provenance(
