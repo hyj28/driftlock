@@ -10,6 +10,7 @@ import tomllib
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -22,6 +23,7 @@ ANALYSIS_ARMS = (
     "oracle",
 )
 SOLVE_THRESHOLD = 0.95
+_FINE_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 
 
 def goal_drift_actions(
@@ -92,6 +94,7 @@ def analyze_jobs(
     task_root = root / "tasks"
     if not task_root.is_dir():
         raise FileNotFoundError(task_root)
+    task_index = _task_index(task_root)
 
     trials_by_arm: dict[str, list[dict[str, Any]]] = {}
     job_summaries: dict[str, dict[str, Any]] = {}
@@ -123,7 +126,7 @@ def analyze_jobs(
                     result_file=resolved,
                     arm=arm,
                     job_id=job_summaries[arm]["job_id"],
-                    task_root=task_root,
+                    task_index=task_index,
                     task_metadata_cache=task_metadata_cache,
                     solve_threshold=solve_threshold,
                 )
@@ -239,7 +242,7 @@ def _load_trial(
     result_file: Path,
     arm: str,
     job_id: str,
-    task_root: Path,
+    task_index: Mapping[str, Path],
     task_metadata_cache: dict[str, dict[str, Any]],
     solve_threshold: float,
 ) -> dict[str, Any]:
@@ -251,20 +254,20 @@ def _load_trial(
         raise ValueError(f"Harbor result must be an object: {result_file}")
     _validate_trial_provenance(data, result_file, job_id)
     task = data.get("task_name")
-    if not isinstance(task, str) or not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]*", task
-    ):
+    if not isinstance(task, str) or task not in task_index:
         raise ValueError(f"invalid task_name in {result_file}")
     reward = _reward(data, result_file)
     checksum = data.get("task_checksum")
     if not isinstance(checksum, str) or not checksum:
         raise ValueError(f"missing task_checksum in {result_file}")
     model = _model_identity(data, result_file)
-    total_token_budget = _validate_arm_identity(data, arm, model, result_file)
+    total_token_budget, experiment_signature = _validate_arm_identity(
+        data, arm, model, result_file
+    )
     usage = _usage(data, result_file)
     task_metadata = task_metadata_cache.get(task)
     if task_metadata is None:
-        task_metadata = _task_metadata(task_root, task)
+        task_metadata = _task_metadata(task_index[task], task)
         task_metadata_cache[task] = task_metadata
     if checksum != task_metadata["task_checksum"]:
         raise ValueError(
@@ -278,7 +281,9 @@ def _load_trial(
         "solved": reward >= solve_threshold,
         "task_checksum": checksum,
         "model": model,
+        "agent_version": data["agent_info"]["version"],
         "total_token_budget": total_token_budget,
+        "experiment_signature": experiment_signature,
         "expert_time_estimate_min": task_metadata["expert_time_estimate_min"],
         "category": task_metadata["category"],
         "input_tokens": usage["input_tokens"],
@@ -313,9 +318,10 @@ def _validate_trial_provenance(
 
 def _validate_arm_identity(
     data: dict[str, Any], arm: str, model: str, result_file: Path
-) -> int | None:
+) -> tuple[int | None, str]:
     agent_info = data.get("agent_info")
     info_name = agent_info.get("name") if isinstance(agent_info, dict) else None
+    info_version = agent_info.get("version") if isinstance(agent_info, dict) else None
     config = data.get("config")
     agent = config.get("agent") if isinstance(config, dict) else None
     if not isinstance(agent, dict):
@@ -327,21 +333,61 @@ def _validate_arm_identity(
     if not isinstance(kwargs, dict) or not isinstance(environment, dict):
         raise ValueError(f"invalid trial agent config in {result_file}")
 
+    base_kwargs = {
+        "api_base",
+        "parser_name",
+        "temperature",
+        "record_terminal_session",
+        "llm_call_kwargs",
+        "model_info",
+    }
+    llm_kwargs = kwargs.get("llm_call_kwargs")
+    model_info = kwargs.get("model_info")
+    common_valid = (
+        isinstance(agent.get("override_timeout_sec"), (int, float))
+        and not isinstance(agent.get("override_timeout_sec"), bool)
+        and agent["override_timeout_sec"] > 0
+        and agent.get("override_setup_timeout_sec") is None
+        and agent.get("max_timeout_sec") is None
+        and isinstance(kwargs.get("api_base"), str)
+        and bool(kwargs["api_base"])
+        and kwargs.get("parser_name") == "json"
+        and kwargs.get("temperature") == 0.7
+        and kwargs.get("record_terminal_session") is True
+        and isinstance(llm_kwargs, dict)
+        and llm_kwargs.get("temperature") == 0.7
+        and llm_kwargs.get("max_tokens") == 8192
+        and llm_kwargs.get("timeout") == 240
+        and model_info
+        == {
+            "max_input_tokens": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+        }
+    )
+    if not common_valid:
+        raise ValueError(f"agent config differs from the frozen harness: {result_file}")
+    experiment_signature = _experiment_signature(config, kwargs, model, result_file)
+
     if arm == "stock":
-        llm_kwargs = kwargs.get("llm_call_kwargs")
         valid = (
             info_name == "terminus-2"
+            and info_version == "2.0.0"
             and agent.get("name") == "terminus-2"
             and agent.get("import_path") is None
-            and environment.get("HB_CONTINUE_MODE") == "fresh"
+            and environment == {"HB_CONTINUE_MODE": "fresh"}
+            and set(kwargs)
+            == base_kwargs | {"enable_summarize", "proactive_summarization_threshold"}
             and kwargs.get("enable_summarize") is True
             and kwargs.get("proactive_summarization_threshold") == 8000
-            and isinstance(llm_kwargs, dict)
+            and set(llm_kwargs)
+            == {"temperature", "max_tokens", "timeout", "num_retries"}
             and llm_kwargs.get("num_retries") == 4
         )
         if not valid:
             raise ValueError(f"arm 'stock' has a non-stock agent config: {result_file}")
-        return None
+        return None, experiment_signature
 
     expected_import_path: str
     expected_name: str
@@ -357,19 +403,24 @@ def _validate_arm_identity(
 
     valid = (
         info_name == expected_name
+        and info_version == _installed_driftlock_version()
         and agent.get("name") is None
         and agent.get("import_path") == expected_import_path
-        and environment.get("HB_CONTINUE_MODE") == "same_conversation"
+        and environment == {"HB_CONTINUE_MODE": "same_conversation"}
         and kwargs.get("enable_summarize") is False
+        and set(llm_kwargs) == {"temperature", "max_tokens", "timeout"}
     )
     if not valid:
         raise ValueError(f"arm {arm!r} has the wrong agent config: {result_file}")
     if arm == "oracle":
-        if kwargs.get("driftlock_oracle_mode") != "isolated-checkpoint-replay":
+        if (
+            set(kwargs) != base_kwargs | {"enable_summarize", "driftlock_oracle_mode"}
+            or kwargs.get("driftlock_oracle_mode") != "isolated-checkpoint-replay"
+        ):
             raise ValueError(
                 f"oracle result lacks isolated replay provenance: {result_file}"
             )
-        return None
+        return None, experiment_signature
 
     budget = _positive_integer(
         kwargs.get("driftlock_max_tokens"),
@@ -387,18 +438,104 @@ def _validate_arm_identity(
         "driftlock_judge_api_base",
         "driftlock_judge_max_output_tokens",
     }
+    expected_keys = base_kwargs | {
+        "enable_summarize",
+        "driftlock_max_tokens",
+        "driftlock_max_steps",
+        "driftlock_max_rollbacks",
+        "driftlock_checkpoint_interval",
+    }
     if arm == "driftlock":
         if (
-            not isinstance(kwargs.get("driftlock_judge_model"), str)
+            kwargs.get("driftlock_judge_model") != _FINE_JUDGE_MODEL
             or not isinstance(kwargs.get("driftlock_judge_api_base"), str)
+            or not kwargs["driftlock_judge_api_base"]
             or kwargs.get("driftlock_judge_max_output_tokens") != 512
         ):
             raise ValueError(f"driftlock arm lacks its fine judge: {result_file}")
+        expected_keys |= judge_fields
     elif judge_fields & kwargs.keys():
         raise ValueError(
             f"arm {arm!r} unexpectedly enables a fine judge: {result_file}"
         )
-    return budget
+    if set(kwargs) != expected_keys:
+        raise ValueError(f"arm {arm!r} has unexpected agent settings: {result_file}")
+    return budget, experiment_signature
+
+
+def _experiment_signature(
+    config: dict[str, Any],
+    kwargs: dict[str, Any],
+    model: str,
+    result_file: Path,
+) -> str:
+    environment = config.get("environment")
+    verifier = config.get("verifier")
+    expected_environment = {
+        "type": "docker",
+        "import_path": None,
+        "force_build": True,
+        "delete": True,
+        "override_cpus": None,
+        "override_memory_mb": None,
+        "override_storage_mb": None,
+        "override_gpus": None,
+        "suppress_override_warnings": False,
+        "mounts": None,
+        "env": {},
+        "kwargs": {},
+    }
+    expected_verifier = {
+        "override_timeout_sec": None,
+        "max_timeout_sec": None,
+        "env": {},
+        "disable": False,
+    }
+    if environment != expected_environment or verifier != expected_verifier:
+        raise ValueError(
+            f"trial environment differs from frozen harness: {result_file}"
+        )
+    multipliers = {
+        key: config.get(key)
+        for key in (
+            "timeout_multiplier",
+            "agent_timeout_multiplier",
+            "verifier_timeout_multiplier",
+            "agent_setup_timeout_multiplier",
+            "environment_build_timeout_multiplier",
+        )
+    }
+    if multipliers != {
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": None,
+        "verifier_timeout_multiplier": None,
+        "agent_setup_timeout_multiplier": None,
+        "environment_build_timeout_multiplier": None,
+    }:
+        raise ValueError(
+            f"trial timeout config differs from frozen harness: {result_file}"
+        )
+    if config.get("artifacts") != []:
+        raise ValueError(f"trial artifacts differ from frozen harness: {result_file}")
+    agent = config["agent"]
+    signature = {
+        "model": model,
+        "agent_timeout_sec": agent["override_timeout_sec"],
+        "api_base": kwargs["api_base"],
+        "parser_name": kwargs["parser_name"],
+        "temperature": kwargs["temperature"],
+        "record_terminal_session": kwargs["record_terminal_session"],
+        "llm_call_kwargs": {
+            key: kwargs["llm_call_kwargs"][key]
+            for key in ("temperature", "max_tokens", "timeout")
+        },
+        "model_info": kwargs["model_info"],
+        "environment": environment,
+        "verifier": verifier,
+        "multipliers": multipliers,
+    }
+    serialized = json.dumps(signature, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _reward(data: dict[str, Any], result_file: Path) -> float:
@@ -473,8 +610,34 @@ def _usage(data: dict[str, Any], result_file: Path) -> dict[str, int | float]:
     return totals
 
 
-def _task_metadata(task_root: Path, task: str) -> dict[str, Any]:
-    path = task_root / task / "task.toml"
+def _task_index(task_root: Path) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for directory in sorted(task_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        path = directory / "task.toml"
+        if not path.is_file():
+            continue
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(f"invalid task metadata in {path}: {error}") from error
+        task_section = data.get("task")
+        name = task_section.get("name") if isinstance(task_section, dict) else None
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*", name
+        ):
+            raise ValueError(f"invalid [task].name in {path}")
+        if name in result:
+            raise ValueError(f"duplicate LHTB task name: {name}")
+        result[name] = directory
+    if not result:
+        raise ValueError(f"no named LHTB tasks found in {task_root}")
+    return result
+
+
+def _task_metadata(directory: Path, task: str) -> dict[str, Any]:
+    path = directory / "task.toml"
     if not path.is_file():
         raise ValueError(f"task result does not exist in LHTB checkout: {task}")
     try:
@@ -494,7 +657,7 @@ def _task_metadata(task_root: Path, task: str) -> dict[str, Any]:
     return {
         "expert_time_estimate_min": expert_time,
         "category": category,
-        "task_checksum": _task_directory_sha256(path.parent),
+        "task_checksum": _task_directory_sha256(directory),
     }
 
 
@@ -560,7 +723,9 @@ def _validate_matrix(
     task_counts: dict[str, dict[str, int]] = {}
     task_checksums: dict[str, set[str]] = defaultdict(set)
     models: set[str] = set()
+    experiment_signatures: set[str] = set()
     arm_budgets: dict[str, set[int]] = defaultdict(set)
+    arm_versions: dict[str, set[str]] = defaultdict(set)
     for arm, trials in trials_by_arm.items():
         counts: dict[str, int] = defaultdict(int)
         for trial in trials:
@@ -568,6 +733,8 @@ def _validate_matrix(
             counts[task] += 1
             task_checksums[task].add(trial["task_checksum"])
             models.add(trial["model"])
+            experiment_signatures.add(trial["experiment_signature"])
+            arm_versions[arm].add(trial["agent_version"])
             if trial["total_token_budget"] is not None:
                 arm_budgets[arm].add(trial["total_token_budget"])
         task_counts[arm] = dict(sorted(counts.items()))
@@ -581,6 +748,16 @@ def _validate_matrix(
     if len(models) != 1:
         raise ValueError(
             "experiment arms use different agent models: " + ", ".join(sorted(models))
+        )
+    if len(experiment_signatures) != 1:
+        raise ValueError("experiment arms use different non-treatment configurations")
+    inconsistent_version_arms = sorted(
+        arm for arm, versions in arm_versions.items() if len(versions) != 1
+    )
+    if inconsistent_version_arms:
+        raise ValueError(
+            "arm uses inconsistent agent versions: "
+            + ", ".join(inconsistent_version_arms)
         )
     inconsistent_budget_arms = sorted(
         arm for arm, budgets in arm_budgets.items() if len(budgets) != 1
@@ -615,6 +792,10 @@ def _validate_matrix(
             task: next(iter(checksums)) for task, checksums in task_checksums.items()
         },
         "agent_model": next(iter(models)),
+        "experiment_signature_sha256": next(iter(experiment_signatures)),
+        "agent_versions": {
+            arm: next(iter(versions)) for arm, versions in arm_versions.items()
+        },
         "controlled_total_token_budget": (
             next(iter(controlled_budgets)) if controlled_budgets else None
         ),
@@ -814,6 +995,13 @@ def _uuid_string(value: Any, name: str) -> str:
         return str(UUID(value))
     except ValueError as error:
         raise ValueError(f"{name} must be a UUID string") from error
+
+
+def _installed_driftlock_version() -> str:
+    try:
+        return version("driftlock")
+    except PackageNotFoundError as error:
+        raise ValueError("driftlock distribution metadata is unavailable") from error
 
 
 def _file_sha256(path: Path) -> str:

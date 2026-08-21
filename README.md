@@ -334,7 +334,11 @@ into model failures. It also requires each Harbor job summary to be finished and
 error-free, and verifies each recorded task checksum against the selected LHTB
 checkout. Arm labels are checked against the pinned agent configuration, controlled
 arms must share one total-token budget, and every trial's job ID and name must match
-its job summary and directory. Every input `result.json` path and SHA-256 is retained.
+its job summary and directory. Canonical namespaced Harbor task names are resolved
+through each `task.toml`, while agent versions and all common non-treatment settings
+(model API, temperatures, request limits, timeouts, environment, and verifier) are
+validated and summarized by a configuration SHA-256. Every input `result.json` path
+and SHA-256 is retained.
 
 ```bash
 driftlock-lhtb analyze --lhtb-dir /srv/LHTB \

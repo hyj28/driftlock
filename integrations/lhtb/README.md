@@ -167,7 +167,11 @@ arm. It also verifies that each job summary is finished and error-free and recom
 Harbor's task-directory checksum before using the checkout's expert-time metadata.
 Each arm label is bound to the expected agent/import path, continuation mode, budget,
 and fine-judge presence; each trial's `config.job_id` and `trial_name` must match its
-job summary and directory. Controlled arms must use the same total-token budget.
+job summary and directory. Namespaced Harbor task names are mapped through the
+canonical `[task].name` in each `task.toml`. Controlled arms must use the same total
+token budget. Agent versions and shared non-treatment configuration—including model
+API, temperature, request ceilings, timeout, environment, and verifier—are frozen and
+recorded through a common configuration SHA-256.
 `--allow-incomplete-matrix` is available only for explicitly exploratory reports and
 records `matrix.complete=false`; aggregate token, cost, and slope deltas are `null`
 for any arm whose workload does not match stock.

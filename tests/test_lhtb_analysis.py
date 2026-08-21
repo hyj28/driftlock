@@ -22,6 +22,8 @@ def _task(root: Path, name: str, *, expert_minutes: int, category: str) -> None:
         "\n".join(
             (
                 "version = '1'",
+                "[task]",
+                f"name = 'long-horizon-terminal-bench/{name}'",
                 "[metadata]",
                 f"expert_time_estimate_min = {expert_minutes}",
                 f"category = '{category}'",
@@ -47,12 +49,31 @@ def _result(
     directory = job / trial
     directory.mkdir(parents=True)
     resolved_arm = arm or job.name
+    result_task = task if "/" in task else f"long-horizon-terminal-bench/{task}"
     agent_config: dict[str, object] = {
         "name": None,
         "import_path": "driftlock.harbor_agent:LHTBDriftlockAgent",
         "model_name": "openrouter/deepseek/deepseek-v4-pro",
+        "override_timeout_sec": 5400,
+        "override_setup_timeout_sec": None,
+        "max_timeout_sec": None,
         "env": {"HB_CONTINUE_MODE": "same_conversation"},
         "kwargs": {
+            "api_base": "https://openrouter.ai/api/v1",
+            "parser_name": "json",
+            "temperature": 0.7,
+            "record_terminal_session": True,
+            "llm_call_kwargs": {
+                "temperature": 0.7,
+                "max_tokens": 8192,
+                "timeout": 240,
+            },
+            "model_info": {
+                "max_input_tokens": 128000,
+                "max_output_tokens": 8192,
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+            },
             "enable_summarize": False,
             "driftlock_max_tokens": 10_000,
             "driftlock_max_steps": 500,
@@ -67,11 +88,29 @@ def _result(
             "name": "terminus-2",
             "import_path": None,
             "model_name": "openrouter/deepseek/deepseek-v4-pro",
+            "override_timeout_sec": 5400,
+            "override_setup_timeout_sec": None,
+            "max_timeout_sec": None,
             "env": {"HB_CONTINUE_MODE": "fresh"},
             "kwargs": {
+                "api_base": "https://openrouter.ai/api/v1",
+                "parser_name": "json",
+                "temperature": 0.7,
+                "record_terminal_session": True,
+                "model_info": {
+                    "max_input_tokens": 128000,
+                    "max_output_tokens": 8192,
+                    "input_cost_per_token": 0,
+                    "output_cost_per_token": 0,
+                },
                 "enable_summarize": True,
                 "proactive_summarization_threshold": 8000,
-                "llm_call_kwargs": {"num_retries": 4},
+                "llm_call_kwargs": {
+                    "temperature": 0.7,
+                    "max_tokens": 8192,
+                    "timeout": 240,
+                    "num_retries": 4,
+                },
             },
         }
     elif resolved_arm == "retry":
@@ -82,23 +121,50 @@ def _result(
         assert isinstance(kwargs, dict)
         kwargs.update(
             {
-                "driftlock_judge_model": "openrouter/deepseek/v4-flash",
+                "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-flash-0731"),
                 "driftlock_judge_api_base": "https://judge.invalid/v1",
                 "driftlock_judge_max_output_tokens": 512,
             }
         )
     payload = {
-        "task_name": task,
+        "task_name": result_task,
         "trial_name": trial,
         "task_checksum": checksum or f"checksum-{task}",
         "agent_info": {
             "name": agent_name,
+            "version": "2.0.0" if resolved_arm == "stock" else "0.1.0",
             "model_info": {"provider": "openrouter", "name": model},
         },
         "config": {
             "job_id": _job_id(job),
             "trial_name": trial,
             "agent": agent_config,
+            "environment": {
+                "type": "docker",
+                "import_path": None,
+                "force_build": True,
+                "delete": True,
+                "override_cpus": None,
+                "override_memory_mb": None,
+                "override_storage_mb": None,
+                "override_gpus": None,
+                "suppress_override_warnings": False,
+                "mounts": None,
+                "env": {},
+                "kwargs": {},
+            },
+            "verifier": {
+                "override_timeout_sec": None,
+                "max_timeout_sec": None,
+                "env": {},
+                "disable": False,
+            },
+            "timeout_multiplier": 1.0,
+            "agent_timeout_multiplier": None,
+            "verifier_timeout_multiplier": None,
+            "agent_setup_timeout_multiplier": None,
+            "environment_build_timeout_multiplier": None,
+            "artifacts": [],
         },
         "agent_result": usage
         or {
@@ -238,6 +304,11 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     assert report["job_summaries"]["stock"]["n_total_trials"] == 2
     assert len(report["job_summaries"]["stock"]["result_sha256"]) == 64
     assert report["matrix"]["agent_model"] == ("openrouter/deepseek/deepseek-v4-pro")
+    assert report["matrix"]["agent_versions"] == {
+        "stock": "2.0.0",
+        "driftlock": "0.1.0",
+    }
+    assert len(report["matrix"]["experiment_signature_sha256"]) == 64
     assert report["arms"]["stock"]["mean_reward"] == 0.5
     assert report["arms"]["stock"][
         "failure_slope_per_task_length_doubling"
@@ -251,6 +322,10 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     assert drift["cache_hit_rate"] == 0.5
     assert drift["cost_usd"] == pytest.approx(0.4)
     assert drift["mean_duration_sec"] == 120
+    assert [item["task"] for item in drift["task_curve"]] == [
+        "long-horizon-terminal-bench/short",
+        "long-horizon-terminal-bench/long",
+    ]
     comparison = report["paired_vs_stock"]["driftlock"]
     assert comparison["mean_task_reward_delta"] == 0.5
     assert comparison["mean_task_failure_rate_delta"] == -0.5
@@ -390,6 +465,45 @@ def test_analyze_requires_compute_matched_controlled_budgets(tmp_path: Path) -> 
                 "retry": retry,
                 "driftlock": driftlock,
             },
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("temperature", "frozen harness"),
+        ("api_base", "different non-treatment"),
+        ("environment", "environment differs"),
+        ("version", "wrong agent config"),
+        ("judge_model", "fine judge"),
+    ],
+)
+def test_analyze_rejects_non_treatment_config_drift(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    if mutation == "temperature":
+        payload["config"]["agent"]["kwargs"]["temperature"] = 0
+    elif mutation == "api_base":
+        payload["config"]["agent"]["kwargs"]["api_base"] = (
+            "https://different.invalid/v1"
+        )
+    elif mutation == "environment":
+        payload["config"]["environment"]["delete"] = False
+    elif mutation == "version":
+        payload["agent_info"]["version"] = "9.9.9"
+    else:
+        payload["config"]["agent"]["kwargs"]["driftlock_judge_model"] = (
+            "openrouter/another-judge"
+        )
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
         )
 
 
