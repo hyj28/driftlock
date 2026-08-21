@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import difflib
 import hashlib
 import os
@@ -47,6 +46,23 @@ class LocalEnvironment:
         self.root = resolved
         self.default_timeout_sec = default_timeout_sec
         self.max_output_bytes = max_output_bytes
+        self._runtime = tempfile.TemporaryDirectory(prefix="driftlock-local-")
+        self._runtime_root = Path(self._runtime.name)
+        self._home = self._runtime_root / "home"
+        self._temporary = self._runtime_root / "tmp"
+        self._home.mkdir()
+        self._temporary.mkdir()
+
+    def close(self) -> None:
+        """Remove the environment-owned runtime directory."""
+
+        self._runtime.cleanup()
+
+    def __enter__(self) -> LocalEnvironment:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     async def exec(
         self,
@@ -62,20 +78,16 @@ class LocalEnvironment:
         timeout = self.default_timeout_sec if timeout_sec is None else timeout_sec
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
             raise ValueError("timeout_sec must be a positive integer or None")
-        with tempfile.TemporaryDirectory(prefix="driftlock-local-") as runtime:
-            runtime_root = Path(runtime)
-            home = runtime_root / "home"
-            temporary = runtime_root / "tmp"
-            home.mkdir()
-            temporary.mkdir()
-            environment = {
-                "HOME": str(home),
-                "LANG": os.environ.get("LANG", "C.UTF-8"),
-                "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "TMPDIR": str(temporary),
-            }
-            return await self._exec_process(command, timeout, environment)
+        if not self._runtime_root.is_dir():
+            raise RuntimeError("LocalEnvironment is closed")
+        environment = {
+            "HOME": str(self._home),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMPDIR": str(self._temporary),
+        }
+        return await self._exec_process(command, timeout, environment)
 
     async def _exec_process(
         self, command: str, timeout: int, environment: dict[str, str]
@@ -103,12 +115,21 @@ class LocalEnvironment:
             return_code = process.returncode if process.returncode is not None else 1
         except TimeoutError:
             timed_out = True
-            with contextlib.suppress(ProcessLookupError):
+            known_return_code = process.returncode
+            process_group_terminated = False
+            try:
                 os.killpg(process.pid, signal.SIGKILL)
+                process_group_terminated = True
+            except ProcessLookupError:
+                pass
             _close_process_pipes(process)
             stdout_task.cancel()
             stderr_task.cancel()
-            return_code = 124
+            return_code = (
+                known_return_code
+                if known_return_code is not None and process_group_terminated
+                else 124
+            )
         stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
         if timed_out:
             try:
@@ -119,7 +140,7 @@ class LocalEnvironment:
             except TimeoutError:
                 wait_task.cancel()
                 await asyncio.gather(wait_task, return_exceptions=True)
-        if timed_out:
+        if timed_out and return_code == 124:
             stderr += f"\ncommand timed out after {timeout} seconds".encode()
         return LocalExecResult(
             return_code=return_code,

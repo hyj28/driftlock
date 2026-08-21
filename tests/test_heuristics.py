@@ -67,3 +67,44 @@ def test_healthy_progress_does_not_trigger() -> None:
     ]
 
     assert judge.evaluate(steps) == ()
+
+
+def _command_record(
+    sequence: int, *, commands_run: int = 1, commands_failed: int = 1
+) -> StepRecord:
+    return StepRecord(
+        sequence=sequence,
+        logical_step=sequence,
+        attempt=1,
+        outcome=StepOutcome(
+            action=f"run command {sequence}",
+            state={},
+            changed_paths=(f"file-{sequence}",),
+            commands_run=commands_run,
+            commands_failed=commands_failed,
+        ),
+    )
+
+
+def test_detects_sustained_command_failure() -> None:
+    steps = [_command_record(sequence) for sequence in range(1, 9)]
+
+    signals = HeuristicJudge().evaluate(steps)
+
+    assert [(signal.kind, signal.lookback) for signal in signals] == [
+        ("sustained_command_failure", 8)
+    ]
+
+
+def test_sustained_command_failure_requires_every_command_to_fail() -> None:
+    steps = [_command_record(sequence) for sequence in range(1, 9)]
+    steps[4] = _command_record(5, commands_run=2, commands_failed=1)
+
+    assert HeuristicJudge().evaluate(steps) == ()
+
+
+def test_step_without_a_command_is_not_counted_as_command_failure() -> None:
+    steps = [_command_record(sequence) for sequence in range(1, 9)]
+    steps[4] = _command_record(5, commands_run=0, commands_failed=0)
+
+    assert HeuristicJudge().evaluate(steps) == ()

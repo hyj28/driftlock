@@ -37,6 +37,60 @@ async def test_local_environment_times_out_endless_output(tmp_path: Path) -> Non
     assert "command timed out after 1 seconds" in result.stderr
 
 
+async def test_local_environment_preserves_exit_of_pipe_holding_child(
+    tmp_path: Path,
+) -> None:
+    script = """\
+import subprocess
+
+subprocess.Popen(["sleep", "30"])
+print("started", flush=True)
+"""
+    environment = LocalEnvironment(tmp_path)
+
+    result = await asyncio.wait_for(
+        environment.exec(f"python3 -c {shlex.quote(script)}", timeout_sec=1),
+        timeout=4,
+    )
+
+    assert result.return_code == 0
+    assert result.stdout == "started\n"
+    assert "timed out" not in result.stderr
+
+
+async def test_local_environment_home_persists_until_close_and_stays_isolated(
+    tmp_path: Path,
+) -> None:
+    environment = LocalEnvironment(tmp_path)
+    write_script = """\
+import pathlib
+
+target = pathlib.Path.home() / ".config" / "identity"
+target.parent.mkdir(parents=True)
+target.write_text("a@b.c", encoding="utf-8")
+print(target)
+"""
+
+    written = await environment.exec(f"python3 -c {shlex.quote(write_script)}")
+    read_back = await environment.exec(
+        "python3 -c 'import pathlib; "
+        'print((pathlib.Path.home() / ".config" / "identity").read_text())\''
+    )
+    runtime_file = Path(written.stdout.strip())
+
+    assert written.return_code == 0
+    assert read_back.return_code == 0
+    assert read_back.stdout == "a@b.c\n"
+    assert tuple(tmp_path.iterdir()) == ()
+    assert not runtime_file.is_relative_to(tmp_path)
+
+    environment.close()
+
+    assert not runtime_file.exists()
+    with pytest.raises(RuntimeError, match="closed"):
+        await environment.exec("true")
+
+
 async def test_local_environment_upload_download_and_path_refusal(
     tmp_path: Path,
 ) -> None:

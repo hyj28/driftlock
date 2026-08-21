@@ -18,6 +18,8 @@ class HeuristicConfig:
     loop_repetitions: int = 3
     error_window: int = 5
     error_rate: float = 0.6
+    command_failure_window: int = 8
+    command_failure_rate: float = 1.0
     reward_stall_steps: int = 5
     reward_epsilon: float = 1e-6
 
@@ -27,6 +29,7 @@ class HeuristicConfig:
             self.loop_window,
             self.loop_repetitions,
             self.error_window,
+            self.command_failure_window,
             self.reward_stall_steps,
         )
         if any(value <= 0 for value in integer_fields):
@@ -35,6 +38,8 @@ class HeuristicConfig:
             raise ValueError("loop_repetitions cannot exceed loop_window")
         if not 0.0 <= self.error_rate <= 1.0:
             raise ValueError("error_rate must be between 0 and 1")
+        if not 0.0 <= self.command_failure_rate <= 1.0:
+            raise ValueError("command_failure_rate must be between 0 and 1")
         if self.reward_epsilon < 0:
             raise ValueError("reward_epsilon cannot be negative")
 
@@ -53,6 +58,7 @@ class HeuristicJudge:
             self.config.no_change_steps,
             self.config.loop_window,
             self.config.error_window,
+            self.config.command_failure_window,
             self.config.reward_stall_steps,
         )
 
@@ -104,6 +110,24 @@ class HeuristicJudge:
                         f"error rate is {rate:.0%} over the last "
                         f"{config.error_window} steps",
                         lookback=config.error_window,
+                    )
+                )
+
+        command_steps = steps[-config.command_failure_window :]
+        if len(command_steps) == config.command_failure_window:
+            all_failed = sum(
+                step.outcome.commands_run > 0
+                and step.outcome.commands_failed == step.outcome.commands_run
+                for step in command_steps
+            )
+            rate = all_failed / config.command_failure_window
+            if rate >= config.command_failure_rate:
+                signals.append(
+                    DriftSignal(
+                        "sustained_command_failure",
+                        f"all commands failed in {all_failed} of the last "
+                        f"{config.command_failure_window} steps",
+                        lookback=config.command_failure_window,
                     )
                 )
 

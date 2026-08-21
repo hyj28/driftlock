@@ -574,15 +574,32 @@ def test_default_prefill_estimator_reserves_utf8_bytes_and_framing() -> None:
     assert conservative_prefill_estimate(request) == 318
 
 
+def test_prefill_estimator_accepts_a_lone_surrogate() -> None:
+    request = AgentCompletionRequest(
+        messages=({"role": "assistant", "content": "\ud800"},),
+        tools=(),
+        max_output_tokens=100,
+    )
+
+    assert conservative_prefill_estimate(request) == 327
+
+
 async def test_runner_counts_failed_provider_usage(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     provider = ScriptedCompletion([AgentProviderError("failed", tokens=7)])
-    agent = _agent(workspace, provider)
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        max_output_tokens=100,
+        min_output_tokens=3,
+        prefill_estimator=lambda _request: 2,
+    )
     result = await DriftlockRunner(
         DirectoryCheckpointStore(workspace, tmp_path / "snapshots"),
         HeuristicJudge(),
-        config=RunnerConfig(max_steps=3, max_tokens=2_152),
+        config=RunnerConfig(max_steps=3, max_tokens=6),
     ).run(goal="bounded", step=agent, initial_state=agent.initial_state())
 
     assert result.status is RunStatus.TOKEN_LIMIT
@@ -798,6 +815,33 @@ async def test_model_shell_timeout_is_clamped_to_agent_ceiling() -> None:
         ("cd -- /remote/workspace && sleep 999999", 7, None)
     ]
     assert outcome.error is None
+
+
+async def test_shell_command_outcomes_are_recorded_separately_from_step_errors(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedCompletion(
+        [
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall("run_shell", {"command": "exit 9"}, "failed"),
+                    ToolCall("run_shell", {"command": "exit 0"}, "passed"),
+                )
+            )
+        ]
+    )
+    agent = _agent(workspace, provider)
+
+    outcome = await agent(_context(agent.initial_state()))
+
+    assert outcome.commands_run == 2
+    assert outcome.commands_failed == 1
+    assert outcome.error is None
+    assert len(outcome.tool_observations) == 2
+    assert "exit_code: 9" in outcome.tool_observations[0]
+    assert "exit_code: 0" in outcome.tool_observations[1]
 
 
 def test_truncation_marker_reports_exact_omitted_character_count() -> None:

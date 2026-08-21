@@ -71,6 +71,9 @@ class StepOutcome:
     diff: str = ""
     workspace_delta_observed: bool = True
     workspace_observation_error: str | None = None
+    commands_run: int = 0
+    commands_failed: int = 0
+    tool_observations: tuple[str, ...] = ()
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -86,6 +89,20 @@ class StepOutcome:
             self.workspace_observation_error, str
         ):
             raise TypeError("workspace_observation_error must be a string or None")
+        for name, value in (
+            ("commands_run", self.commands_run),
+            ("commands_failed", self.commands_failed),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if self.commands_failed > self.commands_run:
+            raise ValueError("commands_failed cannot exceed commands_run")
+        if not isinstance(self.tool_observations, tuple) or any(
+            not isinstance(observation, str) for observation in self.tool_observations
+        ):
+            raise TypeError("tool_observations must be a tuple of strings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +141,7 @@ class DriftContext:
     recent_steps: tuple[StepRecord, ...]
     diff: str
     tokens_remaining: int | None
+    tool_observations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

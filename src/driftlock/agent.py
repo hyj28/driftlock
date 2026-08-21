@@ -106,9 +106,13 @@ def conservative_prefill_estimate(request: AgentCompletionRequest) -> int:
         ],
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    try:
+        encoded = serialized.encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
     # A UTF-8 byte is the smallest unit a byte-level tokenizer can consume. The
     # fixed reserve covers provider-specific chat and tool framing omitted here.
-    return len(serialized.encode("utf-8")) + 256
+    return len(encoded) + 256
 
 
 class _ExecResult(Protocol):
@@ -124,6 +128,7 @@ class _ToolObservation:
     error: str | None = None
     completed: bool = False
     summary: str = ""
+    command_return_code: int | None = None
 
 
 class AgentConversationCodec:
@@ -307,6 +312,11 @@ class ToolCallingAgent:
 
         delta, observer_error = await self._observe_delta(before)
         observation_error = before_error or observer_error
+        command_return_codes = tuple(
+            observation.command_return_code
+            for observation in observations
+            if observation.command_return_code is not None
+        )
         return StepOutcome(
             action=_describe_action(completion),
             state=self.codec.encode(history, steps=completed_steps + 1),
@@ -314,6 +324,11 @@ class ToolCallingAgent:
             diff=delta.diff,
             workspace_delta_observed=observation_error is None,
             workspace_observation_error=observation_error,
+            commands_run=len(command_return_codes),
+            commands_failed=sum(code != 0 for code in command_return_codes),
+            tool_observations=tuple(
+                _render_tool_observation(observation) for observation in observations
+            ),
             error="; ".join(errors) or None,
             tokens=completion.tokens,
             completed=completed,
@@ -425,7 +440,11 @@ class ToolCallingAgent:
         )
         output = _format_exec_result(result)
         content = _truncate(output, self.max_tool_output_chars)
-        return _ToolObservation(call, content)
+        return _ToolObservation(
+            call,
+            content,
+            command_return_code=result.return_code,
+        )
 
     async def _read_file(
         self,
@@ -699,6 +718,10 @@ def _observation_message(observation: _ToolObservation) -> dict[str, Any]:
         "content": observation.content,
         "is_error": observation.error is not None,
     }
+
+
+def _render_tool_observation(observation: _ToolObservation) -> str:
+    return f"{observation.call.name}:\n{observation.content}"
 
 
 def _tool_error(call: ToolCall, message: str) -> _ToolObservation:

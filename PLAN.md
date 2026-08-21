@@ -384,6 +384,7 @@ the results section stays empty, per §1.
 | 7 | **Wall-clock** — 292 runs, of which 32 are 90-minute LHTB tasks | Schedule pressure | Parallelize on the cloud box; box must be sized for concurrent containers |
 | 8 | **Budget overrun** — ~$41 of API leaves room for roughly one redo | Can't iterate | Use V4-Flash during development; hold the 8-task LHTB subset |
 | 9 | **Attribution against external baselines** — with subagents in the agent, comparisons to Memento / ReasoningBank / GEPA can't isolate which component won | Weaker external claim | Accepted. All four arms per benchmark share the same agent, so every *internal* comparison is clean; external numbers are cited as reference points, not as controlled comparisons |
+| 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
 
 ---
 

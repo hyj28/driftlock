@@ -108,6 +108,50 @@ async def test_fine_judge_can_veto_a_coarse_signal(tmp_path: Path) -> None:
     assert result.rollbacks == ()
 
 
+async def test_runner_passes_bounded_tool_observations_to_fine_judge(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+    contexts: list[DriftContext] = []
+
+    class CapturingJudge:
+        async def judge(self, context: DriftContext) -> JudgeVerdict:
+            contexts.append(context)
+            return JudgeVerdict(Verdict.HEALTHY, "test failures show progress")
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"test attempt {context.logical_step}",
+            state={},
+            tool_observations=(
+                f"run_shell:\nexit_code: 1\nstderr:\nfailure-{context.logical_step}-"
+                + "x" * 1_200,
+            ),
+        )
+
+    await DriftlockRunner(
+        store,
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=9,
+                loop_window=10,
+                loop_repetitions=10,
+                error_window=10,
+                command_failure_window=10,
+                reward_stall_steps=10,
+            )
+        ),
+        fine_judge=CapturingJudge(),
+        config=RunnerConfig(max_steps=9, checkpoint_interval=10),
+    ).run(goal="fix tests", step=agent_step, initial_state={})
+
+    assert len(contexts) == 1
+    assert len(contexts[0].tool_observations) == 8
+    assert sum(map(len, contexts[0].tool_observations)) == 8_000
+    assert contexts[0].tool_observations[0].startswith("step 2:\nrun_shell:")
+    assert contexts[0].tool_observations[-1].startswith("step 9:\nrun_shell:")
+
+
 async def test_runner_enforces_token_budget(tmp_path: Path) -> None:
     _workspace, store = _store(tmp_path)
     remaining: list[int | None] = []

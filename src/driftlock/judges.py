@@ -96,6 +96,7 @@ def _build_prompt(context: DriftContext) -> str:
             for signal in context.signals
         ],
         "recent_trajectory": trajectory,
+        "recent_tool_observations": list(context.tool_observations),
         "latest_diff": context.diff,
         "tokens_remaining": context.tokens_remaining,
     }

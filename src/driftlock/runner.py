@@ -26,6 +26,9 @@ from driftlock.models import (
 
 StepFunction = Callable[[StepContext], Awaitable[StepOutcome]]
 
+_JUDGE_TOOL_OBSERVATION_CHARS = 8_000
+_JUDGE_TOOL_OBSERVATION_ITEM_CHARS = 1_000
+
 
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
@@ -299,6 +302,7 @@ class DriftlockRunner:
                 recent_steps=recent,
                 diff=recent[-1].outcome.diff if recent else "",
                 tokens_remaining=self._tokens_remaining(tokens_used),
+                tool_observations=_bounded_tool_observations(recent),
             )
         )
 
@@ -401,3 +405,21 @@ class DriftlockRunner:
             agent_tokens_used,
             judge_tokens_used,
         )
+
+
+def _bounded_tool_observations(steps: tuple[StepRecord, ...]) -> tuple[str, ...]:
+    selected: list[str] = []
+    remaining = _JUDGE_TOOL_OBSERVATION_CHARS
+    for step in reversed(steps):
+        for observation in reversed(step.outcome.tool_observations):
+            if remaining == 0:
+                break
+            rendered = f"step {step.logical_step}:\n{observation}"
+            rendered = rendered[:_JUDGE_TOOL_OBSERVATION_ITEM_CHARS]
+            rendered = rendered[:remaining]
+            selected.append(rendered)
+            remaining -= len(rendered)
+        if remaining == 0:
+            break
+    selected.reverse()
+    return tuple(selected)
