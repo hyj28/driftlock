@@ -551,9 +551,7 @@ async def test_workspace_observer_reports_content_and_git_view_changes() -> None
     environment = FakeEnvironment(
         [
             RemoteResult(
-                "d\0./src\0metadata:\0f\0./src/a.py\0metadata:"
-                + "a" * 64
-                + "\0"
+                "d\0./src\0metadata:\0f\0./src/a.py\0metadata:" + "a" * 64 + "\0"
             ),
             RemoteResult("-old\n"),
             RemoteResult(
@@ -589,8 +587,7 @@ def test_workspace_observer_rejects_root_or_relative_workspace() -> None:
 
 def test_workspace_manifest_supports_newlines_and_rejects_bad_digests() -> None:
     parsed = lhtb._parse_sha256_manifest(
-        "d\0./empty\nname\0metadata:\0"
-        "l\0./link\0metadata:7461726765740a6e616d65\0"
+        "d\0./empty\nname\0metadata:\0l\0./link\0metadata:7461726765740a6e616d65\0"
     )
 
     assert parsed == {
@@ -689,9 +686,7 @@ async def test_before_restore_replaces_shell_and_verifies_cwd(
     await runtime.before_workspace_restore("/app")
 
     cleanup = next(
-        call["command"]
-        for call in environment.calls
-        if "kill -STOP" in call["command"]
+        call["command"] for call in environment.calls if "kill -STOP" in call["command"]
     )
     assert "kill -KILL" in cleanup
     assert "2:100 3:200" in cleanup
