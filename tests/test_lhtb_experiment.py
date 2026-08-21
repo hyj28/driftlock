@@ -45,6 +45,7 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
     assert agent["kwargs"]["driftlock_judge_api_base"] == experiment.DEFAULT_API_BASE
     assert agent["kwargs"]["enable_summarize"] is False
     assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
+    assert len(agent["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"]) == 64
     assert "num_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert "max_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert config["retry"]["max_retries"] == 0
@@ -125,6 +126,7 @@ def test_build_stock_config_matches_leaderboard_retry_behavior(tmp_path: Path) -
     agent = config["agents"][0]
     assert agent["name"] == "terminus-2"
     assert agent["env"]["HB_CONTINUE_MODE"] == "fresh"
+    assert len(agent["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"]) == 64
     assert agent["kwargs"]["enable_summarize"] is True
     assert agent["kwargs"]["llm_call_kwargs"]["num_retries"] == 4
 

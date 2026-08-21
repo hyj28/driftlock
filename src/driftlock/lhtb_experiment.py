@@ -20,6 +20,7 @@ from driftlock.lhtb import (
     DRIFTLOCK_HARBOR_PATCH_VERSION,
     LHTB_LITELLM_VERSION,
     LHTB_REPOSITORY_REVISION,
+    lhtb_experiment_fingerprint,
 )
 from driftlock.lhtb_analysis import analyze_jobs, parse_arm_directories
 
@@ -126,7 +127,10 @@ def build_job_config(
     }
     if arm == "stock":
         agent["name"] = "terminus-2"
-        agent["env"] = {"HB_CONTINUE_MODE": "fresh"}
+        agent["env"] = {
+            "HB_CONTINUE_MODE": "fresh",
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+        }
         agent["kwargs"].update(
             {
                 "enable_summarize": True,
@@ -140,7 +144,10 @@ def build_job_config(
             if arm == "retry"
             else "driftlock.harbor_agent:LHTBDriftlockAgent"
         )
-        agent["env"] = {"HB_CONTINUE_MODE": "same_conversation"}
+        agent["env"] = {
+            "HB_CONTINUE_MODE": "same_conversation",
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+        }
         agent["kwargs"].update(
             {
                 "enable_summarize": False,

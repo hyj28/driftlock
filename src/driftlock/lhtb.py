@@ -8,6 +8,7 @@ pinned LHTB checkout and apply the packaged companion patch.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import importlib.metadata
 import importlib.resources
 import inspect
@@ -54,6 +55,24 @@ _OUTPUT_TOKEN_KEYS = frozenset(
 
 class LHTBRuntimeCompatibilityError(RuntimeError):
     """Raised when the installed Harbor fork is not the pinned integration."""
+
+
+def lhtb_experiment_fingerprint() -> str:
+    """Hash the installed driftlock source and packaged Harbor companion patch."""
+    package_root = Path(__file__).resolve().parent
+    sources = sorted(package_root.rglob("*.py"))
+    patch = lhtb_harbor_patch_path().resolve()
+    sources.append(patch)
+    digest = hashlib.sha256()
+    for source in sources:
+        relative = source.relative_to(package_root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with source.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,9 +550,7 @@ class LHTBTerminusRuntime:
                 if getattr(self._counting_llm.delegate, "_use_responses_api", False)
                 else "max_tokens"
             )
-            configured_values = (
-                old_call_kwargs.get(key) for key in _OUTPUT_TOKEN_KEYS
-            )
+            configured_values = (old_call_kwargs.get(key) for key in _OUTPUT_TOKEN_KEYS)
             for configured in configured_values:
                 if isinstance(configured, int) and not isinstance(configured, bool):
                     ceiling = min(ceiling, configured)
@@ -821,9 +838,7 @@ def _conservative_input_token_bound(agent: Any, chat: Any, prompt: str) -> int:
     ).encode("utf-8")
     byte_bound = len(encoded) + 32 * len(messages) + 256
     try:
-        token_counter = __import__(
-            "litellm", fromlist=["token_counter"]
-        ).token_counter
+        token_counter = __import__("litellm", fromlist=["token_counter"]).token_counter
         estimated = token_counter(model=agent._model_name, messages=messages)
     except Exception:
         estimated = 0
@@ -905,8 +920,7 @@ def _mcp_section(agent: Any) -> str:
             )
         else:
             value += (
-                f"- {server.name}: {server.transport} transport, "
-                f"url: {server.url}\n"
+                f"- {server.name}: {server.transport} transport, url: {server.url}\n"
             )
     return value
 
@@ -944,9 +958,7 @@ def _record_truncation(agent: Any, prompt: str, error: BaseException) -> Any:
     )
     step_type = _harbor_symbol("harbor.models.trajectories", "Step")
     observation_type = _harbor_symbol("harbor.models.trajectories", "Observation")
-    result_type = _harbor_symbol(
-        "harbor.models.trajectories", "ObservationResult"
-    )
+    result_type = _harbor_symbol("harbor.models.trajectories", "ObservationResult")
     metrics_type = _harbor_symbol("harbor.models.trajectories", "Metrics")
     step = step_type(
         step_id=len(agent._trajectory_steps) + 1,
@@ -1057,9 +1069,7 @@ def _parse_sha256_manifest(output: str) -> dict[str, str]:
         payload = value.rsplit(":", 1)[-1]
         if kind == "f" and (
             len(payload) != 64
-            or any(
-                character not in "0123456789abcdefABCDEF" for character in payload
-            )
+            or any(character not in "0123456789abcdefABCDEF" for character in payload)
         ):
             raise RuntimeError("remote workspace returned an invalid SHA-256 digest")
         files[normalized] = f"{kind}:{value.lower() if kind == 'f' else value}"
@@ -1257,8 +1267,11 @@ exit 42
 
 def _valid_process_identity(value: str) -> bool:
     pid, separator, start = value.partition(":")
-    return separator == ":" and pid.isascii() and start.isascii() and (
-        pid.isdigit() and start.isdigit() and int(pid) > 0 and int(start) > 0
+    return (
+        separator == ":"
+        and pid.isascii()
+        and start.isascii()
+        and (pid.isdigit() and start.isdigit() and int(pid) > 0 and int(start) > 0)
     )
 
 

@@ -339,7 +339,10 @@ through each `task.toml`, while agent versions and all common non-treatment sett
 (model API, temperatures, request limits, timeouts, environment, and verifier) are
 validated and summarized by a configuration SHA-256. Harbor retries must be zero,
 and official job-level token/cache/cost totals must reconcile with the trial files.
-Every input `result.json` path and SHA-256 is retained.
+The canonical Harbor `lock.json` binds zero configured retries, concurrency, task
+matrix, pinned Harbor revision, and a build fingerprint over all installed driftlock
+Python sources plus the companion patch. Trial UUIDs must be globally unique. Every
+input `result.json` path and SHA-256 is retained.
 
 ```bash
 driftlock-lhtb analyze --lhtb-dir /srv/LHTB \

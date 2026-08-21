@@ -13,6 +13,7 @@ from driftlock.lhtb import (
     WorkspaceDelta,
     WorkspaceDeltaObserver,
     WorkspaceSnapshot,
+    lhtb_experiment_fingerprint,
     lhtb_harbor_patch_path,
 )
 from driftlock.lhtb_analysis import (
@@ -85,5 +86,6 @@ __all__ = [
     "analyze_jobs",
     "goal_drift_actions",
     "goal_drift_inaction",
+    "lhtb_experiment_fingerprint",
     "lhtb_harbor_patch_path",
 ]

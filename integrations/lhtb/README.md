@@ -174,6 +174,12 @@ API, temperature, request ceilings, timeout, environment, and verifier—are fro
 recorded through a common configuration SHA-256. Harbor's job-level retry count must
 remain zero, and its canonical token/cache/output/cost totals are reconciled against
 the loaded trial results.
+The analyzer also ingests canonical Harbor `lock.json`: configured retries must be
+zero, job concurrency must agree across arms, lock trials must match result configs,
+and Harbor must be the pinned editable revision. Job generation embeds a SHA-256 over
+all installed driftlock Python sources and the packaged Harbor patch; both lock and
+trial config must carry that exact fingerprint. Trial UUIDs are required and globally
+unique.
 `--allow-incomplete-matrix` is available only for explicitly exploratory reports and
 records `matrix.complete=false`; aggregate token, cost, and slope deltas are `null`
 for any arm whose workload does not match stock.

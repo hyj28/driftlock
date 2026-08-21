@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
 from driftlock.lhtb_analysis import (
     _task_directory_sha256,
     analyze_jobs,
@@ -57,7 +59,10 @@ def _result(
         "override_timeout_sec": 5400,
         "override_setup_timeout_sec": None,
         "max_timeout_sec": None,
-        "env": {"HB_CONTINUE_MODE": "same_conversation"},
+        "env": {
+            "HB_CONTINUE_MODE": "same_conversation",
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+        },
         "kwargs": {
             "api_base": "https://openrouter.ai/api/v1",
             "parser_name": "json",
@@ -91,7 +96,10 @@ def _result(
             "override_timeout_sec": 5400,
             "override_setup_timeout_sec": None,
             "max_timeout_sec": None,
-            "env": {"HB_CONTINUE_MODE": "fresh"},
+            "env": {
+                "HB_CONTINUE_MODE": "fresh",
+                "DRIFTLOCK_EXPERIMENT_FINGERPRINT": (lhtb_experiment_fingerprint()),
+            },
             "kwargs": {
                 "api_base": "https://openrouter.ai/api/v1",
                 "parser_name": "json",
@@ -127,6 +135,7 @@ def _result(
             }
         )
     payload = {
+        "id": str(uuid5(NAMESPACE_URL, f"{job.resolve()}:{trial}")),
         "task_name": result_task,
         "trial_name": trial,
         "task_checksum": checksum or f"checksum-{task}",
@@ -215,6 +224,62 @@ def _job_summary(
         for context in contexts:
             for field in usage:
                 usage[field] += context[field]
+    lock_trials = []
+    for result_file in sorted(job.glob("*/result.json")):
+        trial = json.loads(result_file.read_text())
+        config = trial["config"]
+        lock_trials.append(
+            {
+                "task": {
+                    "name": trial["task_name"],
+                    "type": "local",
+                    "digest": f"sha256:{trial['task_checksum']}",
+                    "source": None,
+                    "path": f"/tasks/{trial['task_name'].split('/')[-1]}",
+                    "git_url": None,
+                    "git_commit_id": None,
+                },
+                "timeout_multiplier": config["timeout_multiplier"],
+                "agent_timeout_multiplier": config["agent_timeout_multiplier"],
+                "verifier_timeout_multiplier": config["verifier_timeout_multiplier"],
+                "agent_setup_timeout_multiplier": config[
+                    "agent_setup_timeout_multiplier"
+                ],
+                "environment_build_timeout_multiplier": config[
+                    "environment_build_timeout_multiplier"
+                ],
+                "agent": config["agent"],
+                "environment": config["environment"],
+                "verifier": config["verifier"],
+            }
+        )
+    lock = {
+        "schema_version": 1,
+        "created_at": "2026-08-20T09:00:00+00:00",
+        "harbor": {
+            "version": "0.7.0",
+            "git_commit_hash": LHTB_REPOSITORY_REVISION,
+            "is_editable": True,
+        },
+        "invocation": ["harbor", "run", "-c", "driftlock-job.json"],
+        "n_concurrent_trials": 1,
+        "retry": {
+            "max_retries": 0,
+            "include_exceptions": None,
+            "exclude_exceptions": [
+                "AgentTimeoutError",
+                "VerifierTimeoutError",
+                "RewardFileNotFoundError",
+                "RewardFileEmptyError",
+                "VerifierOutputParseError",
+            ],
+            "wait_multiplier": 1.0,
+            "min_wait_sec": 1.0,
+            "max_wait_sec": 60.0,
+        },
+        "trials": lock_trials,
+    }
+    (job / "lock.json").write_text(json.dumps(lock), encoding="utf-8")
     payload = {
         "id": _job_id(job),
         "started_at": "2026-08-20T09:00:00+00:00",
@@ -436,6 +501,53 @@ def test_analyze_binds_trial_to_job_summary_and_directory(tmp_path: Path) -> Non
         )
 
 
+def test_analyze_requires_globally_unique_trial_ids(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    first = json.loads((driftlock / "short-1" / "result.json").read_text())
+    second_path = driftlock / "long-1" / "result.json"
+    second = json.loads(second_path.read_text())
+    second["id"] = first["id"]
+    second_path.write_text(json.dumps(second), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate Harbor trial id"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("retry", "forbidden retries"),
+        ("concurrency", "different Harbor job-level settings"),
+        ("harbor", "pinned editable build"),
+        ("fingerprint", "invalid trial provenance"),
+    ],
+)
+def test_analyze_validates_canonical_job_lock(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    lock_path = driftlock / "lock.json"
+    lock = json.loads(lock_path.read_text())
+    if mutation == "retry":
+        lock["retry"]["max_retries"] = 1
+    elif mutation == "concurrency":
+        lock["n_concurrent_trials"] = 2
+    elif mutation == "harbor":
+        lock["harbor"]["git_commit_hash"] = "0" * 40
+    else:
+        lock["trials"][0]["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = "0" * 64
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
 def test_analyze_distinguishes_heuristic_and_fine_judge_arms(
     tmp_path: Path,
 ) -> None:
@@ -495,7 +607,7 @@ def test_analyze_requires_compute_matched_controlled_budgets(tmp_path: Path) -> 
     ("mutation", "message"),
     [
         ("temperature", "frozen harness"),
-        ("api_base", "different non-treatment"),
+        ("api_base", "canonical Harbor lock"),
         ("environment", "environment differs"),
         ("version", "wrong agent config"),
         ("judge_model", "fine judge"),
@@ -615,6 +727,7 @@ def test_analyze_accepts_providerless_harbor_model_identity(tmp_path: Path) -> N
             }
             payload["config"]["agent"]["model_name"] = "gpt-5.4"
             result_file.write_text(json.dumps(payload), encoding="utf-8")
+        _job_summary(job, 2)
 
     report = analyze_jobs(
         lhtb_dir=lhtb,
@@ -654,8 +767,8 @@ def test_analyze_aggregates_harbor_multi_step_usage(tmp_path: Path) -> None:
         },
         {
             "agent_result": {
-                    "n_input_tokens": 70,
-                    "n_cache_tokens": 40,
+                "n_input_tokens": 70,
+                "n_cache_tokens": 40,
                 "n_output_tokens": 25,
                 "cost_usd": 0.2,
             }

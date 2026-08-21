@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
+
 ANALYSIS_ARMS = (
     "stock",
     "retry",
@@ -100,6 +102,7 @@ def analyze_jobs(
     job_summaries: dict[str, dict[str, Any]] = {}
     task_metadata_cache: dict[str, dict[str, Any]] = {}
     seen_results: set[Path] = set()
+    seen_trial_ids: set[str] = set()
     for arm, raw_directory in arm_directories.items():
         directory = raw_directory.expanduser().resolve()
         if not directory.is_dir():
@@ -121,21 +124,44 @@ def analyze_jobs(
                     f"result file is assigned to multiple arms: {resolved}"
                 )
             seen_results.add(resolved)
-            trials.append(
-                _load_trial(
-                    result_file=resolved,
-                    arm=arm,
-                    job_id=job_summaries[arm]["job_id"],
-                    task_index=task_index,
-                    task_metadata_cache=task_metadata_cache,
-                    solve_threshold=solve_threshold,
-                )
+            trial = _load_trial(
+                result_file=resolved,
+                arm=arm,
+                job_id=job_summaries[arm]["job_id"],
+                task_index=task_index,
+                task_metadata_cache=task_metadata_cache,
+                solve_threshold=solve_threshold,
+            )
+            if trial["trial_id"] in seen_trial_ids:
+                raise ValueError(f"duplicate Harbor trial id: {trial['trial_id']}")
+            seen_trial_ids.add(trial["trial_id"])
+            trials.append(trial)
+        actual_task_counts: dict[str, int] = defaultdict(int)
+        for trial in trials:
+            actual_task_counts[trial["task"]] += 1
+        if (
+            dict(sorted(actual_task_counts.items()))
+            != job_summaries[arm]["lock_task_counts"]
+        ):
+            raise ValueError(f"arm {arm!r} trial results do not match Harbor lock")
+        if (
+            sorted(trial["lock_trial_signature"] for trial in trials)
+            != job_summaries[arm]["lock_trial_signatures"]
+        ):
+            raise ValueError(
+                f"arm {arm!r} trial configs do not match canonical Harbor lock"
             )
         trials_by_arm[arm] = trials
 
     matrix = _validate_matrix(
         trials_by_arm, require_complete_matrix=require_complete_matrix
     )
+    lock_signatures = {
+        summary["lock_signature_sha256"] for summary in job_summaries.values()
+    }
+    if len(lock_signatures) != 1:
+        raise ValueError("experiment arms use different Harbor job-level settings")
+    matrix["job_lock_signature_sha256"] = next(iter(lock_signatures))
     arm_reports = {
         arm: _aggregate_arm(trials, solve_threshold=solve_threshold)
         for arm, trials in trials_by_arm.items()
@@ -251,6 +277,7 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
     }
     if usage["cache_tokens"] > usage["input_tokens"]:
         raise ValueError(f"job cache tokens exceed input tokens in {result_file}")
+    lock = _load_job_lock(directory, arm, n_total)
     return {
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
@@ -259,6 +286,75 @@ def _load_job_summary(directory: Path, arm: str) -> dict[str, Any]:
         "n_retries": retries,
         "usage": usage,
         "finished_at": finished,
+        **lock,
+    }
+
+
+def _load_job_lock(directory: Path, arm: str, n_total: int) -> dict[str, Any]:
+    lock_file = directory / "lock.json"
+    if not lock_file.is_file():
+        raise ValueError(f"arm {arm!r} lacks its canonical Harbor lock.json")
+    try:
+        data = json.loads(lock_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON in {lock_file}: {error}") from error
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise ValueError(f"invalid Harbor job lock in {lock_file}")
+    harbor = data.get("harbor")
+    if not isinstance(harbor, dict) or (
+        harbor.get("version") != "0.7.0"
+        or harbor.get("git_commit_hash") != LHTB_REPOSITORY_REVISION
+        or harbor.get("is_editable") is not True
+    ):
+        raise ValueError(f"Harbor lock is not the pinned editable build: {lock_file}")
+    concurrency = _positive_integer(
+        data.get("n_concurrent_trials"), f"n_concurrent_trials in {lock_file}"
+    )
+    retry = data.get("retry")
+    if not isinstance(retry, dict) or retry.get("max_retries") != 0:
+        raise ValueError(f"Harbor lock enables forbidden retries: {lock_file}")
+    trials = data.get("trials")
+    if not isinstance(trials, list) or len(trials) != n_total:
+        raise ValueError(f"Harbor lock trial count mismatch in {lock_file}")
+    fingerprint = lhtb_experiment_fingerprint()
+    task_counts: dict[str, int] = defaultdict(int)
+    trial_signatures: list[str] = []
+    for trial in trials:
+        task = trial.get("task") if isinstance(trial, dict) else None
+        agent = trial.get("agent") if isinstance(trial, dict) else None
+        name = task.get("name") if isinstance(task, dict) else None
+        digest = task.get("digest") if isinstance(task, dict) else None
+        environment = agent.get("env") if isinstance(agent, dict) else None
+        if (
+            not isinstance(name, str)
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+            or not isinstance(environment, dict)
+            or environment.get("DRIFTLOCK_EXPERIMENT_FINGERPRINT") != fingerprint
+        ):
+            raise ValueError(f"invalid trial provenance in Harbor lock: {lock_file}")
+        task_counts[name] += 1
+        trial_signatures.append(_lock_trial_signature(name, trial))
+    signature_payload = {
+        "schema_version": 1,
+        "harbor": harbor,
+        "n_concurrent_trials": concurrency,
+        "retry": retry,
+        "driftlock_experiment_fingerprint": fingerprint,
+    }
+    signature = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return {
+        "lock_file": str(lock_file),
+        "lock_sha256": _file_sha256(lock_file),
+        "lock_signature_sha256": signature,
+        "lock_task_counts": dict(sorted(task_counts.items())),
+        "lock_trial_signatures": sorted(trial_signatures),
+        "n_concurrent_trials": concurrency,
+        "driftlock_experiment_fingerprint": fingerprint,
     }
 
 
@@ -294,6 +390,7 @@ def _load_trial(
         raise ValueError(f"invalid JSON in {result_file}: {error}") from error
     if not isinstance(data, dict):
         raise ValueError(f"Harbor result must be an object: {result_file}")
+    trial_id = _uuid_string(data.get("id"), f"trial id in {result_file}")
     _validate_trial_provenance(data, result_file, job_id)
     task = data.get("task_name")
     if not isinstance(task, str) or task not in task_index:
@@ -318,6 +415,7 @@ def _load_trial(
     duration = _duration_seconds(data, result_file)
     return {
         "arm": arm,
+        "trial_id": trial_id,
         "task": task,
         "reward": reward,
         "solved": reward >= solve_threshold,
@@ -326,6 +424,7 @@ def _load_trial(
         "agent_version": data["agent_info"]["version"],
         "total_token_budget": total_token_budget,
         "experiment_signature": experiment_signature,
+        "lock_trial_signature": _lock_trial_signature(task, data["config"]),
         "expert_time_estimate_min": task_metadata["expert_time_estimate_min"],
         "category": task_metadata["category"],
         "input_tokens": usage["input_tokens"],
@@ -337,6 +436,24 @@ def _load_trial(
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
     }
+
+
+def _lock_trial_signature(task_name: str, config: dict[str, Any]) -> str:
+    payload = {
+        "task": task_name,
+        "timeout_multiplier": config.get("timeout_multiplier"),
+        "agent_timeout_multiplier": config.get("agent_timeout_multiplier"),
+        "verifier_timeout_multiplier": config.get("verifier_timeout_multiplier"),
+        "agent_setup_timeout_multiplier": config.get("agent_setup_timeout_multiplier"),
+        "environment_build_timeout_multiplier": config.get(
+            "environment_build_timeout_multiplier"
+        ),
+        "agent": config.get("agent"),
+        "environment": config.get("environment"),
+        "verifier": config.get("verifier"),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _validate_trial_provenance(
@@ -413,12 +530,16 @@ def _validate_arm_identity(
     experiment_signature = _experiment_signature(config, kwargs, model, result_file)
 
     if arm == "stock":
+        expected_environment = {
+            "HB_CONTINUE_MODE": "fresh",
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+        }
         valid = (
             info_name == "terminus-2"
             and info_version == "2.0.0"
             and agent.get("name") == "terminus-2"
             and agent.get("import_path") is None
-            and environment == {"HB_CONTINUE_MODE": "fresh"}
+            and environment == expected_environment
             and set(kwargs)
             == base_kwargs | {"enable_summarize", "proactive_summarization_threshold"}
             and kwargs.get("enable_summarize") is True
@@ -448,7 +569,11 @@ def _validate_arm_identity(
         and info_version == _installed_driftlock_version()
         and agent.get("name") is None
         and agent.get("import_path") == expected_import_path
-        and environment == {"HB_CONTINUE_MODE": "same_conversation"}
+        and environment
+        == {
+            "HB_CONTINUE_MODE": "same_conversation",
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+        }
         and kwargs.get("enable_summarize") is False
         and set(llm_kwargs) == {"temperature", "max_tokens", "timeout"}
     )
