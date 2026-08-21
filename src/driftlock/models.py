@@ -69,6 +69,8 @@ class StepOutcome:
     state: Mapping[str, Any]
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    workspace_delta_observed: bool = True
+    workspace_observation_error: str | None = None
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -78,6 +80,12 @@ class StepOutcome:
     def __post_init__(self) -> None:
         if self.tokens < 0:
             raise ValueError("tokens cannot be negative")
+        if not isinstance(self.workspace_delta_observed, bool):
+            raise TypeError("workspace_delta_observed must be a boolean")
+        if self.workspace_observation_error is not None and not isinstance(
+            self.workspace_observation_error, str
+        ):
+            raise TypeError("workspace_observation_error must be a string or None")
 
 
 @dataclass(frozen=True, slots=True)

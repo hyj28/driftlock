@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import os
 import shutil
 import signal
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
+
+_PROCESS_CLEANUP_TIMEOUT_SEC = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,13 +62,24 @@ class LocalEnvironment:
         timeout = self.default_timeout_sec if timeout_sec is None else timeout_sec
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
             raise ValueError("timeout_sec must be a positive integer or None")
-        environment = {
-            "HOME": str(self.root),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "TMPDIR": str(self.root),
-        }
+        with tempfile.TemporaryDirectory(prefix="driftlock-local-") as runtime:
+            runtime_root = Path(runtime)
+            home = runtime_root / "home"
+            temporary = runtime_root / "tmp"
+            home.mkdir()
+            temporary.mkdir()
+            environment = {
+                "HOME": str(home),
+                "LANG": os.environ.get("LANG", "C.UTF-8"),
+                "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "TMPDIR": str(temporary),
+            }
+            return await self._exec_process(command, timeout, environment)
+
+    async def _exec_process(
+        self, command: str, timeout: int, environment: dict[str, str]
+    ) -> LocalExecResult:
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=self.root,
@@ -81,16 +96,29 @@ class LocalEnvironment:
         stderr_task = asyncio.create_task(
             _read_capped(process.stderr, self.max_output_bytes)
         )
+        wait_task = asyncio.create_task(process.wait())
         timed_out = False
         try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
             return_code = process.returncode if process.returncode is not None else 1
         except TimeoutError:
             timed_out = True
-            os.killpg(process.pid, signal.SIGKILL)
-            await process.wait()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            _close_process_pipes(process)
+            stdout_task.cancel()
+            stderr_task.cancel()
             return_code = 124
         stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+        if timed_out:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task),
+                    timeout=_PROCESS_CLEANUP_TIMEOUT_SEC,
+                )
+            except TimeoutError:
+                wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
         if timed_out:
             stderr += f"\ncommand timed out after {timeout} seconds".encode()
         return LocalExecResult(
@@ -189,7 +217,20 @@ def _decode_capped(value: bytes, limit: int) -> str:
 
 async def _read_capped(stream: asyncio.StreamReader, limit: int) -> bytes:
     retained = bytearray()
-    while chunk := await stream.read(64 * 1024):
-        if len(retained) <= limit:
-            retained.extend(chunk[: limit + 1 - len(retained)])
+    try:
+        while chunk := await stream.read(64 * 1024):
+            if len(retained) <= limit:
+                retained.extend(chunk[: limit + 1 - len(retained)])
+    except asyncio.CancelledError:
+        pass
     return bytes(retained)
+
+
+def _close_process_pipes(process: asyncio.subprocess.Process) -> None:
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        return
+    for descriptor in (1, 2):
+        pipe = transport.get_pipe_transport(descriptor)
+        if pipe is not None:
+            pipe.close()

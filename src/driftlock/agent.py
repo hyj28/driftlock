@@ -148,6 +148,20 @@ class AgentConversationCodec:
             not isinstance(message, Mapping) for message in messages
         ):
             raise AgentStateError("tool-agent messages must be a list of objects")
+        for index, message in enumerate(messages):
+            role = message.get("role")
+            if not isinstance(role, str):
+                raise AgentStateError(
+                    f"tool-agent message {index} must contain a string role"
+                )
+            if role not in {"assistant", "system", "tool", "user"}:
+                raise AgentStateError(
+                    f"tool-agent message {index} has unsupported role {role!r}"
+                )
+            if "content" not in message:
+                raise AgentStateError(
+                    f"tool-agent message {index} must contain content"
+                )
         steps = payload.get("steps")
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
             raise AgentStateError("tool-agent steps must be a non-negative integer")
@@ -195,7 +209,7 @@ class ToolCallingAgent:
         output_cap = self._output_cap(context.tokens_remaining)
         history, completed_steps = self.codec.decode(context.state)
         workspace = await self.observer.canonical_workspace()
-        before = await self.observer.snapshot()
+        before, before_error = await self._snapshot_workspace()
         request = AgentCompletionRequest(
             messages=self._request_messages(context, history),
             tools=_TOOL_DEFINITIONS,
@@ -204,8 +218,7 @@ class ToolCallingAgent:
 
         try:
             completion = await self._complete(request)
-        except Exception as error:
-            tokens = _error_tokens(error)
+        except AgentProviderError as error:
             message = f"Provider call failed: {error}"
             updated = [
                 *history,
@@ -218,15 +231,16 @@ class ToolCallingAgent:
                 },
             ]
             delta, observer_error = await self._observe_delta(before)
-            if observer_error:
-                message = f"{message}; {observer_error}"
+            observation_error = before_error or observer_error
             return StepOutcome(
                 action="Provider call failed",
                 state=self.codec.encode(updated, steps=completed_steps + 1),
                 changed_paths=delta.changed_paths,
                 diff=delta.diff,
+                workspace_delta_observed=observation_error is None,
+                workspace_observation_error=observation_error,
                 error=message,
-                tokens=tokens,
+                tokens=error.tokens,
                 summary="The provider failed before a usable response was returned.",
             )
 
@@ -258,13 +272,14 @@ class ToolCallingAgent:
                 history.append({"role": "user", "content": correction})
 
         delta, observer_error = await self._observe_delta(before)
-        if observer_error:
-            errors.append(observer_error)
+        observation_error = before_error or observer_error
         return StepOutcome(
             action=_describe_action(completion),
             state=self.codec.encode(history, steps=completed_steps + 1),
             changed_paths=delta.changed_paths,
             diff=delta.diff,
+            workspace_delta_observed=observation_error is None,
+            workspace_observation_error=observation_error,
             error="; ".join(errors) or None,
             tokens=completion.tokens,
             completed=completed,
@@ -310,7 +325,17 @@ class ToolCallingAgent:
             )
         return tuple(messages)
 
-    async def _observe_delta(self, before: Any) -> tuple[WorkspaceDelta, str | None]:
+    async def _snapshot_workspace(self) -> tuple[Any | None, str | None]:
+        try:
+            return await self.observer.snapshot(), None
+        except Exception as error:
+            return None, f"Workspace delta observation failed: {error}"
+
+    async def _observe_delta(
+        self, before: Any | None
+    ) -> tuple[WorkspaceDelta, str | None]:
+        if before is None:
+            return WorkspaceDelta(), None
         try:
             after = await self.observer.snapshot()
             return self.observer.compare(before, after), None
@@ -347,15 +372,13 @@ class ToolCallingAgent:
         timeout = arguments.get("timeout_sec", self.shell_timeout_sec)
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
             raise TypeError("timeout_sec must be a positive integer")
+        timeout = min(timeout, self.shell_timeout_sec)
         result = await self.environment.exec(
             f"cd -- {shlex.quote(workspace)} && {command}", timeout_sec=timeout
         )
         output = _format_exec_result(result)
         content = _truncate(output, self.max_tool_output_chars)
-        error = None
-        if result.return_code != 0:
-            error = f"shell command exited with code {result.return_code}"
-        return _ToolObservation(call, content, error=error)
+        return _ToolObservation(call, content)
 
     async def _read_file(
         self,
@@ -668,8 +691,14 @@ def _format_exec_result(result: _ExecResult) -> str:
 def _truncate(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
-    marker = f"\n[tool output truncated; {len(value) - limit} characters omitted]"
-    retained = max(0, limit - len(marker))
+    omitted = len(value) - limit
+    while True:
+        marker = f"\n[tool output truncated; {omitted} characters omitted]"
+        retained = max(0, limit - len(marker))
+        actual_omitted = len(value) - retained
+        if actual_omitted == omitted:
+            break
+        omitted = actual_omitted
     return value[:retained] + marker
 
 
@@ -685,13 +714,6 @@ def _shorten(value: str, limit: int) -> str:
     if len(single_line) <= limit:
         return single_line
     return single_line[: limit - 1] + "…"
-
-
-def _error_tokens(error: Exception) -> int:
-    tokens = getattr(error, "tokens", 0)
-    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
-        return tokens
-    return 0
 
 
 def _json_safe(value: object) -> Any:

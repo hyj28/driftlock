@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
+import shlex
+import signal
 from pathlib import Path
 
 import pytest
 
-from driftlock.local import LocalEnvironment
+from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
 
 
 async def test_local_environment_exec_captures_exit_and_streams(
@@ -69,3 +74,96 @@ async def test_local_environment_refuses_symlink_escape_and_user_switch(
         await environment.upload_file(source, "escape/copied.txt")
     with pytest.raises(ValueError, match="user switching"):
         await environment.exec("id", user="root")
+
+
+async def test_local_environment_timeout_closes_daemon_held_pipes(
+    tmp_path: Path,
+) -> None:
+    script = """\
+import os
+import pathlib
+import time
+
+child = os.fork()
+if child == 0:
+    os.setsid()
+    pathlib.Path("daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
+    time.sleep(30)
+else:
+    time.sleep(30)
+"""
+    environment = LocalEnvironment(tmp_path)
+    pid_path = tmp_path / "daemon.pid"
+
+    try:
+        result = await asyncio.wait_for(
+            environment.exec(f"python3 -c {shlex.quote(script)}", timeout_sec=1),
+            timeout=4,
+        )
+    finally:
+        if pid_path.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+
+    assert result.return_code == 124
+    assert "command timed out after 1 seconds" in result.stderr
+
+
+async def test_local_environment_timeout_ignores_reaped_process_group(
+    tmp_path: Path,
+) -> None:
+    script = """\
+import os
+import pathlib
+import time
+
+child = os.fork()
+if child == 0:
+    os.setsid()
+    pathlib.Path("daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
+    time.sleep(30)
+"""
+    environment = LocalEnvironment(tmp_path)
+    pid_path = tmp_path / "daemon.pid"
+
+    try:
+        result = await asyncio.wait_for(
+            environment.exec(f"python3 -c {shlex.quote(script)}", timeout_sec=1),
+            timeout=4,
+        )
+    finally:
+        if pid_path.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+
+    assert result.return_code == 124
+    assert "command timed out after 1 seconds" in result.stderr
+
+
+async def test_local_environment_runtime_files_are_outside_observed_workspace(
+    tmp_path: Path,
+) -> None:
+    script = """\
+import pathlib
+import tempfile
+
+temporary = tempfile.NamedTemporaryFile(delete=False)
+temporary.close()
+cache = pathlib.Path.home() / ".cache" / "probe"
+cache.parent.mkdir(parents=True)
+cache.write_text("cache", encoding="utf-8")
+print(temporary.name)
+print(cache)
+"""
+    environment = LocalEnvironment(tmp_path)
+    observer = LocalWorkspaceDeltaObserver(tmp_path)
+    before = await observer.snapshot()
+
+    result = await environment.exec(f"python3 -c {shlex.quote(script)}")
+    after = await observer.snapshot()
+
+    assert result.return_code == 0
+    assert observer.compare(before, after).changed_paths == ()
+    assert tuple(tmp_path.iterdir()) == ()
+    for rendered_path in result.stdout.splitlines():
+        assert not Path(rendered_path).resolve().is_relative_to(tmp_path.resolve())

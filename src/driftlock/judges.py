@@ -75,6 +75,8 @@ def _build_prompt(context: DriftContext) -> str:
             "error": step.outcome.error,
             "reward": step.outcome.reward,
             "changed_paths": list(step.outcome.changed_paths),
+            "workspace_delta_observed": step.outcome.workspace_delta_observed,
+            "workspace_observation_error": step.outcome.workspace_observation_error,
         }
         for step in context.recent_steps
     ]

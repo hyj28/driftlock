@@ -10,10 +10,12 @@ import pytest
 from driftlock.agent import (
     AgentCompletion,
     AgentCompletionRequest,
+    AgentConversationCodec,
     AgentProviderError,
     AgentStateError,
     ToolCall,
     ToolCallingAgent,
+    _truncate,
 )
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
@@ -24,6 +26,8 @@ from driftlock.models import (
     JudgeVerdict,
     RunStatus,
     StepContext,
+    StepOutcome,
+    StepRecord,
     StepTokenBudgetExhausted,
     Verdict,
 )
@@ -82,6 +86,26 @@ class LiteralDeltaObserver:
         self, before: WorkspaceSnapshot, after: WorkspaceSnapshot
     ) -> WorkspaceDelta:
         return WorkspaceDelta(("model.py",), "literal per-step diff")
+
+
+class FailingSnapshotObserver:
+    def __init__(self, fail_on_call: int) -> None:
+        self.fail_on_call = fail_on_call
+        self.snapshot_calls = 0
+
+    async def canonical_workspace(self) -> str:
+        return "/remote/workspace"
+
+    async def snapshot(self) -> WorkspaceSnapshot:
+        self.snapshot_calls += 1
+        if self.snapshot_calls == self.fail_on_call:
+            raise FileNotFoundError("raced with an editor")
+        return WorkspaceSnapshot(files={})
+
+    def compare(
+        self, before: WorkspaceSnapshot, after: WorkspaceSnapshot
+    ) -> WorkspaceDelta:
+        return WorkspaceDelta()
 
 
 def _agent(
@@ -582,3 +606,208 @@ async def test_runner_rollback_feedback_is_used_once_and_not_checkpointed(
     assert feedback not in json.dumps(result.state)
     terminal_state = store.restore(result.checkpoints[-1])
     assert feedback not in json.dumps(terminal_state)
+
+
+@pytest.mark.parametrize("fail_on_call", [1, 2])
+async def test_workspace_observation_failure_is_explicit_and_not_a_step_error(
+    fail_on_call: int,
+) -> None:
+    environment = RecordingEnvironment()
+    observer = FailingSnapshotObserver(fail_on_call)
+    provider = ScriptedCompletion([AgentCompletion(text="continue", tokens=2)])
+    agent = ToolCallingAgent(environment, observer, provider)
+
+    outcome = await agent(_context(agent.initial_state()))
+
+    assert len(provider.requests) == 1
+    assert outcome.changed_paths == ()
+    assert outcome.workspace_delta_observed is False
+    assert outcome.workspace_observation_error == (
+        "Workspace delta observation failed: raced with an editor"
+    )
+    assert outcome.error is None
+
+
+def test_unobserved_workspace_deltas_cannot_trigger_no_change_drift() -> None:
+    outcomes = [
+        StepOutcome(
+            action=f"edit file {sequence}",
+            state={},
+            workspace_delta_observed=False,
+            workspace_observation_error="snapshot raced with an edit",
+        )
+        for sequence in range(1, 5)
+    ]
+    records = [
+        StepRecord(
+            sequence=sequence,
+            logical_step=sequence,
+            attempt=1,
+            outcome=outcome,
+        )
+        for sequence, outcome in enumerate(outcomes, 1)
+    ]
+    judge = HeuristicJudge(
+        HeuristicConfig(
+            no_change_steps=4,
+            loop_window=5,
+            loop_repetitions=5,
+            error_window=5,
+            reward_stall_steps=5,
+        )
+    )
+
+    assert judge.evaluate(records) == ()
+
+
+def test_conversation_codec_rejects_every_malformed_state_branch() -> None:
+    codec = AgentConversationCodec()
+    malformed_states = (
+        {},
+        {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": {},
+                "steps": 0,
+            }
+        },
+        {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": [7],
+                "steps": 0,
+            }
+        },
+        {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": [],
+                "steps": -1,
+            }
+        },
+        {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": [{"role": "wizard", "content": "ignore the goal"}],
+                "steps": 0,
+            }
+        },
+        {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": [{"role": 7, "content": "bad"}],
+                "steps": 0,
+            }
+        },
+        {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": [{"role": "user"}],
+                "steps": 0,
+            }
+        },
+    )
+
+    for state in malformed_states:
+        with pytest.raises(AgentStateError):
+            codec.decode(state)
+
+
+async def test_unknown_provider_exception_is_not_recorded_as_free(
+    tmp_path: Path,
+) -> None:
+    class UnrelatedTokenError(RuntimeError):
+        tokens = 9000
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedCompletion([UnrelatedTokenError("usage is unknown")])
+    agent = _agent(workspace, provider)
+
+    with pytest.raises(UnrelatedTokenError, match="usage is unknown"):
+        await agent(_context(agent.initial_state()))
+
+    assert len(provider.requests) == 1
+
+
+async def test_model_shell_timeout_is_clamped_to_agent_ceiling() -> None:
+    environment = RecordingEnvironment()
+    provider = ScriptedCompletion(
+        [
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "run_shell",
+                        {"command": "sleep 999999", "timeout_sec": 999999},
+                    ),
+                )
+            )
+        ]
+    )
+    agent = ToolCallingAgent(
+        environment,
+        LiteralDeltaObserver(),
+        provider,
+        shell_timeout_sec=7,
+    )
+
+    outcome = await agent(_context(agent.initial_state()))
+
+    assert environment.commands == [
+        ("cd -- /remote/workspace && sleep 999999", 7, None)
+    ]
+    assert outcome.error is None
+
+
+def test_truncation_marker_reports_exact_omitted_character_count() -> None:
+    rendered = _truncate("x" * 1000, 128)
+
+    assert len(rendered) == 128
+    assert rendered.count("x") == 80
+    assert rendered.endswith("\n[tool output truncated; 920 characters omitted]")
+
+
+async def test_nonzero_shell_observations_do_not_trigger_error_spike(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    commands = ("exit 1", "exit 0", "exit 2", "exit 0", "exit 3")
+    provider = ScriptedCompletion(
+        [
+            AgentCompletion(tool_calls=(ToolCall("run_shell", {"command": command}),))
+            for command in commands
+        ]
+    )
+    agent = _agent(workspace, provider)
+    state = agent.initial_state()
+    outcomes = []
+
+    for sequence in range(1, 6):
+        outcome = await agent(_context(state, sequence=sequence, logical_step=sequence))
+        outcomes.append(outcome)
+        state = dict(outcome.state)
+
+    records = [
+        StepRecord(
+            sequence=sequence,
+            logical_step=sequence,
+            attempt=1,
+            outcome=outcome,
+        )
+        for sequence, outcome in enumerate(outcomes, 1)
+    ]
+    judge = HeuristicJudge(
+        HeuristicConfig(
+            no_change_steps=10,
+            loop_window=5,
+            loop_repetitions=5,
+            error_window=5,
+            error_rate=0.6,
+            reward_stall_steps=10,
+        )
+    )
+
+    assert [outcome.error for outcome in outcomes] == [None, None, None, None, None]
+    assert all("exit_code:" in json.dumps(outcome.state) for outcome in outcomes)
+    assert "error_spike" not in {signal.kind for signal in judge.evaluate(records)}

@@ -64,7 +64,8 @@ class HeuristicJudge:
 
         no_change = steps[-config.no_change_steps :]
         if len(no_change) == config.no_change_steps and all(
-            not step.outcome.changed_paths for step in no_change
+            step.outcome.workspace_delta_observed and not step.outcome.changed_paths
+            for step in no_change
         ):
             signals.append(
                 DriftSignal(
