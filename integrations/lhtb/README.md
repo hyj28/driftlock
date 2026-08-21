@@ -149,6 +149,47 @@ for a task, excludes zero and solved-threshold results by default, and preserves
 source result paths and failures in the JSON report. No benchmark number is claimed
 until the credentialed native-amd64 run completes.
 
+Aggregate completed arms with strict comparability checks:
+
+```bash
+driftlock-lhtb analyze --lhtb-dir /srv/LHTB \
+  --arm-dir stock=/srv/LHTB/jobs/stock \
+  --arm-dir retry=/srv/LHTB/jobs/retry \
+  --arm-dir driftlock=/srv/LHTB/jobs/driftlock \
+  --output analysis.json
+```
+
+The default rejects unequal task/attempt matrices, changed task checksums, mixed
+models, missing rewards, and absent or invalid token/cost usage. The report retains
+the path and SHA-256 of every source result, computes paired per-task deltas and the
+failure-rate slope per doubling of expert task time, and names any missing planned
+arm. It also verifies that each job summary is finished and error-free and recomputes
+Harbor's task-directory checksum before using the checkout's expert-time metadata.
+Each arm label is bound to the expected agent/import path, continuation mode, budget,
+and fine-judge presence; each trial's `config.job_id` and `trial_name` must match its
+job summary and directory. Namespaced Harbor task names are mapped through the
+canonical `[task].name` in each `task.toml`. Controlled arms must use the same total
+token budget. Agent versions and shared non-treatment configuration—including model
+API, temperature, request ceilings, timeout, environment, and verifier—are frozen and
+recorded through a common configuration SHA-256. Harbor's job-level retry count must
+remain zero, and its canonical token/cache/output/cost totals are reconciled against
+the loaded trial results.
+The analyzer also ingests canonical Harbor `lock.json`: configured retries must be
+zero, job concurrency must agree across arms, lock trials must match result configs,
+and Harbor must be the pinned editable revision. Job generation embeds a SHA-256 over
+all installed driftlock Python sources and the packaged Harbor patch; both lock and
+trial config must carry that exact fingerprint. Trial UUIDs are required and globally
+unique.
+`--allow-incomplete-matrix` is available only for explicitly exploratory reports and
+records `matrix.complete=false`; aggregate token, cost, and slope deltas are `null`
+for any arm whose workload does not match stock.
+
+`GD_actions` and `GD_inaction` follow the commission/omission formulas in
+[Arike et al. (2025)](https://arxiv.org/abs/2505.02709). They require task-specific
+aligned-action budget and residual-state annotations that Harbor `result.json` does
+not provide. The analyzer therefore records `requires_domain_annotations` and never
+manufactures proxy values from reward or token counts.
+
 The runtime supports LHTB's LiteLLM backend. Construct Terminus-2 with
 `enable_summarize=False`; do not install LHTB's process-reward tracker because
 driftlock owns the one-response checkpoints. Call `agent.setup(environment)` before

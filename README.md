@@ -71,8 +71,11 @@ numbers stay comparable to the public leaderboard.
 **Metrics**
 
 - Success rate (LHTB continuous reward, partial credit included)
-- `GD_actions` / `GD_inaction` — goal-drift metrics adopted from
-  *Asymmetric Goal Drift in Coding Agents* (ICLR 2026) rather than invented here
+- `GD_actions` / `GD_inaction` — the commission and omission definitions from
+  [Arike et al. (2025)](https://arxiv.org/abs/2505.02709), when a task provides
+  aligned-action budget and residual-state annotations. Generic LHTB results do
+  not contain those labels, so the analyzer reports them as unavailable instead
+  of substituting an unvalidated proxy.
 - Token cost per task
 - **Slope of the task-length vs. failure-rate curve** — flattening this is the
   strongest result available
@@ -323,6 +326,37 @@ the packaged patch. A stock Terminus run has no comparable total-token ceiling; 
 therefore requires an explicit `--ack-unbounded-stock-tokens` after a provider-side
 spend cap is configured. After screening, `driftlock-lhtb select JOB_DIR` ranks tasks
 by measured mean partial credit and records the trial result files behind the choice.
+
+Completed arms can be aggregated into one strict, auditable report. By default the
+analyzer requires identical task/attempt matrices, task checksums, and model identity;
+it rejects missing rewards or usage instead of silently turning infrastructure errors
+into model failures. It also requires each Harbor job summary to be finished and
+error-free, and verifies each recorded task checksum against the selected LHTB
+checkout. Arm labels are checked against the pinned agent configuration, controlled
+arms must share one total-token budget, and every trial's job ID and name must match
+its job summary and directory. Canonical namespaced Harbor task names are resolved
+through each `task.toml`, while agent versions and all common non-treatment settings
+(model API, temperatures, request limits, timeouts, environment, and verifier) are
+validated and summarized by a configuration SHA-256. Harbor retries must be zero,
+and official job-level token/cache/cost totals must reconcile with the trial files.
+The canonical Harbor `lock.json` binds zero configured retries, concurrency, task
+matrix, pinned Harbor revision, and a build fingerprint over all installed driftlock
+Python sources plus the companion patch. Trial UUIDs must be globally unique. Every
+input `result.json` path and SHA-256 is retained.
+
+```bash
+driftlock-lhtb analyze --lhtb-dir /srv/LHTB \
+  --arm-dir stock=/srv/LHTB/jobs/stock \
+  --arm-dir retry=/srv/LHTB/jobs/retry \
+  --arm-dir driftlock-heuristic=/srv/LHTB/jobs/driftlock-heuristic \
+  --arm-dir driftlock=/srv/LHTB/jobs/driftlock \
+  --arm-dir oracle=/srv/LHTB/jobs/oracle \
+  --output analysis.json
+```
+
+The report includes reward and solved-rate summaries, token/cache/cost accounting,
+paired task deltas versus stock, and an ordinary least-squares failure-rate slope
+against `log2(expert_time_estimate_min)`. Missing planned arms are explicit.
 
 The planned hindsight oracle is not exposed as an online agent arm. A valid oracle
 must replay retained candidate checkpoints in isolated copies against the hidden

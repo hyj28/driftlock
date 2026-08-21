@@ -4,7 +4,7 @@
 > This is the working plan and gets updated as the project moves. For the
 > public-facing introduction, see `README.md`.
 
-**Last updated:** 2026-08-16
+**Last updated:** 2026-08-20
 
 ### Implementation status
 
@@ -20,7 +20,9 @@
   per-episode workspace evidence, and tmux lifecycle cleanup; Harbor import-path
   agent plugin; native-amd64/credential/Docker preflight; reproducible stock and
   trial-budgeted driftlock job generation; measured partial-credit task selector;
-  unit and pinned-Harbor integration tests.
+  strict multi-arm result ingestion with provenance, comparability checks, paired
+  deltas, cost/token summaries, and failure-rate slope analysis; unit and
+  pinned-Harbor integration tests.
 - **Next:** run the credentialed week-1 stock LHTB smoke and roughly 20-task screen
   on native amd64, then commit the measured task-selection artifact. No result has
   been measured yet.
@@ -65,11 +67,12 @@ SkillX?"*
   turns up mostly engineering blogs and playbooks (Wire, NxCode, Redis,
   digitalapplied's rollback-patterns reference) rather than the arXiv density seen in
   the skill-synthesis space.
-- **Published metrics already exist.** *Asymmetric Goal Drift in Coding Agents*
-  (ICLR 2026) formalized goal drift with `GD_actions` (drift through commission) and
-  `GD_inaction` (drift through omission), with a companion stress-test repo,
-  [jhammant/agent-drift](https://github.com/jhammant/agent-drift). **Adopting published
-  metrics is what makes the numbers credible** — inventing our own would not.
+- **Published metrics already exist.** [Arike et al. (2025)](https://arxiv.org/abs/2505.02709)
+  formalized `GD_actions` (drift through commission) and `GD_inaction` (drift
+  through omission). They require aligned-action budget and residual-state
+  annotations. LHTB does not provide those annotations, so they remain unavailable
+  for the generic benchmark analysis unless a task-specific annotation protocol is
+  added. Inventing reward- or token-based proxies would not be credible.
 - **There's a quantitative law to attack.** Doubling a task's duration roughly
   quadruples its failure rate. Flattening that curve even slightly is a clean result.
 - **The capability gap is stark.** Frontier models solve close to 100% of tasks a
@@ -160,7 +163,8 @@ Task structure is standardized as five files:
 ### 4.3 Metrics
 
 - Success rate (LHTB continuous reward, partial credit included)
-- `GD_actions` / `GD_inaction` (adopted from the ICLR 2026 definitions)
+- `GD_actions` / `GD_inaction` (Arike et al. definitions, only for tasks with the
+  required aligned-action and residual-state annotations)
 - Token cost per task
 - **Slope of the task-length vs. failure-rate curve** — flattening this is the
   strongest result available
@@ -253,7 +257,9 @@ result is stable.
 **Failure modes and metrics**
 - [Beyond the Leaderboard: tool-use, planning, and reasoning failures](https://arxiv.org/pdf/2607.05775)
 - [The Long-Horizon Task Mirage?](https://arxiv.org/html/2604.11978v1)
-- *Asymmetric Goal Drift in Coding Agents* (ICLR 2026) — source of `GD_actions` / `GD_inaction`
+- [Arike et al., *Technical Report: Evaluating Goal Drift in Language Model Agents*
+  (2025)](https://arxiv.org/abs/2505.02709) — source of the `GD_actions` /
+  `GD_inaction` definitions
 - [jhammant/agent-drift](https://github.com/jhammant/agent-drift) — drift stress-testing
 
 **Engineering references**
