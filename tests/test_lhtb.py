@@ -647,7 +647,8 @@ def test_packaged_harbor_patch_is_available() -> None:
     patch = lhtb.lhtb_harbor_patch_path()
 
     assert patch.is_file()
-    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 9" in patch.read_text()
+    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 10" in patch.read_text()
+    assert "_driftlock_finalize_after_agent_run" in patch.read_text()
     assert "cat >>" in patch.read_text()
     assert "block=True" in patch.read_text()
     assert "__driftlock_status=$?" not in patch.read_text()

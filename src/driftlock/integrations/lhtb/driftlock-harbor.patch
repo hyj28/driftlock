@@ -7,7 +7,7 @@ index 0000000..6741a39
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 9
++DRIFTLOCK_HARBOR_PATCH_VERSION = 10
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
 index bcd0473..f6ba8fe 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
@@ -786,6 +786,20 @@ index b34b4fc..20cc6ac 100644
  @pytest.mark.asyncio
  async def test_chat_passes_previous_response_id():
      """Verify previous_response_id is passed as kwarg to model.call()."""
+diff --git a/harbor/src/harbor/trial/trial.py b/harbor/src/harbor/trial/trial.py
+--- a/harbor/src/harbor/trial/trial.py
++++ b/harbor/src/harbor/trial/trial.py
+@@ -1169,5 +1169,10 @@ class Trial:
+                     )
+                 self.result.agent_result = aggregated
++            driftlock_finalize = getattr(
++                self._agent, "_driftlock_finalize_after_agent_run", None
++            )
++            if callable(driftlock_finalize):
++                await driftlock_finalize()
+             self.result.agent_execution.finished_at = datetime.now(timezone.utc)
+ 
+     async def _run_verification(self) -> None:
 diff --git a/harbor/tests/unit/llms/test_lite_llm.py b/harbor/tests/unit/llms/test_lite_llm.py
 index 03266fb..dcf3332 100644
 --- a/harbor/tests/unit/llms/test_lite_llm.py
