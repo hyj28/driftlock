@@ -1,0 +1,305 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from driftlock.lhtb_analysis import (
+    analyze_jobs,
+    goal_drift_actions,
+    goal_drift_inaction,
+    parse_arm_directories,
+)
+from driftlock.lhtb_experiment import main
+
+
+def _task(root: Path, name: str, *, expert_minutes: int, category: str) -> None:
+    task = root / "tasks" / name
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        "\n".join(
+            (
+                "version = '1'",
+                "[metadata]",
+                f"expert_time_estimate_min = {expert_minutes}",
+                f"category = '{category}'",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
+def _result(
+    job: Path,
+    trial: str,
+    task: str,
+    reward: float | None,
+    *,
+    checksum: str | None = None,
+    model: str = "deepseek/deepseek-v4-pro",
+    usage: dict[str, int | float] | None = None,
+    exception: str | None = None,
+) -> Path:
+    directory = job / trial
+    directory.mkdir(parents=True)
+    payload = {
+        "task_name": task,
+        "task_checksum": checksum or f"checksum-{task}",
+        "agent_info": {"model_info": {"provider": "openrouter", "name": model}},
+        "agent_result": usage
+        or {
+            "n_input_tokens": 100,
+            "n_cache_tokens": 40,
+            "n_output_tokens": 20,
+            "cost_usd": 0.25,
+        },
+        "verifier_result": (
+            None if reward is None else {"rewards": {"reward": reward}}
+        ),
+        "exception_info": (
+            {"exception_type": exception} if exception is not None else None
+        ),
+        "started_at": "2026-08-20T10:00:00+00:00",
+        "finished_at": "2026-08-20T10:02:00+00:00",
+    }
+    result = directory / "result.json"
+    result.write_text(json.dumps(payload), encoding="utf-8")
+    return result
+
+
+def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    _task(lhtb, "long", expert_minutes=240, category="debug")
+    stock = tmp_path / "stock"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 1.0)
+    _result(stock, "long-1", "long", 0.0)
+    _result(
+        driftlock,
+        "short-1",
+        "short",
+        1.0,
+        usage={
+            "n_input_tokens": 80,
+            "n_cache_tokens": 40,
+            "n_output_tokens": 10,
+            "cost_usd": 0.1,
+        },
+    )
+    _result(
+        driftlock,
+        "long-1",
+        "long",
+        1.0,
+        usage={
+            "n_input_tokens": 120,
+            "n_cache_tokens": 60,
+            "n_output_tokens": 30,
+            "cost_usd": 0.3,
+        },
+    )
+    return lhtb, stock, driftlock
+
+
+def test_goal_drift_formulas_match_published_definitions() -> None:
+    assert goal_drift_actions(0.7, 0.4) == pytest.approx(0.3)
+    assert goal_drift_actions(0.4, 0.7) == 0
+    assert goal_drift_inaction(0.2, 0.6) == pytest.approx(0.4)
+    assert goal_drift_inaction(0.6, 0.2) == 0
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        goal_drift_actions(1.1, 0.2)
+
+
+def test_parse_arm_directories_is_strict() -> None:
+    assert parse_arm_directories(["stock=/a", "driftlock=/b"]) == {
+        "stock": Path("/a"),
+        "driftlock": Path("/b"),
+    }
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_arm_directories(["stock=/a", "stock=/b"])
+    with pytest.raises(ValueError, match="unknown"):
+        parse_arm_directories(["invented=/a"])
+    with pytest.raises(ValueError, match="ARM=JOB_DIR"):
+        parse_arm_directories(["stock"])
+
+
+def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    assert report["matrix"]["complete"] is True
+    assert report["matrix"]["agent_model"] == ("openrouter/deepseek/deepseek-v4-pro")
+    assert report["arms"]["stock"]["mean_reward"] == 0.5
+    assert report["arms"]["stock"][
+        "failure_slope_per_task_length_doubling"
+    ] == pytest.approx(0.5)
+    drift = report["arms"]["driftlock"]
+    assert drift["solved_rate"] == 1.0
+    assert drift["input_tokens"] == 200
+    assert drift["cache_tokens"] == 100
+    assert drift["output_tokens"] == 40
+    assert drift["total_tokens"] == 240
+    assert drift["cache_hit_rate"] == 0.5
+    assert drift["cost_usd"] == pytest.approx(0.4)
+    assert drift["mean_duration_sec"] == 120
+    comparison = report["paired_vs_stock"]["driftlock"]
+    assert comparison["mean_task_reward_delta"] == 0.5
+    assert comparison["mean_task_failure_rate_delta"] == -0.5
+    assert comparison["failure_slope_delta"] == pytest.approx(-0.5)
+    assert report["planned_arm_coverage"]["missing"] == [
+        "retry",
+        "driftlock-heuristic",
+        "oracle",
+    ]
+    assert report["goal_drift_metrics"]["status"] == ("requires_domain_annotations")
+    trial = drift["trials"][0]
+    assert Path(trial["result_file"]).is_absolute()
+    assert len(trial["result_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("matrix", "attempt matrix"),
+        ("checksum", "checksum differs"),
+        ("model", "different agent models"),
+    ],
+)
+def test_analyze_rejects_noncomparable_arms(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    if mutation == "matrix":
+        _result(driftlock, "long-2", "long", 1.0)
+    elif mutation == "checksum":
+        payload_path = driftlock / "long-1" / "result.json"
+        payload = json.loads(payload_path.read_text())
+        payload["task_checksum"] = "different"
+        payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        payload_path = driftlock / "long-1" / "result.json"
+        payload = json.loads(payload_path.read_text())
+        payload["agent_info"]["model_info"]["name"] = "another-model"
+        payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_rejects_infrastructure_failure_instead_of_scoring_it(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _result(stock, "failed", "short", None, exception="AgentTimeoutError")
+
+    with pytest.raises(ValueError, match="AgentTimeoutError"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_rejects_invalid_usage(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"]["n_cache_tokens"] = 101
+    payload["agent_result"]["n_input_tokens"] = 100
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cache tokens exceed input tokens"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_aggregates_harbor_multi_step_usage(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"] = None
+    payload["step_results"] = [
+        {
+            "agent_result": {
+                "n_input_tokens": 50,
+                "n_cache_tokens": 20,
+                "n_output_tokens": 5,
+                "cost_usd": 0.1,
+            }
+        },
+        {
+            "agent_result": {
+                "n_input_tokens": 70,
+                "n_cache_tokens": 30,
+                "n_output_tokens": 25,
+                "cost_usd": 0.2,
+            }
+        },
+    ]
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    assert report["arms"]["driftlock"]["input_tokens"] == 200
+    assert report["arms"]["driftlock"]["output_tokens"] == 40
+    assert report["arms"]["driftlock"]["cost_usd"] == pytest.approx(0.4)
+
+
+def test_analyze_can_explicitly_report_an_incomplete_matrix(tmp_path: Path) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "stock-only", expert_minutes=10, category="one")
+    _task(lhtb, "other-only", expert_minutes=20, category="two")
+    stock = tmp_path / "stock"
+    retry = tmp_path / "retry"
+    _result(stock, "one", "stock-only", 1.0)
+    _result(retry, "two", "other-only", 0.0)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "retry": retry},
+        require_complete_matrix=False,
+    )
+
+    assert report["matrix"]["complete"] is False
+    comparison = report["paired_vs_stock"]["retry"]
+    assert comparison["shared_task_count"] == 0
+    assert comparison["mean_task_reward_delta"] is None
+
+
+def test_analyze_cli_writes_report(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    output = tmp_path / "nested" / "analysis.json"
+
+    assert (
+        main(
+            [
+                "analyze",
+                "--lhtb-dir",
+                str(lhtb),
+                "--arm-dir",
+                f"stock={stock}",
+                "--arm-dir",
+                f"driftlock={driftlock}",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(output.read_text())["schema_version"] == 1

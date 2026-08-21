@@ -149,6 +149,29 @@ for a task, excludes zero and solved-threshold results by default, and preserves
 source result paths and failures in the JSON report. No benchmark number is claimed
 until the credentialed native-amd64 run completes.
 
+Aggregate completed arms with strict comparability checks:
+
+```bash
+driftlock-lhtb analyze --lhtb-dir /srv/LHTB \
+  --arm-dir stock=/srv/LHTB/jobs/stock \
+  --arm-dir retry=/srv/LHTB/jobs/retry \
+  --arm-dir driftlock=/srv/LHTB/jobs/driftlock \
+  --output analysis.json
+```
+
+The default rejects unequal task/attempt matrices, changed task checksums, mixed
+models, missing rewards, and absent or invalid token/cost usage. The report retains
+the path and SHA-256 of every source result, computes paired per-task deltas and the
+failure-rate slope per doubling of expert task time, and names any missing planned
+arm. `--allow-incomplete-matrix` is available only for explicitly exploratory
+reports and records `matrix.complete=false`.
+
+`GD_actions` and `GD_inaction` follow the commission/omission formulas in
+[Arike et al. (2025)](https://arxiv.org/abs/2505.02709). They require task-specific
+aligned-action budget and residual-state annotations that Harbor `result.json` does
+not provide. The analyzer therefore records `requires_domain_annotations` and never
+manufactures proxy values from reward or token counts.
+
 The runtime supports LHTB's LiteLLM backend. Construct Terminus-2 with
 `enable_summarize=False`; do not install LHTB's process-reward tracker because
 driftlock owns the one-response checkpoints. Call `agent.setup(environment)` before

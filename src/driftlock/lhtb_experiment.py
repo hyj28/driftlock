@@ -21,6 +21,7 @@ from driftlock.lhtb import (
     LHTB_LITELLM_VERSION,
     LHTB_REPOSITORY_REVISION,
 )
+from driftlock.lhtb_analysis import analyze_jobs, parse_arm_directories
 
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-pro"
 DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
@@ -397,6 +398,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output.expanduser().resolve().write_text(serialized, encoding="utf-8")
             print(serialized, end="")
             return 0
+        if args.command == "analyze":
+            report = analyze_jobs(
+                lhtb_dir=args.lhtb_dir,
+                arm_directories=parse_arm_directories(args.arm_dirs),
+                solve_threshold=args.solve_threshold,
+                require_complete_matrix=not args.allow_incomplete_matrix,
+            )
+            serialized = json.dumps(report, indent=2) + "\n"
+            output = args.output.expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(serialized, encoding="utf-8")
+            print(serialized, end="")
+            return 0
     except (FileNotFoundError, OSError, PreflightError, ValueError) as error:
         parser.error(str(error))
     return 2
@@ -432,6 +446,20 @@ def _parser() -> argparse.ArgumentParser:
     choose.add_argument("--min-reward", type=float, default=0.0)
     choose.add_argument("--max-reward", type=float, default=0.95)
     choose.add_argument("--output", type=Path, default=Path("selected-tasks.json"))
+    analyze = sub.add_parser(
+        "analyze", help="aggregate auditable multi-arm Harbor results"
+    )
+    analyze.add_argument("--lhtb-dir", type=Path, default=Path.cwd())
+    analyze.add_argument(
+        "--arm-dir",
+        dest="arm_dirs",
+        action="append",
+        required=True,
+        metavar="ARM=JOB_DIR",
+    )
+    analyze.add_argument("--solve-threshold", type=float, default=0.95)
+    analyze.add_argument("--allow-incomplete-matrix", action="store_true")
+    analyze.add_argument("--output", type=Path, default=Path("analysis.json"))
     return parser
 
 
@@ -520,7 +548,8 @@ def _validate_checkout_contents(root: Path) -> None:
         path = root / relative
         if not path.is_file() or _file_sha256(path) != expected:
             raise PreflightError(
-                f"Harbor file does not match companion patch v9: {relative}"
+                "Harbor file does not match companion patch "
+                f"v{DRIFTLOCK_HARBOR_PATCH_VERSION}: {relative}"
             )
     task_status = _run_checked(
         [
