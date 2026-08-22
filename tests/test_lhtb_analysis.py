@@ -9,6 +9,7 @@ import pytest
 from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
 from driftlock.lhtb_analysis import (
     _task_directory_sha256,
+    _validate_arm_identity,
     analyze_jobs,
     goal_drift_actions,
     goal_drift_inaction,
@@ -72,6 +73,12 @@ def _result(
                 "temperature": 0.7,
                 "max_tokens": 8192,
                 "timeout": 240,
+                "extra_body": {
+                    "provider": {
+                        "only": ["baidu/fp8"],
+                        "allow_fallbacks": False,
+                    }
+                },
             },
             "model_info": {
                 "max_input_tokens": 128000,
@@ -117,6 +124,12 @@ def _result(
                     "temperature": 0.7,
                     "max_tokens": 8192,
                     "timeout": 240,
+                    "extra_body": {
+                        "provider": {
+                            "only": ["baidu/fp8"],
+                            "allow_fallbacks": False,
+                        }
+                    },
                     "num_retries": 4,
                 },
             },
@@ -132,6 +145,14 @@ def _result(
                 "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-pro-0813"),
                 "driftlock_judge_api_base": "https://judge.invalid/v1",
                 "driftlock_judge_max_output_tokens": 512,
+                "driftlock_judge_llm_call_kwargs": {
+                    "extra_body": {
+                        "provider": {
+                            "only": ["alibaba"],
+                            "allow_fallbacks": False,
+                        }
+                    }
+                },
             }
         )
     elif resolved_arm in {"native-driftlock-heuristic", "native-driftlock"}:
@@ -149,6 +170,14 @@ def _result(
                     ),
                     "driftlock_judge_api_base": "https://judge.invalid/v1",
                     "driftlock_judge_max_output_tokens": 512,
+                    "driftlock_judge_llm_call_kwargs": {
+                        "extra_body": {
+                            "provider": {
+                                "only": ["alibaba"],
+                                "allow_fallbacks": False,
+                            }
+                        }
+                    },
                 }
             )
     payload = {
@@ -528,6 +557,78 @@ def test_analyze_rejects_noncomparable_arms(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
         )
+
+
+def test_arm_identity_accepts_matching_provider_and_names_mismatch(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "driftlock"
+    result_file = _result(job, "short-1", "short", 1.0)
+    payload = json.loads(result_file.read_text())
+
+    budget, signature = _validate_arm_identity(
+        payload,
+        "driftlock",
+        "openrouter/deepseek/deepseek-v4-flash-0731",
+        result_file,
+        expected_provider="baidu/fp8",
+        expected_judge_provider="alibaba",
+    )
+
+    assert budget == 10_000
+    assert len(signature) == 64
+    with pytest.raises(ValueError) as caught:
+        _validate_arm_identity(
+            payload,
+            "driftlock",
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            result_file,
+            expected_provider="sail-research/fp4",
+            expected_judge_provider="alibaba",
+        )
+    message = str(caught.value)
+    assert "sail-research/fp4" in message
+    assert "baidu/fp8" in message
+
+
+def test_analyze_rejects_trial_provider_different_from_canonical_arm_lock(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    routing = payload["config"]["agent"]["kwargs"]["llm_call_kwargs"]
+    routing["extra_body"]["provider"]["only"] = ["streamlake/fp8"]
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+    message = str(caught.value)
+    assert "baidu/fp8" in message
+    assert "streamlake/fp8" in message
+
+
+def test_analyze_rejects_different_providers_between_arms(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    for result_file in driftlock.glob("*/result.json"):
+        payload = json.loads(result_file.read_text())
+        routing = payload["config"]["agent"]["kwargs"]["llm_call_kwargs"]
+        routing["extra_body"]["provider"]["only"] = ["streamlake/fp8"]
+        result_file.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(driftlock, 2)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+    message = str(caught.value)
+    assert "different agent providers" in message
+    assert "baidu/fp8" in message
+    assert "streamlake/fp8" in message
 
 
 def test_analyze_rejects_swapped_arm_labels(tmp_path: Path) -> None:

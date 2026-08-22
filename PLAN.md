@@ -328,10 +328,10 @@ DeepSeek ended its 75% launch promotion on 2026-08-16, roughly doubling V4-Pro a
 making it about ten times the price of V4-Flash. The allocation below follows from
 that, and from a constraint the original plan got backwards.
 
-| Role | Model | Price per 1M tokens (OpenRouter, routable providers) |
+| Role | Model and pinned provider | Price per 1M tokens |
 | --- | --- | --- |
-| Agent — high call count | DeepSeek **V4-Flash 0731** | $0.065–0.13 in / $0.014–0.07 cache / $0.14–0.28 out |
-| Fine judge — fires only when the coarse tier trips | DeepSeek **V4-Pro 0813** | $1.16–1.45 in / $0.044–0.44 cache / $3.49–4.36 out |
+| Agent — high call count | DeepSeek **V4-Flash 0731**, `baidu/fp8` | $0.069 in / $0.0137 cache / $0.137 out |
+| Fine judge — fires only when the coarse tier trips | DeepSeek **V4-Pro 0813**, `alibaba` | $1.162 in / $0.1162 cache / $3.485 out |
 | Skill retrieval | Local sentence-transformers | $0 |
 
 **The expensive model belongs on the low-call-count side.** Cost is dominated by the
@@ -348,12 +348,11 @@ loop re-sends a nearly identical history every step.
 different days would silently use different models while the recorded model string
 stayed identical.
 
-**Open risk — provider routing is not pinned.** OpenRouter serves one slug from many
-providers whose prices differ by up to 10× on cache reads, and whose builds may
-differ in ways the model string does not capture. The analyzer compares model
-strings, so a provider switch between arms would pass every existing check. Routing
-must be pinned before the first paid experiment run; until then, recorded judge cost
-deliberately uses the highest routable rates so spend is never understated.
+**Provider routing is part of experiment identity.** Every paid request uses one
+provider in `only` with `allow_fallbacks: false`. The canonical Harbor lock and trial
+result must record the same agent provider, every arm must share that provider, and
+fine-judge arms must share their separately pinned provider. Judge pricing is keyed
+by provider so an unpriced provider cannot run with stale rates.
 
 ### 5.3 Budget (hard $100 constraint)
 
@@ -420,7 +419,7 @@ the results section stays empty, per §1.
 | 8 | **Budget overrun** — ~$41 of API leaves room for roughly one redo | Can't iterate | Use V4-Flash during development; hold the 8-task LHTB subset |
 | 9 | **Attribution against external baselines** — with subagents in the agent, comparisons to Memento / ReasoningBank / GEPA can't isolate which component won | Weaker external claim | Accepted. All four arms per benchmark share the same agent, so every *internal* comparison is clean; external numbers are cited as reference points, not as controlled comparisons |
 | 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
-| 11 | **OpenRouter provider routing is not pinned** — one model slug is served by many providers whose cache-read rates differ by up to 10x and whose builds may differ in ways the model string does not capture; the analyzer compares model strings, so a provider switch between arms passes every existing check | Arm comparison void, with no evidence in the record | Pin routing (`allow_fallbacks: false`) before the first paid run. Blocked on `llm_call_kwargs` validation, which currently rejects any key outside `{temperature, max_tokens, timeout}`, and on binding the pinned provider into arm identity |
+| 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin |
 
 ---
 

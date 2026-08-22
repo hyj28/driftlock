@@ -23,6 +23,7 @@ from driftlock.lhtb import (
     LHTB_LITELLM_VERSION,
     LHTB_REPOSITORY_REVISION,
     lhtb_experiment_fingerprint,
+    openrouter_provider_call_kwargs,
 )
 from driftlock.lhtb_analysis import (
     analyze_jobs,
@@ -42,7 +43,9 @@ from driftlock.oracle import (
 # so arms run on different days would use different models while the recorded
 # model string stayed identical - the comparison would be void with no evidence.
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+DEFAULT_PROVIDER = "baidu/fp8"
 DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
+DEFAULT_JUDGE_PROVIDER = "alibaba"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 RUNNABLE_ARMS = (
@@ -105,11 +108,13 @@ def build_job_config(
     arm: str,
     tasks: Sequence[str],
     model: str = DEFAULT_MODEL,
+    provider: str = DEFAULT_PROVIDER,
     api_base: str = DEFAULT_API_BASE,
     n_concurrent_trials: int = 1,
     timeout_sec: int = 5400,
     max_total_tokens: int = 10_000_000,
     judge_api_base: str | None = None,
+    judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     retain_checkpoints: bool = False,
 ) -> dict[str, Any]:
     """Build the exact JSON-compatible Harbor configuration for one run."""
@@ -149,6 +154,7 @@ def build_job_config(
                 "temperature": 0.7,
                 "max_tokens": 8192,
                 "timeout": 240,
+                **openrouter_provider_call_kwargs(provider),
             },
             "model_info": {
                 "max_input_tokens": 128000,
@@ -201,6 +207,9 @@ def build_job_config(
                     "driftlock_judge_model": DEFAULT_JUDGE_MODEL,
                     "driftlock_judge_api_base": judge_api_base or api_base,
                     "driftlock_judge_max_output_tokens": 512,
+                    "driftlock_judge_llm_call_kwargs": (
+                        openrouter_provider_call_kwargs(judge_provider)
+                    ),
                 }
             )
 
@@ -661,11 +670,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arm=args.arm,
                 tasks=args.tasks,
                 model=args.model,
+                provider=args.provider,
                 api_base=args.api_base,
                 n_concurrent_trials=args.concurrency,
                 timeout_sec=args.timeout_sec,
                 max_total_tokens=args.max_total_tokens,
                 judge_api_base=args.judge_api_base,
+                judge_provider=args.judge_provider,
                 retain_checkpoints=args.retain_checkpoints,
             )
             config_path = args.config.expanduser().resolve()
@@ -769,8 +780,10 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--arm", choices=RUNNABLE_ARMS, required=True)
         command.add_argument("--tasks", nargs="+", required=True)
         command.add_argument("--model", default=DEFAULT_MODEL)
+        command.add_argument("--provider", default=DEFAULT_PROVIDER)
         command.add_argument("--api-base", default=DEFAULT_API_BASE)
         command.add_argument("--judge-api-base")
+        command.add_argument("--judge-provider", default=DEFAULT_JUDGE_PROVIDER)
         command.add_argument("--credential-env", default=DEFAULT_CREDENTIAL_ENV)
         command.add_argument("--concurrency", type=int, default=1)
         command.add_argument("--timeout-sec", type=int, default=5400)

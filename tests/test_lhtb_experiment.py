@@ -61,6 +61,59 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
 
 
 @pytest.mark.parametrize(
+    "arm",
+    [
+        "stock",
+        "retry",
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    ],
+)
+def test_every_paid_agent_arm_has_strict_provider_routing(
+    tmp_path: Path, arm: str
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name=f"provider-{arm}",
+        arm=arm,
+        tasks=["task-a"],
+    )
+
+    assert config["agents"][0]["kwargs"]["llm_call_kwargs"]["extra_body"] == {
+        "provider": {"only": ["baidu/fp8"], "allow_fallbacks": False}
+    }
+
+
+def test_agent_and_judge_provider_routes_are_independently_configurable(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="separate-providers",
+        arm="driftlock",
+        tasks=["task-a"],
+        provider="streamlake/fp8",
+        judge_provider="alibaba",
+    )
+
+    kwargs = config["agents"][0]["kwargs"]
+    assert kwargs["llm_call_kwargs"]["extra_body"] == {
+        "provider": {"only": ["streamlake/fp8"], "allow_fallbacks": False}
+    }
+    assert kwargs["driftlock_judge_llm_call_kwargs"] == {
+        "extra_body": {"provider": {"only": ["alibaba"], "allow_fallbacks": False}}
+    }
+
+
+@pytest.mark.parametrize(
     ("arm", "import_path", "has_fine_judge"),
     [
         (

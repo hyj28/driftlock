@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass
@@ -419,6 +420,33 @@ async def test_runtime_reserves_input_tokens_and_uses_responses_ceiling(
     assert llm.calls[0]["max_output_tokens"] == 50
     assert "max_tokens" not in llm.calls[0]
     assert "max_completion_tokens" not in llm.calls[0]
+
+
+async def test_runtime_output_ceiling_preserves_provider_routing_byte_for_byte(
+    fake_harbor_symbols: None,
+) -> None:
+    runtime, agent, llm, _ = _runtime([FakeResponse("ok", FakeUsage(30, 10))])
+    agent._llm_call_kwargs.update(
+        {
+            "max_tokens": 50,
+            "extra_body": {
+                "provider": {
+                    "only": ["baidu/fp8"],
+                    "allow_fallbacks": False,
+                }
+            },
+        }
+    )
+    before = json.dumps(agent._llm_call_kwargs, sort_keys=True, separators=(",", ":"))
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert llm.calls[0]["extra_body"] == {
+        "provider": {"only": ["baidu/fp8"], "allow_fallbacks": False}
+    }
+    after = json.dumps(agent._llm_call_kwargs, sort_keys=True, separators=(",", ":"))
+    assert after == before
 
 
 async def test_runtime_refuses_call_when_input_exhausts_budget(

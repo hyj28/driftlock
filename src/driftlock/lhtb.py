@@ -53,6 +53,41 @@ _OUTPUT_TOKEN_KEYS = frozenset(
 )
 
 
+def openrouter_provider_call_kwargs(provider: str) -> dict[str, Any]:
+    """Return the strict, no-fallback OpenRouter routing request body."""
+    if not isinstance(provider, str) or not provider:
+        raise ValueError("OpenRouter provider must be a non-empty string")
+    return {"extra_body": {"provider": {"only": [provider], "allow_fallbacks": False}}}
+
+
+def openrouter_provider_from_call_kwargs(
+    call_kwargs: Mapping[str, Any], *, source: str
+) -> str:
+    """Validate strict OpenRouter routing and return its sole provider slug."""
+    extra_body = call_kwargs.get("extra_body")
+    routing = extra_body.get("provider") if isinstance(extra_body, Mapping) else None
+    only = routing.get("only") if isinstance(routing, Mapping) else None
+    allow_fallbacks = (
+        routing.get("allow_fallbacks") if isinstance(routing, Mapping) else None
+    )
+    if (
+        not isinstance(extra_body, Mapping)
+        or set(extra_body) != {"provider"}
+        or not isinstance(routing, Mapping)
+        or set(routing) != {"only", "allow_fallbacks"}
+        or not isinstance(only, list)
+        or len(only) != 1
+        or not isinstance(only[0], str)
+        or not only[0]
+        or allow_fallbacks is not False
+    ):
+        raise ValueError(
+            f"{source} must pin exactly one OpenRouter provider with "
+            "allow_fallbacks=false"
+        )
+    return only[0]
+
+
 class LHTBRuntimeCompatibilityError(RuntimeError):
     """Raised when the installed Harbor fork is not the pinned integration."""
 

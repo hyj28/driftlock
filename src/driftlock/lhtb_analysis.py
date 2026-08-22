@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
+from driftlock.lhtb import (
+    LHTB_REPOSITORY_REVISION,
+    lhtb_experiment_fingerprint,
+    openrouter_provider_from_call_kwargs,
+)
 from driftlock.oracle import (
     OracleCheckpointError,
     ReplayUsage,
@@ -140,6 +144,8 @@ def analyze_jobs(
                 task_index=task_index,
                 task_metadata_cache=task_metadata_cache,
                 solve_threshold=solve_threshold,
+                expected_provider=job_summaries[arm]["agent_provider"],
+                expected_judge_provider=job_summaries[arm]["judge_provider"],
             )
             if trial["trial_id"] in seen_trial_ids:
                 raise ValueError(f"duplicate Harbor trial id: {trial['trial_id']}")
@@ -336,6 +342,8 @@ def _load_job_lock(
     basename_index = {path.name: name for name, path in task_index.items()}
     task_counts: dict[str, int] = defaultdict(int)
     trial_signatures: list[str] = []
+    agent_providers: set[str] = set()
+    judge_providers: set[str] = set()
     for trial in trials:
         task = trial.get("task") if isinstance(trial, dict) else None
         agent = trial.get("agent") if isinstance(trial, dict) else None
@@ -362,6 +370,20 @@ def _load_job_lock(
             raise ValueError(f"task path mismatch in Harbor lock: {lock_file}")
         task_counts[canonical_name] += 1
         trial_signatures.append(_lock_trial_signature(canonical_name, trial))
+        if arm != "oracle":
+            agent_providers.add(_agent_provider(agent, lock_file))
+        if arm in {"driftlock", "native-driftlock"}:
+            judge_providers.add(_judge_provider(agent, lock_file))
+    if len(agent_providers) > 1:
+        raise ValueError(
+            f"arm {arm!r} Harbor lock uses different agent providers: "
+            + ", ".join(sorted(agent_providers))
+        )
+    if len(judge_providers) > 1:
+        raise ValueError(
+            f"arm {arm!r} Harbor lock uses different judge providers: "
+            + ", ".join(sorted(judge_providers))
+        )
     signature_payload = {
         "schema_version": 1,
         "harbor": harbor,
@@ -382,6 +404,8 @@ def _load_job_lock(
         "lock_trial_signatures": sorted(trial_signatures),
         "n_concurrent_trials": concurrency,
         "driftlock_experiment_fingerprint": fingerprint,
+        "agent_provider": (next(iter(agent_providers)) if agent_providers else None),
+        "judge_provider": (next(iter(judge_providers)) if judge_providers else None),
     }
 
 
@@ -410,6 +434,8 @@ def _load_trial(
     task_index: Mapping[str, Path],
     task_metadata_cache: dict[str, dict[str, Any]],
     solve_threshold: float,
+    expected_provider: str | None,
+    expected_judge_provider: str | None,
 ) -> dict[str, Any]:
     try:
         data = json.loads(result_file.read_text(encoding="utf-8"))
@@ -428,8 +454,14 @@ def _load_trial(
         raise ValueError(f"missing task_checksum in {result_file}")
     model = _model_identity(data, result_file)
     total_token_budget, experiment_signature = _validate_arm_identity(
-        data, arm, model, result_file
+        data,
+        arm,
+        model,
+        result_file,
+        expected_provider=expected_provider,
+        expected_judge_provider=expected_judge_provider,
     )
+    provider, judge_provider = _trial_providers(data, arm, result_file)
     usage = _usage(data, result_file)
     task_metadata = task_metadata_cache.get(task)
     if task_metadata is None:
@@ -448,6 +480,8 @@ def _load_trial(
         "solved": reward >= solve_threshold,
         "task_checksum": checksum,
         "model": model,
+        "provider": provider,
+        "judge_provider": judge_provider,
         "agent_version": data["agent_info"]["version"],
         "total_token_budget": total_token_budget,
         "experiment_signature": experiment_signature,
@@ -514,8 +548,76 @@ def _validate_trial_provenance(
         raise ValueError(f"trial belongs to a different Harbor job: {result_file}")
 
 
+def _agent_provider(agent: Any, source: Path) -> str:
+    kwargs = agent.get("kwargs") if isinstance(agent, dict) else None
+    call_kwargs = kwargs.get("llm_call_kwargs") if isinstance(kwargs, dict) else None
+    if not isinstance(call_kwargs, dict):
+        raise ValueError(f"missing llm_call_kwargs in {source}")
+    return openrouter_provider_from_call_kwargs(
+        call_kwargs, source=f"llm_call_kwargs in {source}"
+    )
+
+
+def _judge_provider(agent: Any, source: Path) -> str:
+    kwargs = agent.get("kwargs") if isinstance(agent, dict) else None
+    call_kwargs = (
+        kwargs.get("driftlock_judge_llm_call_kwargs")
+        if isinstance(kwargs, dict)
+        else None
+    )
+    if not isinstance(call_kwargs, dict) or set(call_kwargs) != {"extra_body"}:
+        raise ValueError(
+            f"fine judge driftlock_judge_llm_call_kwargs in {source} must contain "
+            "exactly extra_body"
+        )
+    return openrouter_provider_from_call_kwargs(
+        call_kwargs, source=f"driftlock_judge_llm_call_kwargs in {source}"
+    )
+
+
+def _trial_providers(
+    data: dict[str, Any], arm: str, result_file: Path
+) -> tuple[str, str | None]:
+    config = data.get("config")
+    agent = config.get("agent") if isinstance(config, dict) else None
+    if arm != "oracle":
+        provider = _agent_provider(agent, result_file)
+        judge_provider = (
+            _judge_provider(agent, result_file)
+            if arm in {"driftlock", "native-driftlock"}
+            else None
+        )
+        return provider, judge_provider
+
+    kwargs = agent.get("kwargs") if isinstance(agent, dict) else None
+    if not isinstance(kwargs, dict):
+        raise ValueError(f"missing oracle agent config in {result_file}")
+    try:
+        source = load_source_trial_provenance(
+            kwargs["driftlock_source_result"],
+            expected_sha256=kwargs["driftlock_source_result_sha256"],
+        )
+    except (KeyError, OracleCheckpointError) as error:
+        raise ValueError(f"oracle source provider is invalid: {result_file}") from error
+    source_agent = source.data["config"]["agent"]
+    provider = _agent_provider(source_agent, source.result_path)
+    source_kwargs = source_agent["kwargs"]
+    judge_provider = (
+        _judge_provider(source_agent, source.result_path)
+        if "driftlock_judge_model" in source_kwargs
+        else None
+    )
+    return provider, judge_provider
+
+
 def _validate_arm_identity(
-    data: dict[str, Any], arm: str, model: str, result_file: Path
+    data: dict[str, Any],
+    arm: str,
+    model: str,
+    result_file: Path,
+    *,
+    expected_provider: str | None = None,
+    expected_judge_provider: str | None = None,
 ) -> tuple[int | None, str]:
     agent_info = data.get("agent_info")
     info_name = agent_info.get("name") if isinstance(agent_info, dict) else None
@@ -551,6 +653,16 @@ def _validate_arm_identity(
     }
     llm_kwargs = kwargs.get("llm_call_kwargs")
     model_info = kwargs.get("model_info")
+    if not isinstance(llm_kwargs, dict):
+        raise ValueError(f"invalid llm_call_kwargs in {result_file}")
+    provider = openrouter_provider_from_call_kwargs(
+        llm_kwargs, source=f"llm_call_kwargs in {result_file}"
+    )
+    if expected_provider is not None and provider != expected_provider:
+        raise ValueError(
+            f"arm {arm!r} expected provider {expected_provider!r} but trial "
+            f"recorded {provider!r} in {result_file}"
+        )
     common_valid = (
         isinstance(agent.get("override_timeout_sec"), (int, float))
         and not isinstance(agent.get("override_timeout_sec"), bool)
@@ -562,7 +674,6 @@ def _validate_arm_identity(
         and kwargs.get("parser_name") == "json"
         and kwargs.get("temperature") == 0.7
         and kwargs.get("record_terminal_session") is True
-        and isinstance(llm_kwargs, dict)
         and llm_kwargs.get("temperature") == 0.7
         and llm_kwargs.get("max_tokens") == 8192
         and llm_kwargs.get("timeout") == 240
@@ -594,7 +705,13 @@ def _validate_arm_identity(
             and kwargs.get("enable_summarize") is True
             and kwargs.get("proactive_summarization_threshold") == 8000
             and set(llm_kwargs)
-            == {"temperature", "max_tokens", "timeout", "num_retries"}
+            == {
+                "temperature",
+                "max_tokens",
+                "timeout",
+                "extra_body",
+                "num_retries",
+            }
             and llm_kwargs.get("num_retries") == 4
         )
         if not valid:
@@ -626,7 +743,7 @@ def _validate_arm_identity(
             "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
         }
         and kwargs.get("enable_summarize") is False
-        and set(llm_kwargs) == {"temperature", "max_tokens", "timeout"}
+        and set(llm_kwargs) == {"temperature", "max_tokens", "timeout", "extra_body"}
     )
     if not valid:
         raise ValueError(f"arm {arm!r} has the wrong agent config: {result_file}")
@@ -645,6 +762,7 @@ def _validate_arm_identity(
         "driftlock_judge_model",
         "driftlock_judge_api_base",
         "driftlock_judge_max_output_tokens",
+        "driftlock_judge_llm_call_kwargs",
     }
     expected_keys = base_kwargs | {
         "enable_summarize",
@@ -661,6 +779,7 @@ def _validate_arm_identity(
             raise ValueError(f"arm {arm!r} has invalid checkpoint retention")
         expected_keys.add("driftlock_retain_checkpoints")
     if arm in {"driftlock", "native-driftlock"}:
+        judge_provider = _judge_provider(agent, result_file)
         if (
             kwargs.get("driftlock_judge_model") != _FINE_JUDGE_MODEL
             or not isinstance(kwargs.get("driftlock_judge_api_base"), str)
@@ -668,6 +787,15 @@ def _validate_arm_identity(
             or kwargs.get("driftlock_judge_max_output_tokens") != 512
         ):
             raise ValueError(f"driftlock arm lacks its fine judge: {result_file}")
+        if (
+            expected_judge_provider is not None
+            and judge_provider != expected_judge_provider
+        ):
+            raise ValueError(
+                f"arm {arm!r} expected judge provider "
+                f"{expected_judge_provider!r} but trial recorded "
+                f"{judge_provider!r} in {result_file}"
+            )
         expected_keys |= judge_fields
     elif judge_fields & kwargs.keys():
         raise ValueError(
@@ -785,6 +913,14 @@ def _validate_oracle_identity(
         source_arm,
         model,
         source.result_path,
+        expected_provider=_agent_provider(
+            source.data["config"]["agent"], source.result_path
+        ),
+        expected_judge_provider=(
+            _judge_provider(source.data["config"]["agent"], source.result_path)
+            if source_arm == "driftlock"
+            else None
+        ),
     )
     return None, experiment_signature
 
@@ -809,7 +945,7 @@ def _experiment_signature(
         "record_terminal_session": kwargs["record_terminal_session"],
         "llm_call_kwargs": {
             key: kwargs["llm_call_kwargs"][key]
-            for key in ("temperature", "max_tokens", "timeout")
+            for key in ("temperature", "max_tokens", "timeout", "extra_body")
         },
         "model_info": kwargs["model_info"],
         "environment": environment,
@@ -1062,6 +1198,8 @@ def _validate_matrix(
     task_counts: dict[str, dict[str, int]] = {}
     task_checksums: dict[str, set[str]] = defaultdict(set)
     models: set[str] = set()
+    providers: set[str] = set()
+    judge_providers: set[str] = set()
     experiment_signatures: set[str] = set()
     arm_budgets: dict[str, set[int]] = defaultdict(set)
     arm_versions: dict[str, set[str]] = defaultdict(set)
@@ -1072,6 +1210,9 @@ def _validate_matrix(
             counts[task] += 1
             task_checksums[task].add(trial["task_checksum"])
             models.add(trial["model"])
+            providers.add(trial["provider"])
+            if trial["judge_provider"] is not None:
+                judge_providers.add(trial["judge_provider"])
             experiment_signatures.add(trial["experiment_signature"])
             arm_versions[arm].add(trial["agent_version"])
             if trial["total_token_budget"] is not None:
@@ -1087,6 +1228,16 @@ def _validate_matrix(
     if len(models) != 1:
         raise ValueError(
             "experiment arms use different agent models: " + ", ".join(sorted(models))
+        )
+    if len(providers) != 1:
+        raise ValueError(
+            "experiment arms use different agent providers: "
+            + ", ".join(sorted(providers))
+        )
+    if len(judge_providers) > 1:
+        raise ValueError(
+            "fine-judge arms use different providers: "
+            + ", ".join(sorted(judge_providers))
         )
     if len(experiment_signatures) != 1:
         raise ValueError("experiment arms use different non-treatment configurations")
@@ -1139,6 +1290,10 @@ def _validate_matrix(
             task: next(iter(checksums)) for task, checksums in task_checksums.items()
         },
         "agent_model": next(iter(models)),
+        "agent_provider": next(iter(providers)),
+        "fine_judge_provider": (
+            next(iter(judge_providers)) if judge_providers else None
+        ),
         "experiment_signature_sha256": next(iter(experiment_signatures)),
         "agent_versions": {
             arm: next(iter(versions)) for arm, versions in arm_versions.items()

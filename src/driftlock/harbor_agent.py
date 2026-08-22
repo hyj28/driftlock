@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,11 @@ from harbor.llms.lite_llm import LiteLLM
 
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import CallableLLMJudge
-from driftlock.lhtb import HarborWorkspaceDeltaObserver, LHTBTerminusRuntime
+from driftlock.lhtb import (
+    HarborWorkspaceDeltaObserver,
+    LHTBTerminusRuntime,
+    openrouter_provider_from_call_kwargs,
+)
 from driftlock.models import (
     DriftContext,
     JudgeCompletion,
@@ -47,15 +51,23 @@ from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 # the coarse tier fires, so the stronger model sits on the low-call-count side.
 PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
 
-# OpenRouter routes one model slug across many providers whose prices differ - for
-# this slug, input spans $1.162-$1.45 and cache read spans $0.044-$0.44 per million.
-# Until provider routing is pinned these are deliberately the highest routable
-# rates, so recorded cost is never understated. Silently under-reporting spend is
-# the one direction that corrupts the budget; over-reporting only looks expensive.
-# Replace with the pinned provider's exact rates once routing is fixed.
-_JUDGE_INPUT_COST_PER_TOKEN = 1.45 / 1_000_000
-_JUDGE_CACHE_COST_PER_TOKEN = 0.44 / 1_000_000
-_JUDGE_OUTPUT_COST_PER_TOKEN = 4.36 / 1_000_000
+
+@dataclass(frozen=True, slots=True)
+class _JudgeProviderPricing:
+    input_cost_per_token: float
+    cache_cost_per_token: float
+    output_cost_per_token: float
+
+
+# Pricing is keyed by the exact routable provider slug so changing the provider
+# without adding its audited rates fails instead of silently billing at stale rates.
+_JUDGE_PROVIDER_PRICING = {
+    "alibaba": _JudgeProviderPricing(
+        input_cost_per_token=0.000001162,
+        cache_cost_per_token=0.0000001162,
+        output_cost_per_token=0.000003485,
+    )
+}
 
 
 class LHTBCheckpointReplayOracle(BaseAgent):
@@ -217,6 +229,7 @@ class LHTBDriftlockAgent(Terminus2):
         driftlock_judge_api_base: str | None = None,
         driftlock_judge_max_output_tokens: int = 512,
         driftlock_judge_timeout_sec: float = 120.0,
+        driftlock_judge_llm_call_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if enable_summarize:
@@ -245,6 +258,7 @@ class LHTBDriftlockAgent(Terminus2):
                 api_base=driftlock_judge_api_base,
                 max_output_tokens=driftlock_judge_max_output_tokens,
                 timeout_sec=driftlock_judge_timeout_sec,
+                llm_call_kwargs=driftlock_judge_llm_call_kwargs,
             )
         )
         self._driftlock_fine_judge = (
@@ -640,6 +654,7 @@ class _LHTBJudgeClient:
         api_base: str | None,
         max_output_tokens: int,
         timeout_sec: float,
+        llm_call_kwargs: dict[str, Any] | None,
     ) -> None:
         if model != PINNED_LHTB_JUDGE_MODEL:
             raise ValueError(
@@ -648,7 +663,23 @@ class _LHTBJudgeClient:
             )
         if max_output_tokens <= 0 or timeout_sec <= 0:
             raise ValueError("judge output limit and timeout must be positive")
+        call_kwargs = dict(llm_call_kwargs or {})
+        if set(call_kwargs) != {"extra_body"}:
+            raise ValueError(
+                "driftlock_judge_llm_call_kwargs must contain exactly extra_body"
+            )
+        provider = openrouter_provider_from_call_kwargs(
+            call_kwargs, source="driftlock_judge_llm_call_kwargs"
+        )
+        pricing = _JUDGE_PROVIDER_PRICING.get(provider)
+        if pricing is None:
+            raise ValueError(
+                f"judge provider {provider!r} has no audited pricing; add its pinned "
+                "rates before changing driftlock_judge_llm_call_kwargs"
+            )
         self.model = model
+        self.provider = provider
+        self.pricing = pricing
         self.max_output_tokens = max_output_tokens
         self.timeout_sec = timeout_sec
         self.llm = LiteLLM(
@@ -658,10 +689,11 @@ class _LHTBJudgeClient:
             model_info={
                 "max_input_tokens": 1_000_000,
                 "max_output_tokens": 8_192,
-                "input_cost_per_token": _JUDGE_INPUT_COST_PER_TOKEN,
-                "cache_read_input_token_cost": _JUDGE_CACHE_COST_PER_TOKEN,
-                "output_cost_per_token": _JUDGE_OUTPUT_COST_PER_TOKEN,
+                "input_cost_per_token": pricing.input_cost_per_token,
+                "cache_read_input_token_cost": pricing.cache_cost_per_token,
+                "output_cost_per_token": pricing.output_cost_per_token,
             },
+            **call_kwargs,
         )
         self.llm._driftlock_single_attempt = True
         self.n_input_tokens = 0
@@ -722,8 +754,8 @@ class _LHTBJudgeClient:
             completion_tokens = ceiling
             cache_tokens = 0
             cost_usd = (
-                prompt_tokens * _JUDGE_INPUT_COST_PER_TOKEN
-                + completion_tokens * _JUDGE_OUTPUT_COST_PER_TOKEN
+                prompt_tokens * self.pricing.input_cost_per_token
+                + completion_tokens * self.pricing.output_cost_per_token
             )
             self.usage_fallbacks += 1
         self.n_input_tokens += prompt_tokens
@@ -770,6 +802,7 @@ class _LHTBJudgeClient:
         metadata["llm_time_sec"] = sum(request_times) / 1000.0
         metadata["driftlock_judge_usage"] = {
             "model": self.model,
+            "provider": self.provider,
             "input_tokens": self.n_input_tokens,
             "cache_tokens": self.n_cache_tokens,
             "output_tokens": self.n_output_tokens,

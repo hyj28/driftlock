@@ -18,6 +18,7 @@ from driftlock.lhtb import (
     LHTBRuntimeCompatibilityError,
     _validate_pinned_harbor,
     _validate_single_attempt_configuration,
+    openrouter_provider_from_call_kwargs,
 )
 from driftlock.models import RunResult, StepTokenBudgetExhausted
 from driftlock.native_lhtb import (
@@ -47,6 +48,7 @@ class _HarborLiteLLMSingleAttempt:
         temperature: float,
         model_info: dict[str, Any],
         timeout_sec: float,
+        extra_body: dict[str, Any],
     ) -> None:
         _validate_pinned_harbor()
         if timeout_sec <= 0:
@@ -57,6 +59,7 @@ class _HarborLiteLLMSingleAttempt:
             api_base=api_base,
             temperature=temperature,
             model_info=model_info,
+            extra_body=extra_body,
         )
         self.llm._driftlock_single_attempt = True
         _validate_single_attempt_configuration(self, self.llm)
@@ -129,6 +132,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_judge_api_base: str | None = None,
         driftlock_judge_max_output_tokens: int = 512,
         driftlock_judge_timeout_sec: float = 120.0,
+        driftlock_judge_llm_call_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if enable_summarize:
@@ -141,10 +145,17 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         if not isinstance(self.model_name, str) or not self.model_name:
             raise ValueError("native driftlock requires model_name")
         call_kwargs = dict(llm_call_kwargs or {})
-        if set(call_kwargs) != {"temperature", "max_tokens", "timeout"}:
+        if set(call_kwargs) != {
+            "temperature",
+            "max_tokens",
+            "timeout",
+            "extra_body",
+        }:
             raise ValueError(
-                "llm_call_kwargs must contain exactly temperature, max_tokens, timeout"
+                "llm_call_kwargs must contain exactly temperature, max_tokens, "
+                "timeout, extra_body"
             )
+        openrouter_provider_from_call_kwargs(call_kwargs, source="llm_call_kwargs")
         if call_kwargs["temperature"] != temperature:
             raise ValueError("top-level and call-level temperatures must match")
         max_output_tokens = call_kwargs["max_tokens"]
@@ -163,6 +174,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             temperature=temperature,
             model_info=model_info,
             timeout_sec=timeout_sec,
+            extra_body=call_kwargs["extra_body"],
         )
         self._native_low_level = low_level
         self._native_provider = SingleAttemptJSONProvider(low_level)
@@ -189,6 +201,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
                 api_base=driftlock_judge_api_base,
                 max_output_tokens=driftlock_judge_max_output_tokens,
                 timeout_sec=driftlock_judge_timeout_sec,
+                llm_call_kwargs=driftlock_judge_llm_call_kwargs,
             )
         )
         self._native_fine_judge = (
