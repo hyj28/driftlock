@@ -64,27 +64,35 @@ def openrouter_provider_from_call_kwargs(
     call_kwargs: Mapping[str, Any], *, source: str
 ) -> str:
     """Validate strict OpenRouter routing and return its sole provider slug."""
-    extra_body = call_kwargs.get("extra_body")
-    routing = extra_body.get("provider") if isinstance(extra_body, Mapping) else None
-    only = routing.get("only") if isinstance(routing, Mapping) else None
-    allow_fallbacks = (
-        routing.get("allow_fallbacks") if isinstance(routing, Mapping) else None
-    )
-    if (
-        not isinstance(extra_body, Mapping)
-        or set(extra_body) != {"provider"}
-        or not isinstance(routing, Mapping)
-        or set(routing) != {"only", "allow_fallbacks"}
-        or not isinstance(only, list)
-        or len(only) != 1
-        or not isinstance(only[0], str)
-        or not only[0]
-        or allow_fallbacks is not False
-    ):
+    if "extra_body" not in call_kwargs:
+        raise ValueError(f"{source} must contain extra_body")
+    extra_body = call_kwargs["extra_body"]
+    if not isinstance(extra_body, Mapping):
+        raise ValueError(f"{source}.extra_body must be a mapping")
+    if set(extra_body) != {"provider"}:
+        raise ValueError(f"{source}.extra_body must contain exactly provider")
+    routing = extra_body["provider"]
+    if not isinstance(routing, Mapping):
+        raise ValueError(f"{source}.extra_body.provider must be a mapping")
+    if set(routing) != {"only", "allow_fallbacks"}:
         raise ValueError(
-            f"{source} must pin exactly one OpenRouter provider with "
-            "allow_fallbacks=false"
+            f"{source}.extra_body.provider must contain exactly only and "
+            "allow_fallbacks"
         )
+    only = routing["only"]
+    if not isinstance(only, list):
+        raise ValueError(f"{source}.extra_body.provider.only must be a list")
+    if len(only) != 1:
+        raise ValueError(
+            f"{source}.extra_body.provider.only must contain exactly one provider slug"
+        )
+    if not isinstance(only[0], str) or not only[0]:
+        raise ValueError(
+            f"{source}.extra_body.provider.only provider slug must be a "
+            "non-empty string"
+        )
+    if routing["allow_fallbacks"] is not False:
+        raise ValueError(f"{source}.extra_body.provider.allow_fallbacks must be false")
     return only[0]
 
 

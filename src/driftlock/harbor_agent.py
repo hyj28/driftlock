@@ -234,6 +234,10 @@ class LHTBDriftlockAgent(Terminus2):
     ) -> None:
         if enable_summarize:
             raise ValueError("driftlock requires enable_summarize=false")
+        call_kwargs = kwargs.get("llm_call_kwargs")
+        if not isinstance(call_kwargs, dict):
+            call_kwargs = {}
+        openrouter_provider_from_call_kwargs(call_kwargs, source="llm_call_kwargs")
         super().__init__(*args, enable_summarize=False, **kwargs)
         self._driftlock_runner_config = RunnerConfig(
             max_steps=driftlock_max_steps,
