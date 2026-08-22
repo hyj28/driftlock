@@ -43,7 +43,7 @@ def _result(
     reward: float | None,
     *,
     checksum: str | None = None,
-    model: str = "deepseek/deepseek-v4-pro",
+    model: str = "deepseek/deepseek-v4-flash-0731",
     usage: dict[str, int | float] | None = None,
     exception: str | None = None,
     arm: str | None = None,
@@ -55,7 +55,7 @@ def _result(
     agent_config: dict[str, object] = {
         "name": None,
         "import_path": "driftlock.harbor_agent:LHTBDriftlockAgent",
-        "model_name": "openrouter/deepseek/deepseek-v4-pro",
+        "model_name": "openrouter/deepseek/deepseek-v4-flash-0731",
         "override_timeout_sec": 5400,
         "override_setup_timeout_sec": None,
         "max_timeout_sec": None,
@@ -92,7 +92,7 @@ def _result(
         agent_config = {
             "name": "terminus-2",
             "import_path": None,
-            "model_name": "openrouter/deepseek/deepseek-v4-pro",
+            "model_name": "openrouter/deepseek/deepseek-v4-flash-0731",
             "override_timeout_sec": 5400,
             "override_setup_timeout_sec": None,
             "max_timeout_sec": None,
@@ -129,7 +129,7 @@ def _result(
         assert isinstance(kwargs, dict)
         kwargs.update(
             {
-                "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-flash-0731"),
+                "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-pro-0813"),
                 "driftlock_judge_api_base": "https://judge.invalid/v1",
                 "driftlock_judge_max_output_tokens": 512,
             }
@@ -145,7 +145,7 @@ def _result(
             kwargs.update(
                 {
                     "driftlock_judge_model": (
-                        "openrouter/deepseek/deepseek-v4-flash-0731"
+                        "openrouter/deepseek/deepseek-v4-pro-0813"
                     ),
                     "driftlock_judge_api_base": "https://judge.invalid/v1",
                     "driftlock_judge_max_output_tokens": 512,
@@ -418,7 +418,9 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     assert report["matrix"]["complete"] is True
     assert report["job_summaries"]["stock"]["n_total_trials"] == 2
     assert len(report["job_summaries"]["stock"]["result_sha256"]) == 64
-    assert report["matrix"]["agent_model"] == ("openrouter/deepseek/deepseek-v4-pro")
+    assert report["matrix"]["agent_model"] == (
+        "openrouter/deepseek/deepseek-v4-flash-0731"
+    )
     assert report["matrix"]["agent_versions"] == {
         "stock": "2.0.0",
         "driftlock": "0.1.0",

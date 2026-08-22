@@ -37,8 +37,12 @@ from driftlock.oracle import (
     validate_checkpoint_source_audit,
 )
 
-DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-pro"
-DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+# Both identifiers carry an explicit dated build. An unversioned alias such as
+# "deepseek-v4-pro" silently follows whatever OpenRouter currently points it at,
+# so arms run on different days would use different models while the recorded
+# model string stayed identical - the comparison would be void with no evidence.
+DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 RUNNABLE_ARMS = (

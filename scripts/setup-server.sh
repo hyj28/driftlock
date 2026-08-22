@@ -93,8 +93,12 @@ mkdir -p "$ROOT_DIR"
 
 DRIFTLOCK_DIR="$ROOT_DIR/driftlock"
 if [ -d "$DRIFTLOCK_DIR/.git" ]; then
+  # The checkout may have been placed here by other means (rsync from a laptop,
+  # a restored snapshot) on a host with no credentials for the remote. A fetch
+  # that cannot reach the remote is not a reason to abandon provisioning.
   log "Updating driftlock checkout"
-  git -C "$DRIFTLOCK_DIR" fetch --all --tags --quiet
+  git -C "$DRIFTLOCK_DIR" fetch --all --tags --quiet \
+    || log "warning: could not reach the remote; using the checkout as it stands"
 else
   log "Cloning driftlock"
   git clone --quiet "$DRIFTLOCK_REPO" "$DRIFTLOCK_DIR"

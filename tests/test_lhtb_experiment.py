@@ -218,7 +218,7 @@ def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
             "version": "0.1.0",
             "model_info": {
                 "provider": "openrouter",
-                "name": "deepseek/deepseek-v4-pro",
+                "name": "deepseek/deepseek-v4-flash-0731",
             },
         },
         "config": {

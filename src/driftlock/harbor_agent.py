@@ -40,10 +40,22 @@ from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 
-PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
-_JUDGE_INPUT_COST_PER_TOKEN = 0.14 / 1_000_000
-_JUDGE_CACHE_COST_PER_TOKEN = 0.0028 / 1_000_000
-_JUDGE_OUTPUT_COST_PER_TOKEN = 0.28 / 1_000_000
+# The fine judge must not be the same model as the agent. Its job is to notice
+# that the agent has drifted, and a judge sharing the agent's weights shares its
+# blind spots: if the agent talked itself into a wrong path, the same model
+# reading the same trajectory is disposed to agree. The judge also runs only when
+# the coarse tier fires, so the stronger model sits on the low-call-count side.
+PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
+
+# OpenRouter routes one model slug across many providers whose prices differ - for
+# this slug, input spans $1.162-$1.45 and cache read spans $0.044-$0.44 per million.
+# Until provider routing is pinned these are deliberately the highest routable
+# rates, so recorded cost is never understated. Silently under-reporting spend is
+# the one direction that corrupts the budget; over-reporting only looks expensive.
+# Replace with the pinned provider's exact rates once routing is fixed.
+_JUDGE_INPUT_COST_PER_TOKEN = 1.45 / 1_000_000
+_JUDGE_CACHE_COST_PER_TOKEN = 0.44 / 1_000_000
+_JUDGE_OUTPUT_COST_PER_TOKEN = 4.36 / 1_000_000
 
 
 class LHTBCheckpointReplayOracle(BaseAgent):
