@@ -360,6 +360,45 @@ def _without_none(value: object) -> object:
     return value
 
 
+def _trajectory_steps() -> list[dict[str, object]]:
+    return [
+        {"step_id": 1, "source": "user", "message": "task"},
+        {
+            "step_id": 2,
+            "source": "agent",
+            "message": "first",
+            "metrics": {
+                "prompt_tokens": 11,
+                "cached_tokens": 7,
+                "completion_tokens": 3,
+                "cost_usd": 0.125,
+            },
+        },
+        {
+            "step_id": 3,
+            "source": "agent",
+            "message": "second",
+            "metrics": {
+                "prompt_tokens": 13,
+                "cached_tokens": 9,
+                "completion_tokens": 5,
+                "cost_usd": 0.25,
+            },
+        },
+        {
+            "step_id": 4,
+            "source": "agent",
+            "message": "zero-token final entry",
+            "metrics": {
+                "prompt_tokens": 0,
+                "cached_tokens": 0,
+                "completion_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        },
+    ]
+
+
 def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
     lhtb = tmp_path / "LHTB"
     _task(lhtb, "short", expert_minutes=60, category="build")
@@ -399,6 +438,23 @@ def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
     _job_summary(stock, 2)
     _job_summary(driftlock, 2)
     return lhtb, stock, driftlock
+
+
+def _set_graded_timeout(result_file: Path, *, reward: float) -> None:
+    payload = json.loads(result_file.read_text())
+    payload["agent_result"] = None
+    payload["verifier_result"] = {"rewards": {"reward": reward}}
+    payload["exception_info"] = {
+        "exception_type": "AgentTimeoutError",
+        "exception_message": "Agent execution timed out after 5400.0 seconds",
+    }
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir()
+    trajectory.write_text(
+        json.dumps({"schema_version": "ATIF-v1.0", "steps": _trajectory_steps()}),
+        encoding="utf-8",
+    )
 
 
 def test_goal_drift_formulas_match_published_definitions() -> None:
@@ -824,6 +880,146 @@ def test_analyze_rejects_infrastructure_failure_instead_of_scoring_it(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
         )
+
+
+def test_analyze_accepts_graded_timeout_and_reconstructs_exact_usage(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _set_graded_timeout(stock / "long-1" / "result.json", reward=0.15)
+    _job_summary(stock, 2, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    stock_report = report["arms"]["stock"]
+    assert stock_report["trial_count"] == 2
+    assert stock_report["graded_at_time_cap_count"] == 1
+    assert stock_report["input_tokens"] == 124
+    assert stock_report["cache_tokens"] == 56
+    assert stock_report["output_tokens"] == 28
+    assert stock_report["cost_usd"] == 0.625
+    assert stock_report["trajectory_reconstructed_usage"] == {
+        "input_tokens": 24,
+        "cache_tokens": 16,
+        "output_tokens": 8,
+        "cost_usd": 0.375,
+    }
+    timeout_trial = next(
+        trial
+        for trial in stock_report["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert timeout_trial["reward"] == 0.15
+    assert timeout_trial["graded_at_time_cap"] is True
+    assert timeout_trial["usage_source"] == "trajectory"
+    assert timeout_trial["input_tokens"] == 24
+    assert timeout_trial["cache_tokens"] == 16
+    assert timeout_trial["output_tokens"] == 8
+    assert timeout_trial["cost_usd"] == 0.375
+    assert report["matrix"]["complete"] is True
+    assert (
+        report["paired_vs_stock"]["driftlock"]["aggregate_workload_comparable"] is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "missing trajectory needed to reconstruct agent usage"),
+        ("malformed", "cached_tokens"),
+    ],
+)
+def test_analyze_rejects_unusable_trajectory_needed_for_timeout_usage(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = stock / "long-1" / "result.json"
+    _set_graded_timeout(result_file, reward=0.15)
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    if mutation == "missing":
+        trajectory.unlink()
+    else:
+        trajectory.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "source": "agent",
+                            "metrics": {
+                                "prompt_tokens": 11,
+                                "completion_tokens": 3,
+                                "cost_usd": 0.125,
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    _job_summary(stock, 2, errors=1)
+
+    with pytest.raises(ValueError, match=message):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_rejects_non_timeout_exception_by_type(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = stock / "long-1" / "result.json"
+    payload = json.loads(result_file.read_text())
+    payload["exception_info"] = {"exception_type": "RuntimeError"}
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 2, errors=1)
+
+    with pytest.raises(ValueError, match="RuntimeError"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_reports_different_timeout_counts_per_arm(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _set_graded_timeout(stock / "short-1" / "result.json", reward=0.4)
+    _set_graded_timeout(stock / "long-1" / "result.json", reward=0.2)
+    _job_summary(stock, 2, errors=2)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    assert report["arms"]["stock"]["graded_at_time_cap_count"] == 2
+    assert report["arms"]["driftlock"]["graded_at_time_cap_count"] == 0
+
+
+def test_analyze_prefers_agent_result_over_trajectory_usage(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = driftlock / "long-1" / "result.json"
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir()
+    trajectory.write_text("not JSON", encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    trial = next(
+        trial
+        for trial in report["arms"]["driftlock"]["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert trial["usage_source"] == "agent_result"
+    assert trial["input_tokens"] == 120
+    assert trial["cache_tokens"] == 60
+    assert trial["output_tokens"] == 30
+    assert trial["cost_usd"] == 0.3
 
 
 def test_analyze_requires_canonical_reward_key(tmp_path: Path) -> None:

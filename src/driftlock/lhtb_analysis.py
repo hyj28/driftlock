@@ -151,6 +151,14 @@ def analyze_jobs(
                 raise ValueError(f"duplicate Harbor trial id: {trial['trial_id']}")
             seen_trial_ids.add(trial["trial_id"])
             trials.append(trial)
+        graded_at_time_cap_count = sum(trial["graded_at_time_cap"] for trial in trials)
+        if graded_at_time_cap_count != job_summaries[arm]["n_errored_trials"]:
+            raise ValueError(
+                f"arm {arm!r} Harbor job summary declares "
+                f"{job_summaries[arm]['n_errored_trials']} errored trials but "
+                f"trial results contain {graded_at_time_cap_count} graded "
+                "AgentTimeoutError trials"
+            )
         actual_task_counts: dict[str, int] = defaultdict(int)
         for trial in trials:
             actual_task_counts[trial["task"]] += 1
@@ -271,8 +279,8 @@ def _load_job_summary(
     }
     if unfinished:
         raise ValueError(f"Harbor job still has active trials in {result_file}")
-    if counts["n_errored_trials"] or counts["n_cancelled_trials"]:
-        raise ValueError(f"Harbor job contains errored trials in {result_file}")
+    if counts["n_cancelled_trials"]:
+        raise ValueError(f"Harbor job contains cancelled trials in {result_file}")
     retries = _nonnegative_integer(
         stats.get("n_retries"), f"n_retries in {result_file}"
     )
@@ -300,6 +308,7 @@ def _load_job_summary(
         "result_sha256": _file_sha256(result_file),
         "job_id": job_id,
         "n_total_trials": n_total,
+        "n_errored_trials": counts["n_errored_trials"],
         "n_retries": retries,
         "usage": usage,
         "finished_at": finished,
@@ -413,13 +422,17 @@ def _validate_job_usage(
     arm: str, summary: dict[str, Any], report: dict[str, Any]
 ) -> None:
     usage = summary["usage"]
+    reconstructed = report["trajectory_reconstructed_usage"]
     for name in ("input_tokens", "cache_tokens", "output_tokens"):
-        if usage[name] != report[name]:
+        if usage[name] != report[name] - reconstructed[name]:
             raise ValueError(
                 f"arm {arm!r} trial {name} total does not match Harbor job summary"
             )
     if not math.isclose(
-        usage["cost_usd"], report["cost_usd"], rel_tol=1e-9, abs_tol=1e-9
+        usage["cost_usd"],
+        report["cost_usd"] - reconstructed["cost_usd"],
+        rel_tol=1e-9,
+        abs_tol=1e-9,
     ):
         raise ValueError(
             f"arm {arm!r} trial cost total does not match Harbor job summary"
@@ -448,6 +461,7 @@ def _load_trial(
     task = data.get("task_name")
     if not isinstance(task, str) or task not in task_index:
         raise ValueError(f"invalid task_name in {result_file}")
+    graded_at_time_cap = _graded_at_time_cap(data, result_file)
     reward = _reward(data, result_file)
     checksum = data.get("task_checksum")
     if not isinstance(checksum, str) or not checksum:
@@ -462,7 +476,7 @@ def _load_trial(
         expected_judge_provider=expected_judge_provider,
     )
     provider, judge_provider = _trial_providers(data, arm, result_file)
-    usage = _usage(data, result_file)
+    usage, usage_source = _usage(data, result_file)
     task_metadata = task_metadata_cache.get(task)
     if task_metadata is None:
         task_metadata = _task_metadata(task_index[task], task)
@@ -478,6 +492,7 @@ def _load_trial(
         "task": task,
         "reward": reward,
         "solved": reward >= solve_threshold,
+        "graded_at_time_cap": graded_at_time_cap,
         "task_checksum": checksum,
         "model": model,
         "provider": provider,
@@ -493,6 +508,7 @@ def _load_trial(
         "output_tokens": usage["output_tokens"],
         "total_tokens": usage["input_tokens"] + usage["output_tokens"],
         "cost_usd": usage["cost_usd"],
+        "usage_source": usage_source,
         "duration_sec": duration,
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
@@ -1015,12 +1031,28 @@ def _reward(data: dict[str, Any], result_file: Path) -> float:
     if not isinstance(verifier, dict):
         exception = data.get("exception_info")
         detail = _exception_name(exception)
-        raise ValueError(f"missing verifier result in {result_file} ({detail})")
+        raise ValueError(
+            f"Harbor job contains errored trials: missing verifier result in "
+            f"{result_file} ({detail})"
+        )
     rewards = verifier.get("rewards")
     if not isinstance(rewards, dict) or "reward" not in rewards:
         raise ValueError(f"missing canonical verifier reward in {result_file}")
     raw = rewards["reward"]
     return _unit_interval(raw, f"reward in {result_file}")
+
+
+def _graded_at_time_cap(data: dict[str, Any], result_file: Path) -> bool:
+    exception = data.get("exception_info")
+    if exception is None:
+        return False
+    exception_type = _exception_name(exception)
+    if exception_type != "AgentTimeoutError":
+        raise ValueError(
+            f"trial raised {exception_type} instead of reaching the accepted "
+            f"agent time cap in {result_file}"
+        )
+    return True
 
 
 def _model_identity(data: dict[str, Any], result_file: Path) -> str:
@@ -1037,7 +1069,9 @@ def _model_identity(data: dict[str, Any], result_file: Path) -> str:
     return f"{provider}/{name}"
 
 
-def _usage(data: dict[str, Any], result_file: Path) -> dict[str, int | float]:
+def _usage(
+    data: dict[str, Any], result_file: Path
+) -> tuple[dict[str, int | float], str]:
     direct = data.get("agent_result")
     step_results = data.get("step_results")
     if isinstance(direct, dict) and isinstance(step_results, list) and step_results:
@@ -1055,7 +1089,7 @@ def _usage(data: dict[str, Any], result_file: Path) -> dict[str, int | float]:
     else:
         contexts = []
     if not contexts:
-        raise ValueError(f"missing agent usage context in {result_file}")
+        return _trajectory_usage(result_file), "trajectory"
     totals: dict[str, int | float] = {
         "input_tokens": 0,
         "cache_tokens": 0,
@@ -1079,6 +1113,75 @@ def _usage(data: dict[str, Any], result_file: Path) -> dict[str, int | float]:
             totals[output_name] += value
     if totals["cache_tokens"] > totals["input_tokens"]:
         raise ValueError(f"cache tokens exceed input tokens in {result_file}")
+    return totals, "agent_result" if isinstance(direct, dict) else "step_results"
+
+
+def _trajectory_usage(result_file: Path) -> dict[str, int | float]:
+    trajectory_file = result_file.parent / "agent" / "trajectory.json"
+    try:
+        data = json.loads(trajectory_file.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"missing trajectory needed to reconstruct agent usage: {trajectory_file}"
+        ) from error
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(
+            f"unreadable trajectory needed to reconstruct agent usage: "
+            f"{trajectory_file}: {error}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"invalid JSON in trajectory needed to reconstruct agent usage: "
+            f"{trajectory_file}: {error}"
+        ) from error
+    if not isinstance(data, dict) or not isinstance(data.get("steps"), list):
+        raise ValueError(
+            f"malformed trajectory needed to reconstruct agent usage: "
+            f"{trajectory_file} must contain a steps array"
+        )
+    steps = data["steps"]
+    if not steps:
+        raise ValueError(
+            f"malformed trajectory needed to reconstruct agent usage: "
+            f"{trajectory_file} has no steps"
+        )
+    totals: dict[str, int | float] = {
+        "input_tokens": 0,
+        "cache_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    fields = {
+        "input_tokens": "prompt_tokens",
+        "cache_tokens": "cached_tokens",
+        "output_tokens": "completion_tokens",
+        "cost_usd": "cost_usd",
+    }
+    for index, step in enumerate(steps):
+        context = f"step {index} metrics in {trajectory_file}"
+        if not isinstance(step, dict):
+            raise ValueError(f"malformed trajectory {context}: step must be an object")
+        metrics = step.get("metrics")
+        if metrics is None and (
+            step.get("source") in {"system", "user"}
+            or (step.get("source") == "agent" and step.get("llm_call_count") == 0)
+        ):
+            continue
+        if not isinstance(metrics, dict):
+            raise ValueError(
+                f"malformed trajectory {context}: metrics must be an object"
+            )
+        for output_name, source_name in fields.items():
+            raw = metrics.get(source_name)
+            if output_name == "cost_usd":
+                value = _nonnegative_number(raw, f"{source_name} in {context}")
+            else:
+                value = _nonnegative_integer(raw, f"{source_name} in {context}")
+            totals[output_name] += value
+    if totals["cache_tokens"] > totals["input_tokens"]:
+        raise ValueError(
+            f"trajectory cache tokens exceed input tokens in {trajectory_file}"
+        )
     return totals
 
 
@@ -1332,11 +1435,23 @@ def _aggregate_arm(
     output_tokens = sum(trial["output_tokens"] for trial in trials)
     total_tokens = input_tokens + output_tokens
     cost = sum(trial["cost_usd"] for trial in trials)
+    reconstructed_trials = [
+        trial for trial in trials if trial["usage_source"] == "trajectory"
+    ]
+    reconstructed_usage = {
+        "input_tokens": sum(trial["input_tokens"] for trial in reconstructed_trials),
+        "cache_tokens": sum(trial["cache_tokens"] for trial in reconstructed_trials),
+        "output_tokens": sum(trial["output_tokens"] for trial in reconstructed_trials),
+        "cost_usd": sum(trial["cost_usd"] for trial in reconstructed_trials),
+    }
     durations = [
         trial["duration_sec"] for trial in trials if trial["duration_sec"] is not None
     ]
     return {
         "trial_count": len(trials),
+        "graded_at_time_cap_count": sum(
+            trial["graded_at_time_cap"] for trial in trials
+        ),
         "task_count": len(task_trials),
         "mean_reward": _mean([trial["reward"] for trial in trials]),
         "solved_rate": _mean([float(trial["solved"]) for trial in trials]),
@@ -1348,6 +1463,7 @@ def _aggregate_arm(
         "cache_hit_rate": cache_tokens / input_tokens if input_tokens else None,
         "cost_usd": cost,
         "mean_cost_usd_per_trial": cost / len(trials),
+        "trajectory_reconstructed_usage": reconstructed_usage,
         "mean_duration_sec": _mean(durations) if durations else None,
         "duration_observation_count": len(durations),
         "failure_slope_per_task_length_doubling": _slope(
