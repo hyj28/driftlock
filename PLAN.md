@@ -324,20 +324,55 @@ not run at all.
 
 ### 5.2 Models
 
-| Role | Model | Price per 1M tokens |
+DeepSeek ended its 75% launch promotion on 2026-08-16, roughly doubling V4-Pro and
+making it about ten times the price of V4-Flash. The allocation below follows from
+that, and from a constraint the original plan got backwards.
+
+| Role | Model | Price per 1M tokens (OpenRouter, routable providers) |
 | --- | --- | --- |
-| Agent | DeepSeek **V4-Pro** | $0.435 in / $0.003625 cache hit / $0.87 out |
-| LLM judge + skill distiller | DeepSeek **V4-Flash** | $0.14 in / $0.0028 cache hit / $0.28 out |
+| Agent — high call count | DeepSeek **V4-Flash 0731** | $0.065–0.13 in / $0.014–0.07 cache / $0.14–0.28 out |
+| Fine judge — fires only when the coarse tier trips | DeepSeek **V4-Pro 0813** | $1.16–1.45 in / $0.044–0.44 cache / $3.49–4.36 out |
 | Skill retrieval | Local sentence-transformers | $0 |
 
-**Cache-hit pricing is 50–120× cheaper, which is decisive here** — an agent loop
-re-sends a nearly identical history every step, so the cache hit rate is naturally
-very high.
+**The expensive model belongs on the low-call-count side.** Cost is dominated by the
+agent loop, so putting Flash there and Pro on the judge is cheaper than the reverse
+*and* keeps the judge independent: a judge sharing the agent's weights shares its
+blind spots, and §3.3 already commits to the judge's quality being the project's
+quality.
+
+**Cache-hit pricing is 5–10× cheaper than a miss**, which matters because an agent
+loop re-sends a nearly identical history every step.
+
+**Both identifiers carry a dated build.** An unversioned alias such as
+`deepseek-v4-pro` follows whatever OpenRouter currently points it at, so arms run on
+different days would silently use different models while the recorded model string
+stayed identical.
+
+**Open risk — provider routing is not pinned.** OpenRouter serves one slug from many
+providers whose prices differ by up to 10× on cache reads, and whose builds may
+differ in ways the model string does not capture. The analyzer compares model
+strings, so a provider switch between arms would pass every existing check. Routing
+must be pinned before the first paid experiment run; until then, recorded judge cost
+deliberately uses the highest routable rates so spend is never understated.
 
 ### 5.3 Budget (hard $100 constraint)
 
 | Item | Runs | Cost |
 | --- | --- | --- |
+| LHTB, 4 arms × 8 tasks — agent | 32 | ~$7 |
+| LHTB — fine judge | — | ~$8 |
+| SWE-bench evolution, 2 arms × 3 rounds × 30 | 180 | ~$7 |
+| SWE-bench held-out eval, 4 arms × 20 | 80 | ~$4 |
+| **API total** | **292** | **~$26** |
+| Cloud box, hourly, destroyed between sessions | ~250 h | ~$33 |
+| **Total** | | **~$59** |
+
+Assumes ~90% cache hits. The cloud box bills hourly and is billed for as long as it
+*exists*, not while it runs, so the figure above depends on destroying it between
+sessions rather than powering it off; leaving it up for the full ten weeks would cost
+~$206 on its own.
+
+--- | --- | --- |
 | LHTB, 4 arms × 8 tasks | 32 | ~$21 |
 | SWE-bench evolution, 2 arms × 3 rounds × 30 | 180 | ~$13 |
 | SWE-bench held-out eval, 4 arms × 20 | 80 | ~$7 |
@@ -385,6 +420,7 @@ the results section stays empty, per §1.
 | 8 | **Budget overrun** — ~$41 of API leaves room for roughly one redo | Can't iterate | Use V4-Flash during development; hold the 8-task LHTB subset |
 | 9 | **Attribution against external baselines** — with subagents in the agent, comparisons to Memento / ReasoningBank / GEPA can't isolate which component won | Weaker external claim | Accepted. All four arms per benchmark share the same agent, so every *internal* comparison is clean; external numbers are cited as reference points, not as controlled comparisons |
 | 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
+| 11 | **OpenRouter provider routing is not pinned** — one model slug is served by many providers whose cache-read rates differ by up to 10x and whose builds may differ in ways the model string does not capture; the analyzer compares model strings, so a provider switch between arms passes every existing check | Arm comparison void, with no evidence in the record | Pin routing (`allow_fallbacks: false`) before the first paid run. Blocked on `llm_call_kwargs` validation, which currently rejects any key outside `{temperature, max_tokens, timeout}`, and on binding the pinned provider into arm identity |
 
 ---
 
