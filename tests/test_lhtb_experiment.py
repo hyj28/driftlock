@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 import driftlock.lhtb_experiment as experiment
+from driftlock.lhtb_analysis import task_directory_sha256
 from driftlock.lhtb_experiment import (
     PreflightError,
     build_job_config,
     main,
+    prepare_oracle_replays,
     select_tasks,
 )
 
@@ -21,7 +26,10 @@ def _lhtb_tree(tmp_path: Path, *tasks: str) -> Path:
     for task in tasks:
         task_dir = root / "tasks" / task
         task_dir.mkdir(parents=True)
-        (task_dir / "task.toml").write_text("version = '1'\n", encoding="utf-8")
+        (task_dir / "task.toml").write_text(
+            f"[task]\nname = 'long-horizon-terminal-bench/{task}'\n",
+            encoding="utf-8",
+        )
     return root
 
 
@@ -50,6 +58,125 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
     assert "max_retries" not in agent["kwargs"]["llm_call_kwargs"]
     assert config["retry"]["max_retries"] == 0
     assert config["datasets"][0]["task_names"] == ["task-a", "task-b"]
+
+
+@pytest.mark.parametrize(
+    "arm",
+    [
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    ],
+)
+def test_build_driftlock_config_records_every_detector_threshold(
+    tmp_path: Path, arm: str
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name=f"detectors-{arm}",
+        arm=arm,
+        tasks=["task-a"],
+    )
+
+    kwargs = config["agents"][0]["kwargs"]
+    assert {
+        name: kwargs[name]
+        for name in (
+            "driftlock_no_change_steps",
+            "driftlock_loop_window",
+            "driftlock_loop_repetitions",
+            "driftlock_error_window",
+            "driftlock_error_rate",
+            "driftlock_command_failure_window",
+            "driftlock_command_failure_rate",
+            "driftlock_reward_stall_steps",
+            "driftlock_reward_epsilon",
+            "driftlock_corroborating_signals",
+        )
+    } == {
+        "driftlock_no_change_steps": 4,
+        "driftlock_loop_window": 6,
+        "driftlock_loop_repetitions": 3,
+        "driftlock_error_window": 5,
+        "driftlock_error_rate": 0.6,
+        "driftlock_command_failure_window": 8,
+        "driftlock_command_failure_rate": 1.0,
+        "driftlock_reward_stall_steps": 5,
+        "driftlock_reward_epsilon": 0.000001,
+        "driftlock_corroborating_signals": ["no_file_change"],
+    }
+
+
+def test_build_stock_config_has_no_detector_thresholds(tmp_path: Path) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="stock-without-detectors",
+        arm="stock",
+        tasks=["task-a"],
+    )
+
+    kwargs = config["agents"][0]["kwargs"]
+    assert not any(name.startswith("driftlock_") for name in kwargs)
+
+
+@pytest.mark.parametrize(
+    "arm",
+    [
+        "stock",
+        "retry",
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    ],
+)
+def test_every_paid_agent_arm_has_strict_provider_routing(
+    tmp_path: Path, arm: str
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name=f"provider-{arm}",
+        arm=arm,
+        tasks=["task-a"],
+    )
+
+    assert config["agents"][0]["kwargs"]["llm_call_kwargs"]["extra_body"] == {
+        "provider": {"only": ["baidu/fp8"], "allow_fallbacks": False}
+    }
+
+
+def test_agent_and_judge_provider_routes_are_independently_configurable(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="separate-providers",
+        arm="driftlock",
+        tasks=["task-a"],
+        provider="streamlake/fp8",
+        judge_provider="alibaba",
+    )
+
+    kwargs = config["agents"][0]["kwargs"]
+    assert kwargs["llm_call_kwargs"]["extra_body"] == {
+        "provider": {"only": ["streamlake/fp8"], "allow_fallbacks": False}
+    }
+    assert kwargs["driftlock_judge_llm_call_kwargs"] == {
+        "extra_body": {"provider": {"only": ["alibaba"], "allow_fallbacks": False}}
+    }
 
 
 @pytest.mark.parametrize(
@@ -111,6 +238,250 @@ def test_oracle_cannot_be_misrepresented_as_an_online_agent(tmp_path: Path) -> N
             arm="oracle",
             tasks=["task-a"],
         )
+
+
+def test_checkpoint_retention_is_explicit_and_only_for_driftlock(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="source",
+        arm="driftlock",
+        tasks=["task-a"],
+        retain_checkpoints=True,
+    )
+    assert config["agents"][0]["kwargs"]["driftlock_retain_checkpoints"] is True
+    with pytest.raises(ValueError, match="requires a driftlock arm"):
+        build_job_config(
+            lhtb_dir=root,
+            jobs_dir=tmp_path / "jobs",
+            job_name="invalid",
+            arm="retry",
+            tasks=["task-a"],
+            retain_checkpoints=True,
+        )
+
+
+@pytest.mark.parametrize("arm", ["native-driftlock-heuristic", "native-driftlock"])
+def test_native_checkpoint_retention_is_rejected_before_job_generation(
+    tmp_path: Path, arm: str
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    with pytest.raises(ValueError, match="native oracle replay is future work"):
+        build_job_config(
+            lhtb_dir=root,
+            jobs_dir=tmp_path / "jobs",
+            job_name="unsupported-native-source",
+            arm=arm,
+            tasks=["task-a"],
+            retain_checkpoints=True,
+        )
+
+
+def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
+    trial_id = str(uuid4())
+    trial = job / "task-a.1-of-1.2026-01-01"
+    checkpoint_id = "c" * 32
+    checkpoint = (
+        trial / ".driftlock-checkpoints" / "phase-0" / "checkpoints" / checkpoint_id
+    )
+    checkpoint.mkdir(parents=True)
+    archive = b"checkpoint archive"
+    state_text = '{"conversation":[]}'
+    digest = hashlib.sha256(archive)
+    digest.update(b"\0state\0")
+    digest.update(state_text.encode())
+    (checkpoint / "workspace.tar.gz").write_bytes(archive)
+    (checkpoint / "state.json").write_text(state_text, encoding="utf-8")
+    (checkpoint / "manifest.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_id": checkpoint_id,
+                "step": 5,
+                "created_at": datetime.now(UTC).isoformat(),
+                "digest": digest.hexdigest(),
+                "parent_id": None,
+                "label": "step-5",
+                "remote_workspace": "/app",
+            }
+        ),
+        encoding="utf-8",
+    )
+    audit_dir = trial / "agent"
+    audit_dir.mkdir()
+    (audit_dir / "driftlock-result.json").write_text(
+        json.dumps(
+            {
+                "phases": [
+                    {
+                        "phase": 0,
+                        "checkpoint_dir": str(checkpoint.parent.parent.resolve()),
+                        "checkpoints_retained": True,
+                        "status": "completed",
+                        "checkpoint_count": 1,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = {
+        "id": trial_id,
+        "task_name": "long-horizon-terminal-bench/task-a",
+        "task_checksum": task_directory_sha256(root / "tasks" / "task-a"),
+        "agent_info": {
+            "name": "driftlock-terminus-2",
+            "version": "0.1.0",
+            "model_info": {
+                "provider": "openrouter",
+                "name": "deepseek/deepseek-v4-flash-0731",
+            },
+        },
+        "config": {
+            "agent": {
+                "import_path": "driftlock.harbor_agent:LHTBDriftlockAgent",
+                "model_name": experiment.DEFAULT_MODEL,
+                "env": {
+                    "HB_CONTINUE_MODE": "same_conversation",
+                    "DRIFTLOCK_EXPERIMENT_FINGERPRINT": (
+                        experiment.lhtb_experiment_fingerprint()
+                    ),
+                },
+                "kwargs": {
+                    "enable_summarize": False,
+                    "driftlock_max_tokens": 10_000,
+                    "driftlock_max_steps": 500,
+                    "driftlock_max_rollbacks": 3,
+                    "driftlock_checkpoint_interval": 5,
+                    "driftlock_retain_checkpoints": True,
+                },
+            }
+        },
+        "agent_result": {
+            "n_input_tokens": 100,
+            "n_cache_tokens": 20,
+            "n_output_tokens": 10,
+            "cost_usd": 0.5,
+        },
+    }
+    result_file = trial / "result.json"
+    result_file.write_text(json.dumps(result), encoding="utf-8")
+    return result_file, trial_id
+
+
+def test_prepare_oracle_replays_generates_one_isolated_job_per_checkpoint(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    result_file, trial_id = _retained_source_trial(root, source)
+
+    manifest = prepare_oracle_replays(
+        lhtb_dir=root,
+        source_job_dir=source,
+        output_dir=tmp_path / "oracle",
+    )
+
+    assert manifest["candidate_count"] == 1
+    candidate = manifest["candidates"][0]
+    assert candidate["source_trial_id"] == trial_id
+    assert candidate["usage_policy"] == "full-source-trial-conservative"
+    config = json.loads(Path(candidate["config"]).read_text())
+    agent = config["agents"][0]
+    assert agent["import_path"] == "driftlock.harbor_agent:LHTBCheckpointReplayOracle"
+    assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
+    assert agent["kwargs"]["driftlock_source_result"] == str(result_file.resolve())
+    assert agent["kwargs"]["driftlock_source_usage"]["input_tokens"] == 100
+    assert config["n_concurrent_trials"] == 1
+    assert config["retry"] == {"max_retries": 0}
+
+
+def test_prepare_oracle_replays_reports_native_incompatibility_explicitly(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    result_file, _ = _retained_source_trial(root, source)
+    payload = json.loads(result_file.read_text(encoding="utf-8"))
+    payload["config"]["agent"]["import_path"] = (
+        "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+    )
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError, match="native retained checkpoints cannot be used for oracle replay"
+    ):
+        prepare_oracle_replays(
+            lhtb_dir=root,
+            source_job_dir=source,
+            output_dir=tmp_path / "oracle",
+        )
+
+
+def test_oracle_run_needs_docker_but_not_provider_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "oracle"
+    calls: list[dict[str, object]] = []
+
+    def fake_preflight(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append({"kind": "preflight", "args": args, **kwargs})
+        return {}
+
+    monkeypatch.setattr(experiment, "preflight", fake_preflight)
+    monkeypatch.setattr(
+        experiment,
+        "prepare_oracle_replays",
+        lambda **kwargs: {
+            "candidate_count": 1,
+            "candidates": [{"config": str(tmp_path / "candidate.json")}],
+        },
+    )
+    monkeypatch.setattr(
+        experiment,
+        "_pinned_harbor_command",
+        lambda: ["/pinned/python", "/pinned/harbor"],
+    )
+    monkeypatch.setenv("HB_PROCESS_REWARD", "unsafe")
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append({"kind": "run", "command": command, **kwargs})
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(experiment.subprocess, "run", fake_run)
+
+    assert (
+        main(
+            [
+                "oracle-run",
+                "--lhtb-dir",
+                str(root),
+                "--source-job-dir",
+                str(source),
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    preflight_call = calls[0]
+    assert preflight_call["require_credential"] is False
+    run_call = calls[1]
+    assert run_call["command"][-3:] == [
+        "run",
+        "-c",
+        str(tmp_path / "candidate.json"),
+    ]
+    child_env = run_call["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["HB_CONTINUE_MODE"] == "same_conversation"
+    assert "HB_PROCESS_REWARD" not in child_env
 
 
 def test_build_stock_config_matches_leaderboard_retry_behavior(tmp_path: Path) -> None:

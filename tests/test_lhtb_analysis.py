@@ -9,6 +9,7 @@ import pytest
 from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
 from driftlock.lhtb_analysis import (
     _task_directory_sha256,
+    _validate_arm_identity,
     analyze_jobs,
     goal_drift_actions,
     goal_drift_inaction,
@@ -43,7 +44,7 @@ def _result(
     reward: float | None,
     *,
     checksum: str | None = None,
-    model: str = "deepseek/deepseek-v4-pro",
+    model: str = "deepseek/deepseek-v4-flash-0731",
     usage: dict[str, int | float] | None = None,
     exception: str | None = None,
     arm: str | None = None,
@@ -55,7 +56,7 @@ def _result(
     agent_config: dict[str, object] = {
         "name": None,
         "import_path": "driftlock.harbor_agent:LHTBDriftlockAgent",
-        "model_name": "openrouter/deepseek/deepseek-v4-pro",
+        "model_name": "openrouter/deepseek/deepseek-v4-flash-0731",
         "override_timeout_sec": 5400,
         "override_setup_timeout_sec": None,
         "max_timeout_sec": None,
@@ -72,6 +73,12 @@ def _result(
                 "temperature": 0.7,
                 "max_tokens": 8192,
                 "timeout": 240,
+                "extra_body": {
+                    "provider": {
+                        "only": ["baidu/fp8"],
+                        "allow_fallbacks": False,
+                    }
+                },
             },
             "model_info": {
                 "max_input_tokens": 128000,
@@ -92,7 +99,7 @@ def _result(
         agent_config = {
             "name": "terminus-2",
             "import_path": None,
-            "model_name": "openrouter/deepseek/deepseek-v4-pro",
+            "model_name": "openrouter/deepseek/deepseek-v4-flash-0731",
             "override_timeout_sec": 5400,
             "override_setup_timeout_sec": None,
             "max_timeout_sec": None,
@@ -117,6 +124,12 @@ def _result(
                     "temperature": 0.7,
                     "max_tokens": 8192,
                     "timeout": 240,
+                    "extra_body": {
+                        "provider": {
+                            "only": ["baidu/fp8"],
+                            "allow_fallbacks": False,
+                        }
+                    },
                     "num_retries": 4,
                 },
             },
@@ -129,9 +142,64 @@ def _result(
         assert isinstance(kwargs, dict)
         kwargs.update(
             {
-                "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-flash-0731"),
+                "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-pro-0813"),
                 "driftlock_judge_api_base": "https://judge.invalid/v1",
                 "driftlock_judge_max_output_tokens": 512,
+                "driftlock_judge_llm_call_kwargs": {
+                    "extra_body": {
+                        "provider": {
+                            "only": ["alibaba"],
+                            "allow_fallbacks": False,
+                        }
+                    }
+                },
+            }
+        )
+    elif resolved_arm in {"native-driftlock-heuristic", "native-driftlock"}:
+        agent_name = "driftlock-native-tool-agent"
+        agent_config["import_path"] = (
+            "driftlock.harbor_native_agent:LHTBNativeDriftlockAgent"
+        )
+        if resolved_arm == "native-driftlock":
+            kwargs = agent_config["kwargs"]
+            assert isinstance(kwargs, dict)
+            kwargs.update(
+                {
+                    "driftlock_judge_model": (
+                        "openrouter/deepseek/deepseek-v4-pro-0813"
+                    ),
+                    "driftlock_judge_api_base": "https://judge.invalid/v1",
+                    "driftlock_judge_max_output_tokens": 512,
+                    "driftlock_judge_llm_call_kwargs": {
+                        "extra_body": {
+                            "provider": {
+                                "only": ["alibaba"],
+                                "allow_fallbacks": False,
+                            }
+                        }
+                    },
+                }
+            )
+    if resolved_arm in {
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    }:
+        kwargs = agent_config["kwargs"]
+        assert isinstance(kwargs, dict)
+        kwargs.update(
+            {
+                "driftlock_no_change_steps": 4,
+                "driftlock_loop_window": 6,
+                "driftlock_loop_repetitions": 3,
+                "driftlock_error_window": 5,
+                "driftlock_error_rate": 0.6,
+                "driftlock_command_failure_window": 8,
+                "driftlock_command_failure_rate": 1.0,
+                "driftlock_reward_stall_steps": 5,
+                "driftlock_reward_epsilon": 0.000001,
+                "driftlock_corroborating_signals": ["no_file_change"],
             }
         )
     payload = {
@@ -314,6 +382,45 @@ def _without_none(value: object) -> object:
     return value
 
 
+def _trajectory_steps() -> list[dict[str, object]]:
+    return [
+        {"step_id": 1, "source": "user", "message": "task"},
+        {
+            "step_id": 2,
+            "source": "agent",
+            "message": "first",
+            "metrics": {
+                "prompt_tokens": 11,
+                "cached_tokens": 7,
+                "completion_tokens": 3,
+                "cost_usd": 0.125,
+            },
+        },
+        {
+            "step_id": 3,
+            "source": "agent",
+            "message": "second",
+            "metrics": {
+                "prompt_tokens": 13,
+                "cached_tokens": 9,
+                "completion_tokens": 5,
+                "cost_usd": 0.25,
+            },
+        },
+        {
+            "step_id": 4,
+            "source": "agent",
+            "message": "zero-token final entry",
+            "metrics": {
+                "prompt_tokens": 0,
+                "cached_tokens": 0,
+                "completion_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        },
+    ]
+
+
 def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
     lhtb = tmp_path / "LHTB"
     _task(lhtb, "short", expert_minutes=60, category="build")
@@ -353,6 +460,23 @@ def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
     _job_summary(stock, 2)
     _job_summary(driftlock, 2)
     return lhtb, stock, driftlock
+
+
+def _set_graded_timeout(result_file: Path, *, reward: float) -> None:
+    payload = json.loads(result_file.read_text())
+    payload["agent_result"] = None
+    payload["verifier_result"] = {"rewards": {"reward": reward}}
+    payload["exception_info"] = {
+        "exception_type": "AgentTimeoutError",
+        "exception_message": "Agent execution timed out after 5400.0 seconds",
+    }
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir()
+    trajectory.write_text(
+        json.dumps({"schema_version": "ATIF-v1.0", "steps": _trajectory_steps()}),
+        encoding="utf-8",
+    )
 
 
 def test_goal_drift_formulas_match_published_definitions() -> None:
@@ -401,7 +525,9 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     assert report["matrix"]["complete"] is True
     assert report["job_summaries"]["stock"]["n_total_trials"] == 2
     assert len(report["job_summaries"]["stock"]["result_sha256"]) == 64
-    assert report["matrix"]["agent_model"] == ("openrouter/deepseek/deepseek-v4-pro")
+    assert report["matrix"]["agent_model"] == (
+        "openrouter/deepseek/deepseek-v4-flash-0731"
+    )
     assert report["matrix"]["agent_versions"] == {
         "stock": "2.0.0",
         "driftlock": "0.1.0",
@@ -437,6 +563,39 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     trial = drift["trials"][0]
     assert Path(trial["result_file"]).is_absolute()
     assert len(trial["result_sha256"]) == 64
+
+
+def test_planned_arm_coverage_includes_native_arm_present_in_report(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    native = tmp_path / "native-driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(
+        native,
+        "short-1",
+        "short",
+        1.0,
+        checksum=checksum,
+        arm="native-driftlock",
+    )
+    _job_summary(stock, 1)
+    _job_summary(native, 1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "native-driftlock": native},
+    )
+
+    assert report["planned_arm_coverage"]["present"] == [
+        "stock",
+        "native-driftlock",
+    ]
+    assert "native-driftlock" in report["arms"]
+    assert "native-driftlock" in report["paired_vs_stock"]
 
 
 @pytest.mark.parametrize(
@@ -476,6 +635,261 @@ def test_analyze_rejects_noncomparable_arms(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
         )
+
+
+def test_arm_identity_accepts_matching_provider_and_names_mismatch(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "driftlock"
+    result_file = _result(job, "short-1", "short", 1.0)
+    payload = json.loads(result_file.read_text())
+
+    budget, signature = _validate_arm_identity(
+        payload,
+        "driftlock",
+        "openrouter/deepseek/deepseek-v4-flash-0731",
+        result_file,
+        expected_provider="baidu/fp8",
+        expected_judge_provider="alibaba",
+    )
+
+    assert budget == 10_000
+    assert len(signature) == 64
+    with pytest.raises(ValueError) as caught:
+        _validate_arm_identity(
+            payload,
+            "driftlock",
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            result_file,
+            expected_provider="sail-research/fp4",
+            expected_judge_provider="alibaba",
+        )
+    message = str(caught.value)
+    assert "sail-research/fp4" in message
+    assert "baidu/fp8" in message
+
+
+def test_analyze_accepts_matching_detector_thresholds_across_controlled_arms(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(heuristic, "short-1", "short", 1.0, checksum=checksum)
+    _result(driftlock, "short-1", "short", 1.0, checksum=checksum)
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={
+            "stock": stock,
+            "driftlock-heuristic": heuristic,
+            "driftlock": driftlock,
+        },
+    )
+
+    assert report["matrix"]["complete"] is True
+
+
+def test_analyze_names_detector_threshold_and_both_values_on_mismatch(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(heuristic, "short-1", "short", 1.0, checksum=checksum)
+    driftlock_result = _result(driftlock, "short-1", "short", 1.0, checksum=checksum)
+    payload = json.loads(driftlock_result.read_text())
+    payload["config"]["agent"]["kwargs"]["driftlock_no_change_steps"] = 7
+    driftlock_result.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={
+                "stock": stock,
+                "driftlock-heuristic": heuristic,
+                "driftlock": driftlock,
+            },
+        )
+
+    message = str(caught.value)
+    assert "driftlock_no_change_steps" in message
+    assert "driftlock-heuristic=4" in message
+    assert "driftlock=7" in message
+
+
+def test_analyze_rejects_arms_that_gate_different_signals(tmp_path: Path) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(heuristic, "short-1", "short", 1.0, checksum=checksum)
+    driftlock_result = _result(driftlock, "short-1", "short", 1.0, checksum=checksum)
+    payload = json.loads(driftlock_result.read_text())
+    payload["config"]["agent"]["kwargs"]["driftlock_corroborating_signals"] = []
+    driftlock_result.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={
+                "stock": stock,
+                "driftlock-heuristic": heuristic,
+                "driftlock": driftlock,
+            },
+        )
+
+    message = str(caught.value)
+    assert "driftlock_corroborating_signals" in message
+    assert "driftlock-heuristic=('no_file_change',)" in message
+    assert "driftlock=()" in message
+
+
+def test_analyze_accepts_the_same_gate_written_in_a_different_order(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    for job in (heuristic, driftlock):
+        result_file = _result(job, "short-1", "short", 1.0, checksum=checksum)
+        payload = json.loads(result_file.read_text())
+        kwargs = payload["config"]["agent"]["kwargs"]
+        kwargs["driftlock_corroborating_signals"] = (
+            ["no_file_change", "reward_stall"]
+            if job is heuristic
+            else ["reward_stall", "no_file_change"]
+        )
+        result_file.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={
+            "stock": stock,
+            "driftlock-heuristic": heuristic,
+            "driftlock": driftlock,
+        },
+    )
+
+    # Accepted: order is not part of the configuration. The neighbouring test
+    # shows a genuinely different set is still rejected.
+    assert sorted(report["arms"]) == ["driftlock", "driftlock-heuristic", "stock"]
+
+
+def test_analyze_rejects_a_corroborating_gate_that_is_not_a_list_of_strings(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "driftlock"
+    result_file = _result(job, "short-1", "short", 1.0)
+    payload = json.loads(result_file.read_text())
+    payload["config"]["agent"]["kwargs"]["driftlock_corroborating_signals"] = (
+        "no_file_change"
+    )
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid driftlock_corroborating_signals"):
+        _validate_arm_identity(
+            payload,
+            "driftlock",
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            result_file,
+        )
+
+
+def test_arm_identity_rejects_legacy_config_without_detector_thresholds(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "driftlock"
+    result_file = _result(job, "short-1", "short", 1.0)
+    payload = json.loads(result_file.read_text())
+    kwargs = payload["config"]["agent"]["kwargs"]
+    for name in tuple(kwargs):
+        if name.startswith("driftlock_") and name not in {
+            "driftlock_max_tokens",
+            "driftlock_max_steps",
+            "driftlock_max_rollbacks",
+            "driftlock_checkpoint_interval",
+            "driftlock_judge_model",
+            "driftlock_judge_api_base",
+            "driftlock_judge_max_output_tokens",
+            "driftlock_judge_llm_call_kwargs",
+        }:
+            del kwargs[name]
+
+    with pytest.raises(ValueError, match="missing detector setting"):
+        _validate_arm_identity(
+            payload,
+            "driftlock",
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            result_file,
+        )
+
+
+def test_analyze_rejects_trial_provider_different_from_canonical_arm_lock(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    routing = payload["config"]["agent"]["kwargs"]["llm_call_kwargs"]
+    routing["extra_body"]["provider"]["only"] = ["streamlake/fp8"]
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+    message = str(caught.value)
+    assert "baidu/fp8" in message
+    assert "streamlake/fp8" in message
+
+
+def test_analyze_rejects_different_providers_between_arms(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    for result_file in driftlock.glob("*/result.json"):
+        payload = json.loads(result_file.read_text())
+        routing = payload["config"]["agent"]["kwargs"]["llm_call_kwargs"]
+        routing["extra_body"]["provider"]["only"] = ["streamlake/fp8"]
+        result_file.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(driftlock, 2)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+    message = str(caught.value)
+    assert "different agent providers" in message
+    assert "baidu/fp8" in message
+    assert "streamlake/fp8" in message
 
 
 def test_analyze_rejects_swapped_arm_labels(tmp_path: Path) -> None:
@@ -671,6 +1085,146 @@ def test_analyze_rejects_infrastructure_failure_instead_of_scoring_it(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
         )
+
+
+def test_analyze_accepts_graded_timeout_and_reconstructs_exact_usage(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _set_graded_timeout(stock / "long-1" / "result.json", reward=0.15)
+    _job_summary(stock, 2, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    stock_report = report["arms"]["stock"]
+    assert stock_report["trial_count"] == 2
+    assert stock_report["graded_at_time_cap_count"] == 1
+    assert stock_report["input_tokens"] == 124
+    assert stock_report["cache_tokens"] == 56
+    assert stock_report["output_tokens"] == 28
+    assert stock_report["cost_usd"] == 0.625
+    assert stock_report["trajectory_reconstructed_usage"] == {
+        "input_tokens": 24,
+        "cache_tokens": 16,
+        "output_tokens": 8,
+        "cost_usd": 0.375,
+    }
+    timeout_trial = next(
+        trial
+        for trial in stock_report["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert timeout_trial["reward"] == 0.15
+    assert timeout_trial["graded_at_time_cap"] is True
+    assert timeout_trial["usage_source"] == "trajectory"
+    assert timeout_trial["input_tokens"] == 24
+    assert timeout_trial["cache_tokens"] == 16
+    assert timeout_trial["output_tokens"] == 8
+    assert timeout_trial["cost_usd"] == 0.375
+    assert report["matrix"]["complete"] is True
+    assert (
+        report["paired_vs_stock"]["driftlock"]["aggregate_workload_comparable"] is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "missing trajectory needed to reconstruct agent usage"),
+        ("malformed", "cached_tokens"),
+    ],
+)
+def test_analyze_rejects_unusable_trajectory_needed_for_timeout_usage(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = stock / "long-1" / "result.json"
+    _set_graded_timeout(result_file, reward=0.15)
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    if mutation == "missing":
+        trajectory.unlink()
+    else:
+        trajectory.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "source": "agent",
+                            "metrics": {
+                                "prompt_tokens": 11,
+                                "completion_tokens": 3,
+                                "cost_usd": 0.125,
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    _job_summary(stock, 2, errors=1)
+
+    with pytest.raises(ValueError, match=message):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_rejects_non_timeout_exception_by_type(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = stock / "long-1" / "result.json"
+    payload = json.loads(result_file.read_text())
+    payload["exception_info"] = {"exception_type": "RuntimeError"}
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 2, errors=1)
+
+    with pytest.raises(ValueError, match="RuntimeError"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_reports_different_timeout_counts_per_arm(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _set_graded_timeout(stock / "short-1" / "result.json", reward=0.4)
+    _set_graded_timeout(stock / "long-1" / "result.json", reward=0.2)
+    _job_summary(stock, 2, errors=2)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    assert report["arms"]["stock"]["graded_at_time_cap_count"] == 2
+    assert report["arms"]["driftlock"]["graded_at_time_cap_count"] == 0
+
+
+def test_analyze_prefers_agent_result_over_trajectory_usage(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = driftlock / "long-1" / "result.json"
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir()
+    trajectory.write_text("not JSON", encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    trial = next(
+        trial
+        for trial in report["arms"]["driftlock"]["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert trial["usage_source"] == "agent_result"
+    assert trial["input_tokens"] == 120
+    assert trial["cache_tokens"] == 60
+    assert trial["output_tokens"] == 30
+    assert trial["cost_usd"] == 0.3
 
 
 def test_analyze_requires_canonical_reward_key(tmp_path: Path) -> None:

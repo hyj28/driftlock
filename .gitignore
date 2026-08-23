@@ -27,3 +27,6 @@ results/raw/
 .DS_Store
 .idea/
 .vscode/
+
+# Local-only operational notes (never published)
+ops/

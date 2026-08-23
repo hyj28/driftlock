@@ -27,6 +27,23 @@ class RunStatus(StrEnum):
     ROLLBACK_LIMIT = "rollback_limit"
 
 
+class FineJudgeStatus(StrEnum):
+    """Whether a coarse trigger was evaluated by a configured fine judge."""
+
+    VERDICT = "verdict"
+    NOT_CONFIGURED = "not_configured"
+    NOT_INVOKED = "not_invoked"
+
+
+class DriftTriggerOutcome(StrEnum):
+    """What happened after the coarse detector fired."""
+
+    ROLLED_BACK = "rolled_back"
+    VETOED = "vetoed"
+    ROLLBACK_LIMIT_REFUSED = "rollback_limit_refused"
+    SUPPRESSED = "suppressed"
+
+
 class StepTokenBudgetExhausted(RuntimeError):
     """Raised before a provider call when no safe output-token allowance remains."""
 
@@ -42,6 +59,7 @@ class Checkpoint:
     path: Path
     parent_id: str | None = None
     label: str | None = None
+    unstable_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +87,11 @@ class StepOutcome:
     state: Mapping[str, Any]
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    workspace_delta_observed: bool = True
+    workspace_observation_error: str | None = None
+    commands_run: int = 0
+    commands_failed: int = 0
+    tool_observations: tuple[str, ...] = ()
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -78,6 +101,26 @@ class StepOutcome:
     def __post_init__(self) -> None:
         if self.tokens < 0:
             raise ValueError("tokens cannot be negative")
+        if not isinstance(self.workspace_delta_observed, bool):
+            raise TypeError("workspace_delta_observed must be a boolean")
+        if self.workspace_observation_error is not None and not isinstance(
+            self.workspace_observation_error, str
+        ):
+            raise TypeError("workspace_observation_error must be a string or None")
+        for name, value in (
+            ("commands_run", self.commands_run),
+            ("commands_failed", self.commands_failed),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if self.commands_failed > self.commands_run:
+            raise ValueError("commands_failed cannot exceed commands_run")
+        if not isinstance(self.tool_observations, tuple) or any(
+            not isinstance(observation, str) for observation in self.tool_observations
+        ):
+            raise TypeError("tool_observations must be a tuple of strings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +159,7 @@ class DriftContext:
     recent_steps: tuple[StepRecord, ...]
     diff: str
     tokens_remaining: int | None
+    tool_observations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +201,82 @@ class RollbackRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DriftTriggerRecord:
+    """A coarse trigger and the complete disposition of that intervention attempt."""
+
+    sequence: int
+    logical_step: int
+    signals: tuple[DriftSignal, ...]
+    judge_status: FineJudgeStatus
+    judge_verdict: Verdict | None
+    judge_reason: str | None
+    outcome: DriftTriggerOutcome
+    rollback_checkpoint_id: str | None = None
+    rollback_checkpoint_step: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sequence <= 0:
+            raise ValueError("sequence must be positive")
+        if self.logical_step <= 0:
+            raise ValueError("logical_step must be positive")
+        if not self.signals:
+            raise ValueError("a trigger record must contain at least one signal")
+        if self.judge_status is not FineJudgeStatus.VERDICT:
+            if self.judge_verdict is not None or self.judge_reason is not None:
+                raise ValueError("a fine judge that did not run cannot have a verdict")
+        elif self.judge_verdict is None or self.judge_reason is None:
+            raise ValueError("a configured fine judge must have a verdict and reason")
+        suppressed = self.outcome is DriftTriggerOutcome.SUPPRESSED
+        not_invoked = self.judge_status is FineJudgeStatus.NOT_INVOKED
+        if suppressed != not_invoked:
+            raise ValueError(
+                "a suppressed trigger is exactly one the fine judge never saw"
+            )
+        has_checkpoint_id = self.rollback_checkpoint_id is not None
+        has_checkpoint_step = self.rollback_checkpoint_step is not None
+        if has_checkpoint_id != has_checkpoint_step:
+            raise ValueError(
+                "rollback checkpoint id and step must be recorded together"
+            )
+        if self.outcome is DriftTriggerOutcome.ROLLED_BACK and not has_checkpoint_id:
+            raise ValueError("a rollback must identify its target checkpoint")
+        if self.outcome is not DriftTriggerOutcome.ROLLED_BACK and has_checkpoint_id:
+            raise ValueError(
+                "only a completed rollback may identify a target checkpoint"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the stable JSON representation used by phase audit records."""
+        checkpoint = None
+        if self.rollback_checkpoint_id is not None:
+            checkpoint = {
+                "checkpoint_id": self.rollback_checkpoint_id,
+                "step": self.rollback_checkpoint_step,
+            }
+        return {
+            "sequence": self.sequence,
+            "logical_step": self.logical_step,
+            "signals": [
+                {
+                    "kind": signal.kind,
+                    "detail": signal.detail,
+                    "lookback": signal.lookback,
+                }
+                for signal in self.signals
+            ],
+            "judge": {
+                "status": self.judge_status.value,
+                "verdict": (
+                    self.judge_verdict.value if self.judge_verdict is not None else None
+                ),
+                "reason": self.judge_reason,
+            },
+            "outcome": self.outcome.value,
+            "rollback_checkpoint": checkpoint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult:
     """Final state and accounting for a runner invocation."""
 
@@ -168,3 +288,26 @@ class RunResult:
     tokens_used: int
     agent_tokens_used: int
     judge_tokens_used: int
+    coarse_triggers: tuple[DriftTriggerRecord, ...] = ()
+
+    @property
+    def signal_counts(self) -> dict[str, dict[str, int]]:
+        """Count signal occurrences by kind and disposition.
+
+        ``suppressed`` counts triggers the coarse tier raised but never escalated,
+        because every signal in them was corroborating-only. They are separate from
+        ``vetoed`` because they cost no judge tokens and carry no verdict.
+        """
+        counts: dict[str, dict[str, int]] = {}
+        dispositions = {
+            DriftTriggerOutcome.VETOED: "vetoed",
+            DriftTriggerOutcome.SUPPRESSED: "suppressed",
+        }
+        for trigger in self.coarse_triggers:
+            disposition = dispositions.get(trigger.outcome, "upheld")
+            for signal in trigger.signals:
+                kind_counts = counts.setdefault(
+                    signal.kind, {"upheld": 0, "vetoed": 0, "suppressed": 0}
+                )
+                kind_counts[disposition] += 1
+        return {kind: counts[kind] for kind in sorted(counts)}

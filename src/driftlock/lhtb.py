@@ -53,6 +53,49 @@ _OUTPUT_TOKEN_KEYS = frozenset(
 )
 
 
+def openrouter_provider_call_kwargs(provider: str) -> dict[str, Any]:
+    """Return the strict, no-fallback OpenRouter routing request body."""
+    if not isinstance(provider, str) or not provider:
+        raise ValueError("OpenRouter provider must be a non-empty string")
+    return {"extra_body": {"provider": {"only": [provider], "allow_fallbacks": False}}}
+
+
+def openrouter_provider_from_call_kwargs(
+    call_kwargs: Mapping[str, Any], *, source: str
+) -> str:
+    """Validate strict OpenRouter routing and return its sole provider slug."""
+    if "extra_body" not in call_kwargs:
+        raise ValueError(f"{source} must contain extra_body")
+    extra_body = call_kwargs["extra_body"]
+    if not isinstance(extra_body, Mapping):
+        raise ValueError(f"{source}.extra_body must be a mapping")
+    if set(extra_body) != {"provider"}:
+        raise ValueError(f"{source}.extra_body must contain exactly provider")
+    routing = extra_body["provider"]
+    if not isinstance(routing, Mapping):
+        raise ValueError(f"{source}.extra_body.provider must be a mapping")
+    if set(routing) != {"only", "allow_fallbacks"}:
+        raise ValueError(
+            f"{source}.extra_body.provider must contain exactly only and "
+            "allow_fallbacks"
+        )
+    only = routing["only"]
+    if not isinstance(only, list):
+        raise ValueError(f"{source}.extra_body.provider.only must be a list")
+    if len(only) != 1:
+        raise ValueError(
+            f"{source}.extra_body.provider.only must contain exactly one provider slug"
+        )
+    if not isinstance(only[0], str) or not only[0]:
+        raise ValueError(
+            f"{source}.extra_body.provider.only provider slug must be a "
+            "non-empty string"
+        )
+    if routing["allow_fallbacks"] is not False:
+        raise ValueError(f"{source}.extra_body.provider.allow_fallbacks must be false")
+    return only[0]
+
+
 class LHTBRuntimeCompatibilityError(RuntimeError):
     """Raised when the installed Harbor fork is not the pinned integration."""
 

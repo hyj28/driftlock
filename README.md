@@ -1,11 +1,12 @@
 # driftlock
 
-**A checkpoint-and-rollback layer for long-horizon agents.**
+**A self-evolving long-horizon coding agent whose learning signal is its own rollbacks.**
 
-> 🚧 **Status: experimental. No benchmark results yet.** The runner, remote
-> checkpoints, pinned LHTB/Terminus runtime, Harbor agent plugin, and experiment
-> harness are implemented. Credentialed amd64 screening has not run, so nothing here
-> is a result claim.
+> 🚧 **Status: experimental. No benchmark results yet.** The checkpoint, rollback,
+> judge, and experiment-analysis layers are implemented and unit-tested. The agent
+> loop, subagent layer, and skill layer are not yet written; the Terminus-2 driver
+> documented below is being replaced by driftlock's own agent (see `PLAN.md` §3.1).
+> Credentialed amd64 screening has not run, so nothing here is a result claim.
 
 ---
 
@@ -24,7 +25,25 @@ Two failure modes dominate the long-horizon regime:
 2. **Compounding error and goal drift** — small early mistakes snowball along the
    trajectory, gradually steering the agent away from what it was asked to do.
 
-`driftlock` attacks **the second one**.
+`driftlock` attacks **the second one** — and then turns what it learns there into
+skills the agent carries into the next task.
+
+## Rollback is the missing lever
+
+The standard vocabulary for context engineering has four levers: **write, select,
+compress, isolate**. Every one of them assumes the agent keeps moving forward. None of
+them is *undo*.
+
+| Lever | Mechanism in driftlock |
+| --- | --- |
+| write | Rollback-grounded skill distillation into a persistent library |
+| select | Embedding retrieval over skill activation conditions, plus a router |
+| compress | Context editing at checkpoint boundaries |
+| isolate | Read-only subagents that read, grep, and test but never write, returning condensed summaries |
+| **undo** | **Checkpoint + progress-aware rollback** |
+
+Because subagents have no filesystem side effects, rollback semantics are unaffected
+by them: there is nothing in flight to undo.
 
 ## The approach
 
@@ -42,6 +61,24 @@ The judge is two-tier by design:
 The coarse tier keeps the cost near zero; the fine tier catches what rules can't
 express — *"the agent is now working on the wrong thing."*
 
+## Learning from rollbacks
+
+Recent work found that self-evolving agents improve through *validation-filtered
+search*, not accumulation: only **55 of 388** candidate skills produced a real
+validation gain, and **every** selected improvement was grounded in a failed
+trajectory — success-only feedback never produced one. Separately, automatic evolution
+methods measurably trail human curation (+0.4 to +5.7 versus +7.5 to +10.5).
+
+The field feeds the model a *whole* failed trajectory and asks it to work out what
+went wrong. driftlock already knows: the checkpoint delta bounds the failure to the
+region between checkpoint *k* and *k+n*, with a diff and a judge verdict attached.
+That localized evidence is the supervision signal for skill distillation.
+
+Skills use the ProcMEM `activation` / `execution` / `termination` schema and carry
+preventative content ("when X appears, do not do Y; do Z instead"). A candidate only
+enters the library after a **measured** improvement on a held-out validation split —
+an unfiltered library demonstrably makes agents worse.
+
 ## The question this has to answer
 
 > *"How is checkpoint-and-rollback different from just retrying on failure?
@@ -55,11 +92,10 @@ will say so.
 
 ## Experiment design
 
-Four arms, evaluated on a subset of
-**[LHTB (Long-Horizon Terminal-Bench)](https://github.com/zli12321/LHTB)** — 46
-reproducible terminal tasks designed to resist memorization, shortcutting, and
-reward hacking. The official harness and hidden verifiers are kept intact so
-numbers stay comparable to the public leaderboard.
+Two benchmarks, because they answer different questions and neither can answer both.
+
+**Drift — [LHTB (Long-Horizon Terminal-Bench)](https://github.com/zli12321/LHTB)**,
+8 screened tasks, 4 arms:
 
 | Arm | Purpose |
 | --- | --- |
@@ -68,9 +104,23 @@ numbers stay comparable to the public leaderboard.
 | **driftlock** | The claim |
 | **Oracle upper bound** | A hindsight-perfect judge — shows how much headroom the real judge leaves |
 
+**Transfer — SWE-bench Verified**, 50 tasks split 20 train / 10 validation /
+20 held-out test, 4 arms:
+
+| Arm | Purpose |
+| --- | --- |
+| No skills | Baseline |
+| **Whole-trajectory distillation** | The field's standard grounding — the arm that decides whether localization matters |
+| **Rollback-grounded distillation** | The claim |
+| **Human-curated skills** | Upper bound, mirroring the curated reference other work reports at +7.5 to +10.5 |
+
+Both distillation arms use an identical skill schema. The only difference between them
+is the evidence handed to the distiller; anything else would confound the comparison.
+
 **Metrics**
 
-- Success rate (LHTB continuous reward, partial credit included)
+- Success rate (LHTB continuous reward with partial credit; SWE-bench resolve rate)
+- **Candidate skill pass rate**, against the 14.2% published reference
 - `GD_actions` / `GD_inaction` — the commission and omission definitions from
   [Arike et al. (2025)](https://arxiv.org/abs/2505.02709), when a task provides
   aligned-action budget and residual-state annotations. Generic LHTB results do
@@ -87,13 +137,22 @@ recorded runs reached the solve threshold. The best score to date is a mean rewa
 of 0.505. Tasks average 69–93 minutes and roughly 231 agent steps.
 
 Running the full suite costs 53–71 hours of wall-clock per model, so this project
-uses a **screened 8–12 task subset**, chosen by *measured* partial credit — tasks
-nobody can solve provide no headroom to measure against.
+uses a **screened 8-task subset**, chosen by *measured* partial credit — tasks nobody
+can solve provide no headroom to measure against.
+
+This is also why the transfer experiment lives on a different benchmark. Excluding the
+29 unsolved tasks leaves 17 across 9 categories — fewer than 2 per category. A
+train/test split would give roughly 9/8, which has no power to detect an effect the
+field measures at a 14.2% candidate pass rate.
 
 ## Planned deliverables
 
-1. This library — a rollback middle layer you can wrap around your own agent loop
-2. A technical writeup: the four curves, failure-case analysis, and the judge design tradeoffs
+1. This project — a terminal coding agent with checkpointing, progress-aware rollback,
+   and rollback-grounded skill distillation. The rollback layer stays usable
+   standalone around someone else's agent loop.
+2. A technical writeup: the drift curves, the transfer results, the candidate pass
+   rate against the 14.2% reference, failure-case analysis, and the judge design
+   tradeoffs
 
 ## Core library quick start
 
@@ -122,7 +181,7 @@ snapshots = Path("/path/to/snapshots")  # must be outside workspace
 
 async def next_step(context):
     # Ask your agent for one action, execute it, and return its new state.
-    # Cap the provider request at context.tokens_remaining when it is not None.
+    # Reserve request prefill, then cap output by the remaining token allowance.
     return StepOutcome(
         action="pytest -q",
         state={"messages": []},
@@ -189,7 +248,11 @@ Recovery archives are retained on failure, timeout, or cancellation; other stagi
 artifacts are cleaned after ordinary failures. The configured workspace cannot be
 `/`.
 
-### Terminus-2 checkpoint boundaries
+### Terminus-2 checkpoint boundaries (being replaced)
+
+> This adapter drives Harbor's stock Terminus-2 agent. It is documented because the
+> code is still present, but the plan now has driftlock supply its own agent loop, at
+> which point this layer and its Harbor coupling are deleted. See `PLAN.md` §3.1.
 
 `TerminusStepAdapter` connects the runner to a small, dependency-free runtime
 protocol that yields after exactly one billed Terminus episode. Its versioned
@@ -288,8 +351,11 @@ receive metadata-only edits and changes made to files that were already dirty as
 as newly changed paths.
 
 `RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
-receives `context.tokens_remaining` and must use it to cap the provider request, then
-report actual billed tokens in `StepOutcome.tokens`, including failed model calls.
+receives the total remaining budget in `context.tokens_remaining`. Before issuing a
+provider call, it must reserve the request prefill plus a usable output allowance;
+when that cannot fit, it must raise `StepTokenBudgetExhausted`. Otherwise it caps output
+at the smaller of its configured maximum and the budget left after prefill, then reports
+actual billed tokens in `StepOutcome.tokens`, including failed model calls.
 Unexpected adapter exceptions propagate because treating them as zero-token agent
 steps would corrupt compute-matched experiments. For fine judges, return
 `JudgeCompletion(text=..., tokens=...)` from the completion callback to include judge

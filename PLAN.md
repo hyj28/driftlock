@@ -1,6 +1,6 @@
 # driftlock — Project Plan
 
-> A checkpoint-and-rollback layer for long-horizon agents.
+> A self-evolving long-horizon coding agent whose learning signal is its own rollbacks.
 > This is the working plan and gets updated as the project moves. For the
 > public-facing introduction, see `README.md`.
 
@@ -8,34 +8,50 @@
 
 ### Implementation status
 
-- **Implemented:** provider-neutral async runner; atomic local workspace + agent-state
-  checkpoints with integrity verification; no-change, action-loop, error-spike, and
-  reward-stall heuristics; optional structured LLM judge; shared agent/judge token
-  accounting and step/rollback budgets; signal-window-aware rollback selection;
-  sync/async checkpoint backends; host-side archive snapshots for Harbor-compatible
-  POSIX remote environments with canonical-path validation and retained recovery
-  archives; SHA-256-verified host fallback and exact failed-restore recovery;
-  versioned Terminus-2 semantic conversation codec and one-episode boundary adapter;
-  pinned LHTB Harbor runtime with exact physical-call accounting, truncation usage,
-  per-episode workspace evidence, and tmux lifecycle cleanup; Harbor import-path
-  agent plugin; native-amd64/credential/Docker preflight; reproducible stock and
-  trial-budgeted driftlock job generation; measured partial-credit task selector;
-  strict multi-arm result ingestion with provenance, comparability checks, paired
-  deltas, cost/token summaries, and failure-rate slope analysis; unit and
-  pinned-Harbor integration tests.
-- **Next:** run the credentialed week-1 stock LHTB smoke and roughly 20-task screen
-  on native amd64, then commit the measured task-selection artifact. No result has
-  been measured yet.
+The project started as a checkpoint-and-rollback middleware wrapped around Harbor's
+stock Terminus-2 agent. As of 2026-08-20 the scope changed: **driftlock is now the
+agent itself**, and rollback events became the supervision signal for skill
+distillation. The rewrite keeps roughly three quarters of the existing code.
+
+- **Built and unit-tested (survives the rewrite, ~7,700 lines).** Provider-neutral
+  async runner; atomic workspace + agent-state checkpoints with integrity
+  verification; no-change, action-loop, error-spike, and reward-stall heuristics;
+  structured LLM judge; shared agent/judge token accounting and step/rollback
+  budgets; signal-window-aware rollback selection; sync/async checkpoint backends;
+  host-side archive snapshots for POSIX remote environments with canonical-path
+  validation, SHA-256-verified fallback, and exact failed-restore recovery;
+  workspace snapshotting with xattr and content digests; tmux lifecycle cleanup;
+  native-amd64/credential/Docker preflight; reproducible job generation; measured
+  partial-credit task selector; strict multi-arm result ingestion with provenance,
+  comparability checks, paired deltas, cost/token summaries, and failure-rate slope
+  analysis; 136 passing unit tests.
+- **Discarded by the rewrite (~2,750 lines).** `terminus.py` and its tests (Terminus-2
+  semantic conversation codec), the `Terminus2` subclass and config plumbing inside
+  `harbor_agent.py`, and `LHTBTerminusRuntime` plus the Harbor-internals coupling in
+  `lhtb.py`. All of it exists only to drive someone else's agent loop.
+- **Not yet built.** The agent loop, the subagent layer, and the entire skill layer.
+- **Not yet measured.** No experiment number exists. The week-1 end-to-end gate has
+  never been run — unit tests pass, but nothing has touched a real container, a real
+  model, or a real task. Validating the surviving code is a job for that smoke run,
+  not for code review.
 
 ---
 
-## 1. The claim, in one sentence
+## 1. The claims, in two sentences
 
-Same model, same compute budget — add a layer of checkpointing and progress-aware
+**Drift.** Same model, same compute budget — add checkpointing and progress-aware
 rollback and long-horizon terminal task success goes from X% to Y%, with a clear
 account of where the ceiling is.
 
-(X / Y are placeholders. They stay unfilled until measured.)
+**Transfer.** Skills distilled from *rollback events* — a checkpoint-localized failure
+region plus the judge's verdict on it — beat skills distilled from *whole failed
+trajectories* by Z points on held-out tasks, closing W% of the gap between automatic
+methods and human-curated skills that EvoAgentBench reports as the field's standing
+deficit.
+
+(X / Y / Z / W are placeholders. They stay unfilled until measured. This rule is not
+decoration: an unfilled placeholder in a public repo is a stronger signal than a
+number nobody can reproduce.)
 
 ---
 
@@ -50,36 +66,65 @@ largest by volume is agentic workflows (4,585 → 10,496). The more useful findi
 agentic-workflows category — the field has moved past "can we build agents?" to "how
 do we make agents plan, use tools, and judge their own output?"
 
-Conclusion: **the component layer is what's valuable, not another general-purpose agent.**
-
-### 2.2 Why not self-evolving agents / skill synthesis
-
-That line got extremely crowded in H1 2026: SkillFoundry, SkillOpt, SkillComposer,
-SkillGen, SkillDAG, SkillX, SkillRL, EvoSkills, Trace2Skill, SkillWeaver, AutoSkill,
-and more — a dozen-plus papers in six months, plus a dedicated benchmark
-(SkillResolve-Bench) for the second-order problem of skill-retrieval ambiguity.
-Walking the happy path there invites one fatal question: *"how is this different from
-SkillX?"*
-
-### 2.3 Why goal drift is the right target
+### 2.2 Why goal drift is the right target
 
 - **Industry treats it as a real pain point; the academic side is thin.** Search
-  turns up mostly engineering blogs and playbooks (Wire, NxCode, Redis,
-  digitalapplied's rollback-patterns reference) rather than the arXiv density seen in
-  the skill-synthesis space.
+  turns up mostly engineering blogs and playbooks rather than the arXiv density seen
+  in the skill-synthesis space.
 - **Published metrics already exist.** [Arike et al. (2025)](https://arxiv.org/abs/2505.02709)
-  formalized `GD_actions` (drift through commission) and `GD_inaction` (drift
-  through omission). They require aligned-action budget and residual-state
-  annotations. LHTB does not provide those annotations, so they remain unavailable
-  for the generic benchmark analysis unless a task-specific annotation protocol is
-  added. Inventing reward- or token-based proxies would not be credible.
+  formalized `GD_actions` (drift through commission) and `GD_inaction` (drift through
+  omission). They require aligned-action budget and residual-state annotations. LHTB
+  does not provide those, so they remain unavailable for the generic benchmark
+  analysis unless a task-specific annotation protocol is added. Inventing reward- or
+  token-based proxies would not be credible.
 - **There's a quantitative law to attack.** Doubling a task's duration roughly
   quadruples its failure rate. Flattening that curve even slightly is a clean result.
 - **The capability gap is stark.** Frontier models solve close to 100% of tasks a
   human expert finishes in under four minutes, and under 10% of tasks taking a human
   more than four hours.
 
-### 2.4 The three recognized long-horizon failure modes
+### 2.3 Why self-evolution, and why it isn't the crowded version
+
+Generic skill synthesis got very crowded in H1 2026 — SkillFoundry, SkillOpt,
+SkillComposer, SkillGen, SkillDAG, SkillX, SkillRL, EvoSkills, Trace2Skill,
+SkillWeaver, AutoSkill, plus a dedicated benchmark for skill-retrieval ambiguity.
+Walking that happy path invites one fatal question: *"how is this different from
+SkillX?"*
+
+The answer here is a specific, defensible one, and it comes from the field's own
+recent results:
+
+- [*Rethinking Self-Evolving Agent Skills*](https://arxiv.org/html/2608.02636) (2026-08)
+  finds that skill evolution is **not** cumulative but is "validation-filtered
+  search": only **55 of 388** candidate skills (14.2%) produced a distinct validation
+  improvement. Crucially, **all 11 selected improvements included failed
+  trajectories** — success-only feedback never produced a selected improvement.
+- [EvoAgentBench](https://arxiv.org/html/2607.05202v1) finds automatic evolution
+  methods brittle against human curation: Memento −2.4 to +1.5, ReasoningBank +0.4 to
+  +3.6, GEPA +1.2 to +5.7, versus a curated Anchor Skill at **+7.5 to +10.5**.
+
+So the field knows failure trajectories are the necessary ingredient, but feeds the
+model the *whole* trajectory and lets it guess where things went wrong. **driftlock
+already localizes the failure**: the checkpoint delta bounds it to the region between
+checkpoint *k* and *k+n*, with a diff and a judge verdict attached. Nobody else has
+that, because nobody else built the rollback infrastructure first.
+
+That is the contribution: **rollback-grounded skill distillation.** It is not "another
+skill synthesis method"; it is a claim about the *supervision signal*, and it is
+testable against the exact baseline the field already uses.
+
+### 2.4 Rollback is the missing fifth context-engineering lever
+
+The 2026 consensus vocabulary for context engineering is four levers — **write,
+select, compress, isolate**. The supporting numbers are strong: information that
+scores 98.1 in a clean prompt drops to **64.1** when distributed across a multi-turn
+agent run; context editing alone is worth **+29%**, and +39% combined with a memory
+tool; a 100-turn eval cut token consumption by **84%**.
+
+Every one of those four levers assumes the agent keeps moving forward. **None of them
+is undo.** Rollback is the fifth lever, and it is the one this project owns.
+
+### 2.5 The three recognized long-horizon failure modes
 
 1. **Context rot** — as history grows, relevant information becomes harder to
    retrieve, and performance falls off sharply once context utilization crosses a
@@ -92,82 +137,199 @@ SkillX?"*
 
 ## 3. Technical approach
 
-### 3.1 Core mechanism: checkpoints + progress-aware rollback
+### 3.1 The agent
 
-Snapshot filesystem state (Docker layers + git) together with agent state. An
-independent judge periodically asks whether the current state is still a sound basis
-for continuing. If not, roll back to the most recent healthy checkpoint and retry
-from there.
+driftlock is a terminal coding agent, written here, running against LHTB and
+SWE-bench Verified containers. It implements all five levers:
+
+| Lever | Mechanism | Status |
+| --- | --- | --- |
+| **write** | Rollback-grounded skill distillation into a persistent library | To build |
+| **select** | Embedding retrieval over `activation` conditions + a router that injects the top-k skills | To build |
+| **compress** | Context editing / summarization at checkpoint boundaries | To build |
+| **isolate** | Read-only subagents (read, grep, run tests; never write) returning 1–2k token condensed summaries | To build |
+| **undo** | Checkpoint + progress-aware rollback | **Built** |
+
+**Subagents are deliberately side-effect free.** They locate, read, and analyze;
+they never touch the filesystem. This matches the production pattern behind the
++90.2% multi-agent research result, and it means rollback semantics need no change at
+all: with no filesystem side effects, there is nothing in flight to undo. The
+checkpoint layer is untouched by the subagent addition.
+
+Writing the loop ourselves also **eliminates the original plan's second risk**. Harbor
+and Terminus-2 expose no agent plugin interface, so the old design had to wedge a
+rollback layer into someone else's loop. Owning both sides removes that problem
+entirely, and it is what makes skill injection into prompt construction tractable.
+
+The cost is losing direct comparability with the LHTB public leaderboard. This is
+acceptable: every claim above is a *within-experiment* comparison between arms that
+share an agent, and the LHTB tasks, hidden verifiers, and scoring stay intact.
 
 ### 3.2 The judge: two tiers
 
 | Tier | What it does | Cost |
 | --- | --- | --- |
-| **Coarse — heuristics** | No file changes for N steps, action loops, error-rate spikes, reward stalls | Zero tokens |
-| **Fine — LLM** | Once the coarse tier fires, hand (original goal + current plan + recent trajectory + file diff) to a cheap model to judge semantic drift | DeepSeek V4-Flash; negligible |
+| **Coarse — heuristics** | Action loops, error-rate spikes, sustained command failure, reward stalls | Zero tokens |
+| **Fine — LLM** | Once the coarse tier fires, hand (original goal + current plan + recent trajectory + file diff) to a cheap model to judge semantic drift | DeepSeek V4-Pro 0813; see §5.2 |
 
-A useful side effect of this structure: **heuristics-only / LLM-only / two-tier are
-three ready-made ablation arms.** The experiment design falls out of the architecture.
+A useful side effect: **heuristics-only / LLM-only / two-tier are three ready-made
+ablation arms.** The experiment design falls out of the architecture.
 
-### 3.3 The question this has to survive
+**Not every signal may open a review.** A detector kind can be marked
+*corroborating*: it is passed to the fine judge as evidence when something else
+fires, but on its own it is recorded and dropped. `no_file_change` is
+corroborating, and it is the only one — measured, not assumed. The 2026-08-23
+diagnostic run (3 LHTB tasks, 462 steps, `driftlock` arm) raised it alone **109
+times and the fine judge rejected all 109**, while both rollbacks that did happen
+came from `action_loop` + `error_spike` + `no_file_change` firing together. 54% of
+the solo firings landed in the first fifth of a phase, in runs of up to 28
+consecutive steps — the detector was reporting exploration, which is reading
+rather than writing, as drift.
+
+Two consequences follow. The fine judge was **52% of that run's spend**
+($0.63 of $1.23) and roughly 80% of its calls came from a signal that never
+survived, so gating is a budget decision as much as a correctness one. And the
+`driftlock-heuristic` arm, which has no fine judge to veto anything, previously
+exhausted its rollback budget within 16–28 steps on 8/8 trials; gating is what
+makes it a comparable arm rather than a degenerate one.
+
+Suppressed triggers are still recorded, in their own `suppressed` bucket
+alongside `upheld` and `vetoed`, so a gated detector's firing rate stays
+measurable and the decision above stays re-checkable against later data.
+
+### 3.3 Skill representation
+
+One schema, shared by **both** distillation arms. This is a correctness requirement,
+not a convenience: if the two arms used different formats, the comparison would be
+confounded by format rather than by grounding. The arms differ in exactly one thing —
+the evidence handed to the distiller.
+
+Structured markdown following the [ProcMEM](https://arxiv.org/pdf/2606.23127) /
+[Memento-Skills](https://arxiv.org/pdf/2603.18743) convention:
+
+- `activation` — when this skill applies (also the retrieval index and router key)
+- `execution` — what to do
+- `termination` — when it is finished, and when it no longer applies
+
+Content is **preventative** ("when X appears, do not do Y; do Z instead").
+[ReasoningBank](https://research.google/blog/reasoningbank-enabling-agents-to-learn-from-experience/)
+observed that curated checklists spontaneously evolve toward compositional,
+preventative logic; rollback events produce that form natively, so we start where they
+ended up.
+
+Retrieval uses a local sentence-transformers model on the cloud box: **zero API cost**,
+outside the token budget.
+
+### 3.4 Skill admission: validation-filtered, never automatic
+
+An unfiltered skill library **makes the agent worse**. This is measured, not
+hypothetical: in the 2026-08 study, GPT-5.5 on LiveMath gained +5.7 validation points
+and lost **−6.6** on the released test.
+
+So every candidate skill must earn its place by measured improvement on a held-out
+validation split before entering the library. This is budget-neutral — it only
+requires splitting the training side three ways (see §4.3).
+
+The field's own pass rate, **14.2%**, becomes a second independent piece of evidence:
+if checkpoint localization genuinely makes distillation sharper, our candidate pass
+rate should sit visibly above it.
+
+### 3.5 The two questions this has to survive
 
 > *"How is checkpoint-and-rollback different from just retrying on failure? Aren't you
 > buying success rate with extra compute?"*
 
-The answer has to be: **the judge detects a broken trajectory before the task fails** —
-early stop plus precise rollback to the last healthy point, not a blind restart.
-Which means **the judge's quality is the project's quality**, and which is why the
-compute-matched control arm below is non-negotiable.
+**The judge detects a broken trajectory before the task fails** — early stop plus
+precise rollback to the last healthy point, not a blind restart. Which means the
+judge's quality is the project's quality, and which is why the compute-matched control
+arm is non-negotiable.
+
+> *"How is rollback-grounded distillation different from just showing the model the
+> failed trajectory?"*
+
+**Localization.** The whole-trajectory arm exists precisely to answer this, and if it
+wins, that gets published as the result.
 
 ---
 
 ## 4. Experiment design
 
-### 4.1 Benchmark
+Two benchmarks, because they measure different claims and only one of them can support
+each.
 
-**A subset of LHTB (Long-Horizon Terminal-Bench)** —
+### 4.1 LHTB — the drift claim
+
 [repo](https://github.com/zli12321/LHTB) ·
-[dataset](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench).
-
-Key facts driving cost and schedule estimates:
+[dataset](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench)
 
 | Item | Value |
 | --- | --- |
 | Full suite | 46 tasks across 9 categories |
 | Tokens per task | ~9.9M (231 steps average; 120–320 range) |
 | Time per task | 69–93 min average, 90 min budget cap |
-| Wall-clock for a full single-model run | 53–71 hours |
 | Scoring | Continuous reward 0–1 with partial credit; ≥0.95 counts as solved |
 | Verification | Hidden verifiers, deterministic replay, seeded environments |
 | Best result to date | Grok 4.5, mean reward 0.505, 13 of 46 solved |
 | Unsolved | 29/46; only 7% of 782 runs reached solve status |
-| Cost reference | MiniMax M3 $6.13/task; Claude models $38–73/task |
 
-**Use an 8–12 task subset**, selected by *measured* partial credit in week 1. The 29
-tasks nobody has solved must be excluded — they offer no headroom, only a floor effect.
-The official harness and hidden verifiers stay intact so numbers remain comparable to
-the public leaderboard.
+**Use an 8-task subset**, selected by *measured* partial credit in week 1. The 29
+tasks nobody has solved must be excluded — they offer no headroom, only a floor
+effect.
 
-Task structure is standardized as five files:
-`task.toml` / `instruction.md` / `environment/` / `tests/` / `solution/`.
+**Why LHTB cannot carry the transfer claim.** Excluding the 29 unsolved tasks leaves
+a usable pool of 17, spread across 9 categories — under 2 tasks per category. A
+train/test split would give roughly 9/8. Detecting an effect the field measures at a
+14.2% candidate pass rate, with n=8 held out, has essentially no statistical power.
+LHTB is also the most expensive benchmark available (~9.9M tokens, ~90 min per task)
+paired with the method that most needs repeated runs. Forcing it would produce a
+number nobody should believe.
 
-### 4.2 Four arms
+### 4.2 SWE-bench Verified — the transfer claim
+
+Short, cheap, plentiful tasks; the agent benchmark with the widest recognition; and
+the benchmark EvoAgentBench itself uses (87/56 split), so Memento / ReasoningBank /
+GEPA / Anchor Skill numbers are directly citable as reference points.
+
+### 4.3 Splits and arms
+
+**LHTB — 4 arms × 8 tasks = 32 runs**
 
 | Arm | Purpose |
 | --- | --- |
 | 1. No intervention | Reference point |
 | 2. **Compute-matched retry** | Same token budget, spent on blind retries — **kills the "you just spent more compute" objection** |
-| 3. **driftlock** (checkpoint + rollback) | The claim |
+| 3. **driftlock** (checkpoint + rollback) | The drift claim |
 | 4. **Oracle upper bound** | A hindsight-perfect judge — shows how much headroom the real judge leaves on the table |
 
-### 4.3 Metrics
+**SWE-bench Verified — 50 tasks, split three ways**
 
-- Success rate (LHTB continuous reward, partial credit included)
-- `GD_actions` / `GD_inaction` (Arike et al. definitions, only for tasks with the
+| Split | Tasks | Use |
+| --- | --- | --- |
+| Train | 20 | Run, collect rollback events, distill candidate skills |
+| Validation | 10 | Measure each candidate; only measured improvements enter the library |
+| Held-out test | 20 | Final four-arm comparison; never seen during evolution |
+
+**SWE-bench — 4 arms**
+
+| Arm | Purpose |
+| --- | --- |
+| 1. No skills | Reference point |
+| 2. **Whole-trajectory distillation** | The field's standard grounding (ReasoningBank-style) — **the arm that decides whether localization matters** |
+| 3. **Rollback-grounded distillation** | The transfer claim |
+| 4. **Human-curated skills** | Upper bound, mirroring EvoAgentBench's Anchor Skill (+7.5 to +10.5) — turns "better than nothing" into "closes N% of the field's standing gap" |
+
+Evolution: 2 distillation arms × 3 rounds × 30 runs (20 train + 10 validation) = 180
+runs. Final eval: 4 arms × 20 held-out = 80 runs.
+
+### 4.4 Metrics
+
+- Success rate (LHTB continuous reward with partial credit; SWE-bench resolve rate)
+- **Candidate skill pass rate**, against the 14.2% reference
+- `GD_actions` / `GD_inaction` (Arike et al. definitions, only for tasks carrying the
   required aligned-action and residual-state annotations)
 - Token cost per task
 - **Slope of the task-length vs. failure-rate curve** — flattening this is the
-  strongest result available
+  strongest single result available
 
 ---
 
@@ -175,50 +337,93 @@ Task structure is standardized as five files:
 
 ### 5.1 Compute host: a cheap x86 cloud box
 
-**Why:** LHTB images are essentially amd64-only — the docs instruct Apple Silicon
-users to set `DOCKER_DEFAULT_PLATFORM=linux/amd64`, i.e. run under emulation. The
-local M4 Air (24 GB, fanless) throttles hard under an overnight full-load run, and
-some images may not run at all.
+LHTB images are essentially amd64-only — the docs instruct Apple Silicon users to set
+`DOCKER_DEFAULT_PLATFORM=linux/amd64`, i.e. run under emulation. The local M4 Air
+(24 GB, fanless) throttles hard under an overnight full-load run, and some images may
+not run at all.
 
 **Split:** write code and analyze data locally; run experiments on the cloud box.
 
 ### 5.2 Models
 
-| Role | Model | Price per 1M tokens |
-| --- | --- | --- |
-| Agent | DeepSeek **V4-Pro** | $0.435 in / $0.003625 cache hit / $0.87 out |
-| LLM judge | DeepSeek **V4-Flash** | $0.14 in / $0.0028 cache hit / $0.28 out |
+DeepSeek ended its 75% launch promotion on 2026-08-16, roughly doubling V4-Pro and
+making it about ten times the price of V4-Flash. The allocation below follows from
+that, and from a constraint the original plan got backwards.
 
-**Cache-hit pricing is 50–120× cheaper, which is decisive here** — an agent loop
-re-sends a nearly identical history every step, so the cache hit rate is naturally
-very high.
+| Role | Model and pinned provider | Price per 1M tokens |
+| --- | --- | --- |
+| Agent — high call count | DeepSeek **V4-Flash 0731**, `baidu/fp8` | $0.069 in / $0.0137 cache / $0.137 out |
+| Fine judge — fires only when the coarse tier trips | DeepSeek **V4-Pro 0813**, `alibaba` | $1.162 in / $0.1162 cache / $3.485 out |
+| Skill retrieval | Local sentence-transformers | $0 |
+
+**The expensive model belongs on the low-call-count side.** Cost is dominated by the
+agent loop, so putting Flash there and Pro on the judge is cheaper than the reverse
+*and* keeps the judge independent: a judge sharing the agent's weights shares its
+blind spots, and §3.3 already commits to the judge's quality being the project's
+quality.
+
+**Cache-hit pricing is 5–10× cheaper than a miss**, which matters because an agent
+loop re-sends a nearly identical history every step.
+
+**Both identifiers carry a dated build.** An unversioned alias such as
+`deepseek-v4-pro` follows whatever OpenRouter currently points it at, so arms run on
+different days would silently use different models while the recorded model string
+stayed identical.
+
+**Provider routing is part of experiment identity.** Every paid request uses one
+provider in `only` with `allow_fallbacks: false`. The canonical Harbor lock and trial
+result must record the same agent provider, every arm must share that provider, and
+fine-judge arms must share their separately pinned provider. Judge pricing is keyed
+by provider so an unpriced provider cannot run with stale rates.
 
 ### 5.3 Budget (hard $100 constraint)
 
-Estimating 12 tasks × 4 arms at a ~90% cache hit rate:
+| Item | Runs | Cost |
+| --- | --- | --- |
+| LHTB, 4 arms × 8 tasks — agent | 32 | ~$7 |
+| LHTB — fine judge | — | ~$8 |
+| SWE-bench evolution, 2 arms × 3 rounds × 30 | 180 | ~$7 |
+| SWE-bench held-out eval, 4 arms × 20 | 80 | ~$4 |
+| **API total** | **292** | **~$26** |
+| Cloud box, hourly, destroyed between sessions | ~250 h | ~$33 |
+| **Total** | | **~$59** |
 
-- ~476M input tokens: 10% miss ≈ $20.7 + 90% hit ≈ $1.6
-- ~12M output tokens ≈ $10.4
-- **≈ $33 for one complete four-arm round**
+Assumes ~90% cache hits. The cloud box bills hourly and is billed for as long as it
+*exists*, not while it runs, so the figure above depends on destroying it between
+sessions rather than powering it off; leaving it up for the full ten weeks would cost
+~$206 on its own.
 
-Plus $30–45 for two to three months of the cloud box, **$100 covers 1–2 complete
-rounds plus scattered development runs.**
+--- | --- | --- |
+| LHTB, 4 arms × 8 tasks | 32 | ~$21 |
+| SWE-bench evolution, 2 arms × 3 rounds × 30 | 180 | ~$13 |
+| SWE-bench held-out eval, 4 arms × 20 | 80 | ~$7 |
+| **API total** | **292** | **~$41** |
+| Cloud box, 2–3 months | — | $30–45 |
+| **Total** | | **~$71–86** |
 
-**Mitigation: start with 8 tasks**, bringing the first round to just over $20 and
-leaving room to revise the judge and run a second round. Expand to 12 once the
-result is stable.
+Leaves $14–29 for one iteration after a bad round. Assumes ~90% cache hit rate.
 
 ---
 
 ## 6. Phases and gates
 
+Ten weeks from 2026-08-20, targeting a complete release at the end of October.
+
 | Phase | Work | Gate (fail → change the plan) |
 | --- | --- | --- |
-| **Week 1** | Stand up the cloud box, run 2 stock LHTB tasks end to end; screen ~20 tasks with V4-Pro and pick the subset by **measured partial credit** | If V4-Pro scores near zero on everything → floor effect; switch to a stronger model or easier tasks |
-| **Weeks 2–3** | Fork Harbor, insert the checkpoint / snapshot / rollback skeleton; heuristics-only judge first | If the fork proves intractable → fall back to AgentCE-Bench |
-| **Weeks 4–5** | Add the LLM judge tier; run the first complete four-arm round | If driftlock doesn't beat compute-matched retry → fix the judge immediately, don't keep running |
-| **Weeks 6–7** | Ablations, failure-case analysis, oracle upper bound | — |
-| **Week 8** | Package the library (pip-installable, one-command repro script) + technical blog post | — |
+| **Week 1** | Cloud box; end-to-end smoke on 2 stock LHTB tasks; screen ~20 tasks and pick the 8-task subset by **measured partial credit**. This validates the surviving code against reality for the first time. | V4-Pro scores near zero on everything → floor effect; switch to a stronger model or easier tasks |
+| **Weeks 2–3** | Write the agent: tool-calling loop, context compression, read-only subagent layer. Wire it into Harbor as a plugin. Delete the ~2,750 lines of Terminus-2 coupling. | Our agent scores far below stock Terminus-2 on the screened subset → fix the loop before anything else |
+| **Week 4** | Skill layer: ProcMEM schema, both distillation prompts, embedding retrieval + activation router, validation-set admission | — |
+| **Week 5** | LHTB four-arm round | driftlock doesn't beat compute-matched retry → fix the judge immediately, don't keep running |
+| **Week 6** | SWE-bench Verified environment; commit the 20/10/20 split | — |
+| **Weeks 7–8** | Evolution rounds: 2 distillation arms × 3 rounds | Candidate pass rate not visibly above 14.2% → localization isn't helping; report that honestly rather than tuning until it does |
+| **Week 9** | Held-out four-arm eval; hand-author the curated-skill arm; ablations (heuristics-only / LLM-only / two-tier) | — |
+| **Week 10** | Failure-case analysis, packaging, blog post | — |
+
+**Note on timing.** New-grad applications for 2027 starts run roughly August through
+October, so this schedule finishes at the tail of that window. During September and
+October the repo is public with the full design and the agent implementation in place;
+the results section stays empty, per §1.
 
 ---
 
@@ -227,20 +432,29 @@ result is stable.
 | # | Risk | Impact | Mitigation |
 | --- | --- | --- | --- |
 | 1 | **Floor effect** — V4-Pro too weak, no headroom to improve | No result | Week-1 screening by measured partial credit; fall back to a stronger model |
-| 2 | **Harness fork underestimated** — Harbor / Terminus-2 expose no agent plugin interface, so the rollback layer must be wedged into someone else's loop | 2+ week slip | Gate at end of week 2; fall back to AgentCE-Bench |
-| 3 | **Judge isn't accurate enough** — decisions no better than random, all four curves overlap | No result | The oracle arm surfaces this early |
-| 4 | **amd64 emulation** — images fail or run too slowly | Can't iterate | Already avoided via the x86 cloud box; verify in week 1 |
-| 5 | **Wall-clock** — 12 tasks × 4 arms = 48 runs × 90 min cap | One experiment round per day | Parallelize on the cloud box; drop to 8 tasks if needed |
-| 6 | **Budget overrun** — $33/round only covers 1–2 rounds | Can't iterate | Start at 8 tasks; use V4-Flash during development |
+| 2 | **Our agent underperforms stock Terminus-2** — writing the loop ourselves costs raw capability | Weak baseline, results uninteresting | Week-3 gate compares against the week-1 stock numbers on the same tasks |
+| 3 | **Judge isn't accurate enough** — decisions no better than random, all curves overlap | No result | The oracle arm surfaces this early |
+| 4 | **Skill library degrades performance** — the measured −6.6 failure mode | Transfer claim inverts | Validation-set admission (§3.4); the no-skills arm makes degradation visible |
+| 5 | **Two benchmarks, two environments** — SWE-bench setup slips into the evolution weeks | 1–2 week slip | Week 6 is dedicated to it; LHTB results are already banked by then |
+| 6 | **amd64 emulation** — images fail or run too slowly | Can't iterate | Already avoided via the x86 cloud box; verify in week 1 |
+| 7 | **Wall-clock** — 292 runs, of which 32 are 90-minute LHTB tasks | Schedule pressure | Parallelize on the cloud box; box must be sized for concurrent containers |
+| 8 | **Budget overrun** — ~$41 of API leaves room for roughly one redo | Can't iterate | Use V4-Flash during development; hold the 8-task LHTB subset |
+| 9 | **Attribution against external baselines** — with subagents in the agent, comparisons to Memento / ReasoningBank / GEPA can't isolate which component won | Weaker external claim | Accepted. All four arms per benchmark share the same agent, so every *internal* comparison is clean; external numbers are cited as reference points, not as controlled comparisons |
+| 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
+| 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin |
+| 12 | **The corroborating gate is fitted on 3 tasks** — `no_file_change` was demoted on one diagnostic run: 109 solo firings, 109 rejected, 2 rollbacks total (§3.2). The tasks were chosen for their spread on the week-1 screen, not sampled, and a task where the agent genuinely stalls *without* looping would now be missed | Missed intervention; a knob fitted on the data it is judged by | The miss is in the safe direction — a gated detector makes the driftlock arm behave more like the no-intervention arm, which can only understate the effect. Suppressed triggers keep being recorded, so the held-out week-9 run re-measures the gate on tasks it was not fitted on: if solo `no_file_change` ever precedes a genuine stall there, the demotion is wrong and the record shows it |
 
 ---
 
 ## 8. Deliverables
 
-1. **Open-source library** — a rollback middle layer others can wrap around their own
-   agent loop: pip-installable, documented, with a one-command reproduction script
-2. **Technical blog post** — the four curves, failure-case analysis, and the design
-   tradeoffs behind the judge
+1. **Open-source agent + library** — a terminal coding agent with checkpoint,
+   rollback, and rollback-grounded skill distillation, pip-installable, documented,
+   with a one-command reproduction script. The rollback layer stays usable
+   standalone around someone else's loop.
+2. **Technical blog post** — the drift curves, the transfer results, the candidate
+   pass rate against 14.2%, failure-case analysis, and the design tradeoffs behind
+   the judge.
 
 ---
 
@@ -250,26 +464,36 @@ result is stable.
 - [LHTB — Long-Horizon Terminal-Bench](https://zli12321.github.io/LHTB/) ·
   [GitHub](https://github.com/zli12321/LHTB) ·
   [HF dataset](https://huggingface.co/datasets/IntelligenceLab/Long-Horizon-Terminal-Bench)
+- [EvoAgentBench: Benchmarking Agent Self-Evolution via Ability Transfer](https://arxiv.org/html/2607.05202v1) ·
+  [dataset](https://huggingface.co/datasets/EverMind-AI/EvoAgentBench)
 - [AgentCE-Bench](https://arxiv.org/pdf/2604.06111) — fallback: tunable horizon, lightweight environments
 - [LOCA-bench](https://arxiv.org/pdf/2602.07962) — controllable, extreme context growth
-- [LongHorizon-Harness](https://arxiv.org/html/2608.01964)
+
+**Self-evolution and skills**
+- [Rethinking Self-Evolving Agent Skills: Feedback Dynamics over Multiple Rounds](https://arxiv.org/html/2608.02636)
+  (2026-08) — source of the 14.2% candidate pass rate and the validation-filtered-search framing
+- [Managing Procedural Memory in LLM Agents (ProcMEM)](https://arxiv.org/pdf/2606.23127) —
+  source of the activation / execution / termination schema
+- [Memento-Skills: Let Agents Design Agents](https://arxiv.org/pdf/2603.18743)
+- [ReasoningBank](https://research.google/blog/reasoningbank-enabling-agents-to-learn-from-experience/)
+- [A Survey of Self-Evolving Agents](https://arxiv.org/abs/2507.21046)
+
+**Context engineering**
+- [Context Engineering: A Practical Guide for AI Agents](https://sourcegraph.com/blog/context-engineering) —
+  the write / select / compress / isolate framing
+- [Context Engineering: Agent Reliability Playbook 2026](https://www.digitalapplied.com/blog/context-engineering-agent-reliability-playbook-2026)
+- [Self-Compacting Language Model Agents](https://arxiv.org/pdf/2606.23525)
 
 **Failure modes and metrics**
+- [Arike et al., *Evaluating Goal Drift in Language Model Agents* (2025)](https://arxiv.org/abs/2505.02709) —
+  source of the `GD_actions` / `GD_inaction` definitions
 - [Beyond the Leaderboard: tool-use, planning, and reasoning failures](https://arxiv.org/pdf/2607.05775)
 - [The Long-Horizon Task Mirage?](https://arxiv.org/html/2604.11978v1)
-- [Arike et al., *Technical Report: Evaluating Goal Drift in Language Model Agents*
-  (2025)](https://arxiv.org/abs/2505.02709) — source of the `GD_actions` /
-  `GD_inaction` definitions
-- [jhammant/agent-drift](https://github.com/jhammant/agent-drift) — drift stress-testing
+- [jhammant/agent-drift](https://github.com/jhammant/agent-drift)
 
 **Engineering references**
 - [Agent Rollback and Checkpoint Patterns](https://www.digitalapplied.com/blog/agent-rollback-checkpoint-patterns-2026-engineering-reference)
 - [Agent drift: why long-running AI agents lose the plot](https://usewire.io/blog/agent-drift-why-long-running-ai-agents-lose-the-plot/)
-- [Long-Horizon Agent Trajectory Governance Playbook](https://www.nxcode.io/resources/news/long-horizon-agent-trajectory-governance-playbook-2026)
-
-**Adjacent work (worth keeping the boundary clear)**
-- [Self-Compacting Language Model Agents](https://arxiv.org/pdf/2606.23525) — the context-compaction direction
-- [A Survey of Self-Evolving Agents](https://arxiv.org/abs/2507.21046)
 
 **Pricing**
 - [DeepSeek official pricing](https://deepseek.ai/pricing) · [summary](https://benchlm.ai/deepseek/api-pricing)

@@ -10,17 +10,24 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from dataclasses import replace
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
+from harbor.agents.base import BaseAgent
 from harbor.agents.terminus_2 import Terminus2
 from harbor.llms.lite_llm import LiteLLM
 
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import CallableLLMJudge
-from driftlock.lhtb import HarborWorkspaceDeltaObserver, LHTBTerminusRuntime
+from driftlock.lhtb import (
+    HarborWorkspaceDeltaObserver,
+    LHTBTerminusRuntime,
+    openrouter_provider_from_call_kwargs,
+)
 from driftlock.models import (
     DriftContext,
     JudgeCompletion,
@@ -28,14 +35,172 @@ from driftlock.models import (
     RunResult,
     RunStatus,
 )
+from driftlock.oracle import (
+    ReplayUsage,
+    load_remote_checkpoint_bundle,
+    load_source_trial_provenance,
+    validate_checkpoint_source_audit,
+)
 from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 
-PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
-_JUDGE_INPUT_COST_PER_TOKEN = 0.14 / 1_000_000
-_JUDGE_CACHE_COST_PER_TOKEN = 0.0028 / 1_000_000
-_JUDGE_OUTPUT_COST_PER_TOKEN = 0.28 / 1_000_000
+# The fine judge must not be the same model as the agent. Its job is to notice
+# that the agent has drifted, and a judge sharing the agent's weights shares its
+# blind spots: if the agent talked itself into a wrong path, the same model
+# reading the same trajectory is disposed to agree. The judge also runs only when
+# the coarse tier fires, so the stronger model sits on the low-call-count side.
+PINNED_LHTB_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
+
+
+@dataclass(frozen=True, slots=True)
+class _JudgeProviderPricing:
+    input_cost_per_token: float
+    cache_cost_per_token: float
+    output_cost_per_token: float
+
+
+# Pricing is keyed by the exact routable provider slug so changing the provider
+# without adding its audited rates fails instead of silently billing at stale rates.
+_JUDGE_PROVIDER_PRICING = {
+    "alibaba": _JudgeProviderPricing(
+        input_cost_per_token=0.000001162,
+        cache_cost_per_token=0.0000001162,
+        output_cost_per_token=0.000003485,
+    )
+}
+
+
+class LHTBCheckpointReplayOracle(BaseAgent):
+    """Restore one retained checkpoint for Harbor's isolated hidden verifier.
+
+    The class never calls a model and never sees verifier output. Harbor creates a
+    fresh task environment, calls this agent once to restore a predeclared bundle,
+    and then runs the task's ordinary verifier after the agent returns.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        driftlock_oracle_mode: str,
+        driftlock_checkpoint_dir: str,
+        driftlock_checkpoint_digest: str,
+        driftlock_expected_workspace: str,
+        driftlock_source_trial_id: str,
+        driftlock_source_task_name: str,
+        driftlock_source_result: str,
+        driftlock_source_result_sha256: str,
+        driftlock_source_audit: str,
+        driftlock_source_audit_sha256: str,
+        driftlock_source_usage: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        if driftlock_oracle_mode != "isolated-checkpoint-replay":
+            raise ValueError("oracle mode must be isolated-checkpoint-replay")
+        try:
+            UUID(driftlock_source_trial_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("source trial id must be a UUID") from error
+        if len(driftlock_checkpoint_digest) != 64:
+            raise ValueError("checkpoint digest must be a SHA-256")
+        if len(driftlock_source_result_sha256) != 64:
+            raise ValueError("source result digest must be a SHA-256")
+        super().__init__(*args, **kwargs)
+        self._oracle_checkpoint_dir = Path(driftlock_checkpoint_dir)
+        self._oracle_checkpoint_digest = driftlock_checkpoint_digest
+        self._oracle_expected_workspace = driftlock_expected_workspace
+        self._oracle_source_trial_id = driftlock_source_trial_id
+        self._oracle_source_task_name = driftlock_source_task_name
+        self._oracle_source_result = Path(driftlock_source_result)
+        self._oracle_source_result_sha256 = driftlock_source_result_sha256
+        self._oracle_source_audit = Path(driftlock_source_audit)
+        self._oracle_source_audit_sha256 = driftlock_source_audit_sha256
+        self._oracle_source_usage = ReplayUsage.from_mapping(driftlock_source_usage)
+
+    @staticmethod
+    def name() -> str:
+        return "driftlock-checkpoint-replay-oracle"
+
+    def version(self) -> str | None:
+        return version("driftlock")
+
+    async def setup(self, environment: Any) -> None:
+        del environment
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        del instruction
+        source = load_source_trial_provenance(
+            self._oracle_source_result,
+            expected_sha256=self._oracle_source_result_sha256,
+        )
+        if (
+            source.trial_id != self._oracle_source_trial_id
+            or source.task_name != self._oracle_source_task_name
+            or source.model_name != self.model_name
+            or source.usage != self._oracle_source_usage
+        ):
+            raise ValueError("replay parameters differ from hashed source result")
+        bundle = load_remote_checkpoint_bundle(
+            self._oracle_checkpoint_dir,
+            expected_digest=self._oracle_checkpoint_digest,
+            expected_workspace=self._oracle_expected_workspace,
+        )
+        phase_audit = validate_checkpoint_source_audit(
+            bundle.checkpoint.path,
+            source_result=source.result_path,
+            source_audit=self._oracle_source_audit,
+            expected_audit_sha256=self._oracle_source_audit_sha256,
+        )
+        task_config = getattr(environment, "task_env_config", None)
+        workspace = str(getattr(task_config, "workdir", None) or "/app")
+        if workspace != bundle.remote_workspace:
+            raise ValueError("fresh verifier workspace differs from checkpoint")
+
+        store = RemoteArchiveCheckpointStore(
+            environment,
+            remote_workspace=workspace,
+            store_dir=bundle.checkpoint.path.parent.parent,
+            user=environment.default_user,
+        )
+        await store.restore(bundle.checkpoint)
+
+        usage = self._oracle_source_usage
+        context.n_input_tokens = usage.input_tokens
+        context.n_cache_tokens = usage.cache_tokens
+        context.n_output_tokens = usage.output_tokens
+        context.cost_usd = float(usage.cost_usd)
+        metadata = dict(context.metadata or {})
+        metadata["termination_reason"] = "oracle_checkpoint_replay"
+        metadata["oracle"] = {
+            "mode": "isolated-checkpoint-replay",
+            "source_trial_id": self._oracle_source_trial_id,
+            "source_result": str(self._oracle_source_result.resolve()),
+            "source_result_sha256": self._oracle_source_result_sha256,
+            "source_audit": str(self._oracle_source_audit.resolve()),
+            "source_audit_sha256": self._oracle_source_audit_sha256,
+            "source_task_name": source.task_name,
+            "checkpoint_id": bundle.checkpoint.checkpoint_id,
+            "checkpoint_step": bundle.checkpoint.step,
+            "checkpoint_digest": bundle.checkpoint.digest,
+            "archive_sha256": bundle.archive_sha256,
+            "state_sha256": bundle.state_sha256,
+            "workspace": workspace,
+            "usage_policy": "full-source-trial-conservative",
+            "source_usage": usage.as_dict(),
+            "source_phase": phase_audit,
+        }
+        context.metadata = metadata
+        output = Path(self.logs_dir) / "oracle-replay.json"
+        output.write_text(
+            json.dumps(metadata["oracle"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    async def resume_after_verifier_rejection(
+        self, user_prompt: str, context: Any
+    ) -> None:
+        del user_prompt, context
+        raise RuntimeError("oracle replay is a single terminal phase")
 
 
 class LHTBDriftlockAgent(Terminus2):
@@ -60,21 +225,31 @@ class LHTBDriftlockAgent(Terminus2):
         driftlock_loop_repetitions: int = 3,
         driftlock_error_window: int = 5,
         driftlock_error_rate: float = 0.6,
+        driftlock_command_failure_window: int = 8,
+        driftlock_command_failure_rate: float = 1.0,
         driftlock_reward_stall_steps: int = 5,
+        driftlock_reward_epsilon: float = 1e-6,
+        driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
         driftlock_judge_max_output_tokens: int = 512,
         driftlock_judge_timeout_sec: float = 120.0,
+        driftlock_judge_llm_call_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         if enable_summarize:
             raise ValueError("driftlock requires enable_summarize=false")
+        call_kwargs = kwargs.get("llm_call_kwargs")
+        if not isinstance(call_kwargs, dict):
+            call_kwargs = {}
+        openrouter_provider_from_call_kwargs(call_kwargs, source="llm_call_kwargs")
         super().__init__(*args, enable_summarize=False, **kwargs)
         self._driftlock_runner_config = RunnerConfig(
             max_steps=driftlock_max_steps,
             max_rollbacks=driftlock_max_rollbacks,
             checkpoint_interval=driftlock_checkpoint_interval,
             max_tokens=driftlock_max_tokens,
+            checkpoint_on_exit=driftlock_retain_checkpoints,
         )
         self._driftlock_heuristic_config = HeuristicConfig(
             no_change_steps=driftlock_no_change_steps,
@@ -82,7 +257,11 @@ class LHTBDriftlockAgent(Terminus2):
             loop_repetitions=driftlock_loop_repetitions,
             error_window=driftlock_error_window,
             error_rate=driftlock_error_rate,
+            command_failure_window=driftlock_command_failure_window,
+            command_failure_rate=driftlock_command_failure_rate,
             reward_stall_steps=driftlock_reward_stall_steps,
+            reward_epsilon=driftlock_reward_epsilon,
+            corroborating_signals=frozenset(driftlock_corroborating_signals),
         )
         self._driftlock_judge_client = (
             None
@@ -92,6 +271,7 @@ class LHTBDriftlockAgent(Terminus2):
                 api_base=driftlock_judge_api_base,
                 max_output_tokens=driftlock_judge_max_output_tokens,
                 timeout_sec=driftlock_judge_timeout_sec,
+                llm_call_kwargs=driftlock_judge_llm_call_kwargs,
             )
         )
         self._driftlock_fine_judge = (
@@ -289,6 +469,7 @@ class LHTBDriftlockAgent(Terminus2):
             "tokens_used": result.tokens_used,
             "agent_tokens_used": result.agent_tokens_used,
             "judge_tokens_used": result.judge_tokens_used,
+            "signal_counts": result.signal_counts,
             "trial_tokens_used": self._driftlock_tokens_consumed,
             "trial_token_budget": self._driftlock_runner_config.max_tokens,
         }
@@ -318,6 +499,14 @@ class LHTBDriftlockAgent(Terminus2):
                     "rollbacks": len(result.rollbacks),
                     "tokens_used": result.tokens_used,
                     "checkpoint_count": len(result.checkpoints),
+                    "unstable_checkpoint_count": sum(
+                        bool(checkpoint.unstable_paths)
+                        for checkpoint in result.checkpoints
+                    ),
+                    "coarse_triggers": [
+                        trigger.to_dict() for trigger in result.coarse_triggers
+                    ],
+                    "signal_counts": result.signal_counts,
                 }
             )
         self._driftlock_phases.append(record)
@@ -487,6 +676,7 @@ class _LHTBJudgeClient:
         api_base: str | None,
         max_output_tokens: int,
         timeout_sec: float,
+        llm_call_kwargs: dict[str, Any] | None,
     ) -> None:
         if model != PINNED_LHTB_JUDGE_MODEL:
             raise ValueError(
@@ -495,7 +685,23 @@ class _LHTBJudgeClient:
             )
         if max_output_tokens <= 0 or timeout_sec <= 0:
             raise ValueError("judge output limit and timeout must be positive")
+        call_kwargs = dict(llm_call_kwargs or {})
+        if set(call_kwargs) != {"extra_body"}:
+            raise ValueError(
+                "driftlock_judge_llm_call_kwargs must contain exactly extra_body"
+            )
+        provider = openrouter_provider_from_call_kwargs(
+            call_kwargs, source="driftlock_judge_llm_call_kwargs"
+        )
+        pricing = _JUDGE_PROVIDER_PRICING.get(provider)
+        if pricing is None:
+            raise ValueError(
+                f"judge provider {provider!r} has no audited pricing; add its pinned "
+                "rates before changing driftlock_judge_llm_call_kwargs"
+            )
         self.model = model
+        self.provider = provider
+        self.pricing = pricing
         self.max_output_tokens = max_output_tokens
         self.timeout_sec = timeout_sec
         self.llm = LiteLLM(
@@ -505,10 +711,11 @@ class _LHTBJudgeClient:
             model_info={
                 "max_input_tokens": 1_000_000,
                 "max_output_tokens": 8_192,
-                "input_cost_per_token": _JUDGE_INPUT_COST_PER_TOKEN,
-                "cache_read_input_token_cost": _JUDGE_CACHE_COST_PER_TOKEN,
-                "output_cost_per_token": _JUDGE_OUTPUT_COST_PER_TOKEN,
+                "input_cost_per_token": pricing.input_cost_per_token,
+                "cache_read_input_token_cost": pricing.cache_cost_per_token,
+                "output_cost_per_token": pricing.output_cost_per_token,
             },
+            **call_kwargs,
         )
         self.llm._driftlock_single_attempt = True
         self.n_input_tokens = 0
@@ -569,8 +776,8 @@ class _LHTBJudgeClient:
             completion_tokens = ceiling
             cache_tokens = 0
             cost_usd = (
-                prompt_tokens * _JUDGE_INPUT_COST_PER_TOKEN
-                + completion_tokens * _JUDGE_OUTPUT_COST_PER_TOKEN
+                prompt_tokens * self.pricing.input_cost_per_token
+                + completion_tokens * self.pricing.output_cost_per_token
             )
             self.usage_fallbacks += 1
         self.n_input_tokens += prompt_tokens
@@ -617,6 +824,7 @@ class _LHTBJudgeClient:
         metadata["llm_time_sec"] = sum(request_times) / 1000.0
         metadata["driftlock_judge_usage"] = {
             "model": self.model,
+            "provider": self.provider,
             "input_tokens": self.n_input_tokens,
             "cache_tokens": self.n_cache_tokens,
             "output_tokens": self.n_output_tokens,

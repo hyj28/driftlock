@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
+from uuid import uuid4
 
 import litellm
 import pytest
@@ -142,6 +146,129 @@ def _agent(
         driftlock_retain_checkpoints=True,
         driftlock_max_tokens=max_tokens,
     )
+
+
+@pytest.mark.asyncio
+async def test_oracle_restores_one_verified_checkpoint_without_model_access(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "agent"
+    logs.mkdir()
+    trial_id = str(uuid4())
+    source_result = tmp_path / "result.json"
+    checkpoint_id = "d" * 32
+    checkpoint = (
+        tmp_path / ".driftlock-checkpoints" / "phase-0" / "checkpoints" / checkpoint_id
+    )
+    checkpoint.mkdir(parents=True)
+    archive = b"archive"
+    state_text = "{}"
+    digest = hashlib.sha256(archive)
+    digest.update(b"\0state\0")
+    digest.update(state_text.encode())
+    (checkpoint / "workspace.tar.gz").write_bytes(archive)
+    (checkpoint / "state.json").write_text(state_text, encoding="utf-8")
+    (checkpoint / "manifest.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_id": checkpoint_id,
+                "step": 10,
+                "created_at": datetime.now(UTC).isoformat(),
+                "digest": digest.hexdigest(),
+                "parent_id": None,
+                "label": "step-10",
+                "remote_workspace": "/app",
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_result.write_text(
+        json.dumps(
+            {
+                "id": trial_id,
+                "task_name": "long-horizon-terminal-bench/task-a",
+                "agent_info": {
+                    "name": "driftlock-terminus-2",
+                    "version": "0.1.0",
+                    "model_info": {
+                        "provider": "openrouter",
+                        "name": "source-model",
+                    },
+                },
+                "config": {
+                    "agent": {
+                        "import_path": ("driftlock.harbor_agent:LHTBDriftlockAgent"),
+                        "model_name": "openrouter/source-model",
+                        "kwargs": {"driftlock_retain_checkpoints": True},
+                    }
+                },
+                "agent_result": {
+                    "n_input_tokens": 100,
+                    "n_cache_tokens": 20,
+                    "n_output_tokens": 30,
+                    "cost_usd": 0.75,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_digest = hashlib.sha256(source_result.read_bytes()).hexdigest()
+    source_audit = logs / "driftlock-result.json"
+    source_audit.write_text(
+        json.dumps(
+            {
+                "phases": [
+                    {
+                        "phase": 0,
+                        "checkpoint_dir": str(checkpoint.parent.parent.resolve()),
+                        "checkpoints_retained": True,
+                        "status": "completed",
+                        "checkpoint_count": 1,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_audit_digest = hashlib.sha256(source_audit.read_bytes()).hexdigest()
+    agent = plugin.LHTBCheckpointReplayOracle(
+        logs_dir=logs,
+        model_name="openrouter/source-model",
+        driftlock_oracle_mode="isolated-checkpoint-replay",
+        driftlock_checkpoint_dir=str(checkpoint),
+        driftlock_checkpoint_digest=digest.hexdigest(),
+        driftlock_expected_workspace="/app",
+        driftlock_source_trial_id=trial_id,
+        driftlock_source_task_name="long-horizon-terminal-bench/task-a",
+        driftlock_source_result=str(source_result),
+        driftlock_source_result_sha256=source_digest,
+        driftlock_source_audit=str(source_audit),
+        driftlock_source_audit_sha256=source_audit_digest,
+        driftlock_source_usage={
+            "input_tokens": 100,
+            "cache_tokens": 20,
+            "output_tokens": 30,
+            "cost_usd": 0.75,
+        },
+    )
+    context = AgentContext()
+    environment = SimpleNamespace(
+        default_user="root", task_env_config=SimpleNamespace(workdir="/app")
+    )
+
+    await agent.run("hidden task instruction", environment, context)
+
+    assert [item.checkpoint_id for item in FakeStore.restores] == [checkpoint_id]
+    assert context.n_input_tokens == 100
+    assert context.n_cache_tokens == 20
+    assert context.n_output_tokens == 30
+    assert context.cost_usd == pytest.approx(0.75)
+    assert context.metadata["termination_reason"] == "oracle_checkpoint_replay"
+    assert context.metadata["oracle"]["source_trial_id"] == trial_id
+    assert context.metadata["oracle"]["usage_policy"] == (
+        "full-source-trial-conservative"
+    )
+    assert (logs / "oracle-replay.json").is_file()
 
 
 @pytest.mark.asyncio

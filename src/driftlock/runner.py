@@ -13,6 +13,9 @@ from driftlock.models import (
     Checkpoint,
     DriftContext,
     DriftSignal,
+    DriftTriggerOutcome,
+    DriftTriggerRecord,
+    FineJudgeStatus,
     JudgeVerdict,
     RollbackRecord,
     RunResult,
@@ -26,6 +29,9 @@ from driftlock.models import (
 
 StepFunction = Callable[[StepContext], Awaitable[StepOutcome]]
 
+_JUDGE_TOOL_OBSERVATION_CHARS = 8_000
+_JUDGE_TOOL_OBSERVATION_ITEM_CHARS = 1_000
+
 
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
@@ -37,6 +43,7 @@ class RunnerConfig:
     recent_steps_for_judge: int = 12
     max_tokens: int | None = None
     rollback_on_uncertain: bool = False
+    checkpoint_on_exit: bool = False
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -85,6 +92,7 @@ class DriftlockRunner:
         all_steps: list[StepRecord] = []
         recent_steps: list[StepRecord] = []
         rollbacks: list[RollbackRecord] = []
+        coarse_triggers: list[DriftTriggerRecord] = []
         agent_tokens_used = 0
         judge_tokens_used = 0
         logical_step = 0
@@ -108,14 +116,17 @@ class DriftlockRunner:
             try:
                 outcome = await step(context)
             except StepTokenBudgetExhausted:
-                return self._result(
+                return await self._finish(
                     RunStatus.TOKEN_LIMIT,
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
             state = dict(outcome.state)
             agent_tokens_used += outcome.tokens
@@ -140,32 +151,42 @@ class DriftlockRunner:
                 and tokens_used > self.config.max_tokens
             )
             if outcome.completed and not over_token_budget:
-                return self._result(
+                return await self._finish(
                     RunStatus.COMPLETED,
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
             if (
                 self.config.max_tokens is not None
                 and tokens_used >= self.config.max_tokens
             ):
-                return self._result(
+                return await self._finish(
                     RunStatus.TOKEN_LIMIT,
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
 
             signals = self.coarse_judge.evaluate(recent_steps)
             checkpoint_is_healthy = not signals
-            if signals:
+            if signals and not self.coarse_judge.initiates_review(signals):
+                # Corroborating-only: recorded so the detector's firing rate stays
+                # measurable, but not escalated and not billed.
+                coarse_triggers.append(self._suppressed_trigger_record(record, signals))
+            elif signals:
                 rollback_checkpoint = self._select_rollback_checkpoint(
                     checkpoint_lineage,
                     signals,
@@ -186,17 +207,37 @@ class DriftlockRunner:
                 )
                 if should_rollback:
                     if len(rollbacks) >= self.config.max_rollbacks:
-                        return self._result(
+                        coarse_triggers.append(
+                            self._trigger_record(
+                                record,
+                                signals,
+                                verdict,
+                                DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED,
+                            )
+                        )
+                        return await self._finish(
                             RunStatus.ROLLBACK_LIMIT,
                             state,
                             all_steps,
                             rollbacks,
+                            coarse_triggers,
                             checkpoints,
                             agent_tokens_used,
                             judge_tokens_used,
+                            current_checkpoint=checkpoint,
+                            logical_step=logical_step,
                         )
                     checkpoint = rollback_checkpoint
                     state = await self._restore_checkpoint(checkpoint)
+                    coarse_triggers.append(
+                        self._trigger_record(
+                            record,
+                            signals,
+                            verdict,
+                            DriftTriggerOutcome.ROLLED_BACK,
+                            rollback_checkpoint=checkpoint,
+                        )
+                    )
                     rollbacks.append(
                         RollbackRecord(
                             sequence=sequence,
@@ -212,27 +253,41 @@ class DriftlockRunner:
                     recent_steps = list(checkpoint_histories[checkpoint.checkpoint_id])
                     rollback_feedback = verdict.reason
                     if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
-                        return self._result(
+                        return await self._finish(
                             RunStatus.TOKEN_LIMIT,
                             state,
                             all_steps,
                             rollbacks,
+                            coarse_triggers,
                             checkpoints,
                             agent_tokens_used,
                             judge_tokens_used,
+                            current_checkpoint=checkpoint,
+                            logical_step=logical_step,
                         )
                     continue
+                coarse_triggers.append(
+                    self._trigger_record(
+                        record,
+                        signals,
+                        verdict,
+                        DriftTriggerOutcome.VETOED,
+                    )
+                )
                 checkpoint_is_healthy = verdict.verdict is Verdict.HEALTHY
 
             if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
-                return self._result(
+                return await self._finish(
                     RunStatus.TOKEN_LIMIT,
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
                 )
 
             if (
@@ -249,14 +304,17 @@ class DriftlockRunner:
                 checkpoint_lineage.append(checkpoint)
                 checkpoint_histories[checkpoint.checkpoint_id] = list(recent_steps)
 
-        return self._result(
+        return await self._finish(
             RunStatus.STEP_LIMIT,
             state,
             all_steps,
             rollbacks,
+            coarse_triggers,
             checkpoints,
             agent_tokens_used,
             judge_tokens_used,
+            current_checkpoint=checkpoint,
+            logical_step=logical_step,
         )
 
     async def _judge(
@@ -284,6 +342,7 @@ class DriftlockRunner:
                 recent_steps=recent,
                 diff=recent[-1].outcome.diff if recent else "",
                 tokens_remaining=self._tokens_remaining(tokens_used),
+                tool_observations=_bounded_tool_observations(recent),
             )
         )
 
@@ -295,6 +354,53 @@ class DriftlockRunner:
     def _budget_exhausted(self, tokens_used: int) -> bool:
         return (
             self.config.max_tokens is not None and tokens_used >= self.config.max_tokens
+        )
+
+    def _suppressed_trigger_record(
+        self,
+        step: StepRecord,
+        signals: tuple[DriftSignal, ...],
+    ) -> DriftTriggerRecord:
+        return DriftTriggerRecord(
+            sequence=step.sequence,
+            logical_step=step.logical_step,
+            signals=signals,
+            judge_status=FineJudgeStatus.NOT_INVOKED,
+            judge_verdict=None,
+            judge_reason=None,
+            outcome=DriftTriggerOutcome.SUPPRESSED,
+        )
+
+    def _trigger_record(
+        self,
+        step: StepRecord,
+        signals: tuple[DriftSignal, ...],
+        verdict: JudgeVerdict,
+        outcome: DriftTriggerOutcome,
+        *,
+        rollback_checkpoint: Checkpoint | None = None,
+    ) -> DriftTriggerRecord:
+        judge_configured = self.fine_judge is not None
+        return DriftTriggerRecord(
+            sequence=step.sequence,
+            logical_step=step.logical_step,
+            signals=signals,
+            judge_status=(
+                FineJudgeStatus.VERDICT
+                if judge_configured
+                else FineJudgeStatus.NOT_CONFIGURED
+            ),
+            judge_verdict=verdict.verdict if judge_configured else None,
+            judge_reason=verdict.reason if judge_configured else None,
+            outcome=outcome,
+            rollback_checkpoint_id=(
+                rollback_checkpoint.checkpoint_id
+                if rollback_checkpoint is not None
+                else None
+            ),
+            rollback_checkpoint_step=(
+                rollback_checkpoint.step if rollback_checkpoint is not None else None
+            ),
         )
 
     @staticmethod
@@ -341,6 +447,7 @@ class DriftlockRunner:
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
+        coarse_triggers: list[DriftTriggerRecord],
         checkpoints: list[Checkpoint],
         agent_tokens_used: int,
         judge_tokens_used: int,
@@ -354,4 +461,56 @@ class DriftlockRunner:
             tokens_used=agent_tokens_used + judge_tokens_used,
             agent_tokens_used=agent_tokens_used,
             judge_tokens_used=judge_tokens_used,
+            coarse_triggers=tuple(coarse_triggers),
         )
+
+    async def _finish(
+        self,
+        status: RunStatus,
+        state: Mapping[str, Any],
+        steps: list[StepRecord],
+        rollbacks: list[RollbackRecord],
+        coarse_triggers: list[DriftTriggerRecord],
+        checkpoints: list[Checkpoint],
+        agent_tokens_used: int,
+        judge_tokens_used: int,
+        *,
+        current_checkpoint: Checkpoint,
+        logical_step: int,
+    ) -> RunResult:
+        if self.config.checkpoint_on_exit and current_checkpoint.step != logical_step:
+            terminal = await self._create_checkpoint(
+                state,
+                step=logical_step,
+                parent_id=current_checkpoint.checkpoint_id,
+                label="terminal",
+            )
+            checkpoints.append(terminal)
+        return self._result(
+            status,
+            state,
+            steps,
+            rollbacks,
+            coarse_triggers,
+            checkpoints,
+            agent_tokens_used,
+            judge_tokens_used,
+        )
+
+
+def _bounded_tool_observations(steps: tuple[StepRecord, ...]) -> tuple[str, ...]:
+    selected: list[str] = []
+    remaining = _JUDGE_TOOL_OBSERVATION_CHARS
+    for step in reversed(steps):
+        for observation in reversed(step.outcome.tool_observations):
+            if remaining == 0:
+                break
+            rendered = f"step {step.logical_step}:\n{observation}"
+            rendered = rendered[:_JUDGE_TOOL_OBSERVATION_ITEM_CHARS]
+            rendered = rendered[:remaining]
+            selected.append(rendered)
+            remaining -= len(rendered)
+        if remaining == 0:
+            break
+    selected.reverse()
+    return tuple(selected)

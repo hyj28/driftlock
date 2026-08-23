@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -72,6 +73,26 @@ async def test_callable_llm_judge_degrades_invalid_output_to_uncertain() -> None
 
     assert verdict.verdict is Verdict.UNCERTAIN
     assert verdict.confidence == 0.0
+
+
+async def test_callable_llm_judge_prompt_includes_tool_observations() -> None:
+    received = ""
+
+    async def complete(prompt: str) -> str:
+        nonlocal received
+        received = prompt
+        return '{"verdict":"healthy","reason":"failure is changing"}'
+
+    context = replace(
+        _context(),
+        tool_observations=("step 3:\nrun_shell:\nexit_code: 1\nstderr:\nsyntax",),
+    )
+    verdict = await CallableLLMJudge(complete).judge(context)
+
+    assert verdict.verdict is Verdict.HEALTHY
+    assert '"recent_tool_observations"' in received
+    assert "exit_code: 1" in received
+    assert "syntax" in received
 
 
 async def test_callable_llm_judge_degrades_provider_failure_to_uncertain() -> None:

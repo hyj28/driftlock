@@ -1,0 +1,543 @@
+{
+  "selection_rule": {
+    "minimum_exclusive": 0.0,
+    "maximum_exclusive": 0.95,
+    "limit": 12
+  },
+  "selected_tasks": [
+    "long-horizon-terminal-bench/riscv-core-debug",
+    "long-horizon-terminal-bench/dicom-radiology-audit",
+    "long-horizon-terminal-bench/spice-ephemeris-regression",
+    "long-horizon-terminal-bench/unknown-config-semantics",
+    "long-horizon-terminal-bench/2048",
+    "long-horizon-terminal-bench/alp-paper-reproduction",
+    "long-horizon-terminal-bench/sudoku-recovery",
+    "custom/snake-obstacle-campaign",
+    "long-horizon-terminal-bench/great-expectations-audit",
+    "long-horizon-terminal-bench/commit0-multilib-tdd",
+    "long-horizon-terminal-bench/epidemic-inverse-control-audit",
+    "long-horizon-terminal-bench/chess-mate"
+  ],
+  "eligible": [
+    {
+      "task": "long-horizon-terminal-bench/riscv-core-debug",
+      "mean_reward": 0.88,
+      "attempts": 1,
+      "rewards": [
+        0.88
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/riscv-core-debug__ftDwu4k/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/dicom-radiology-audit",
+      "mean_reward": 0.8760045924225028,
+      "attempts": 1,
+      "rewards": [
+        0.8760045924225028
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/dicom-radiology-audit__CWJpc6Y/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/spice-ephemeris-regression",
+      "mean_reward": 0.8181818181818182,
+      "attempts": 1,
+      "rewards": [
+        0.8181818181818182
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/spice-ephemeris-regression__3n4d7uD/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/unknown-config-semantics",
+      "mean_reward": 0.7471264367816092,
+      "attempts": 1,
+      "rewards": [
+        0.7471264367816092
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/unknown-config-semantics__YTujN5J/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/2048",
+      "mean_reward": 0.646036,
+      "attempts": 1,
+      "rewards": [
+        0.646036
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-flash/2048__795CfpY/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/alp-paper-reproduction",
+      "mean_reward": 0.5,
+      "attempts": 1,
+      "rewards": [
+        0.5
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/alp-paper-reproduction__CaaUFPY/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/sudoku-recovery",
+      "mean_reward": 0.47619,
+      "attempts": 1,
+      "rewards": [
+        0.47619
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/sudoku-recovery__f2RCBBU/result.json"
+      ]
+    },
+    {
+      "task": "custom/snake-obstacle-campaign",
+      "mean_reward": 0.3842,
+      "attempts": 1,
+      "rewards": [
+        0.3842
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/snake_maze_campaign__tNz2G7s/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/great-expectations-audit",
+      "mean_reward": 0.36363636363636365,
+      "attempts": 1,
+      "rewards": [
+        0.36363636363636365
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/great-expectations-audit__i3H2CXe/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/commit0-multilib-tdd",
+      "mean_reward": 0.2691,
+      "attempts": 1,
+      "rewards": [
+        0.2691
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/commit0-multilib-tdd__kNnehDR/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/epidemic-inverse-control-audit",
+      "mean_reward": 0.17325949367088608,
+      "attempts": 1,
+      "rewards": [
+        0.17325949367088608
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/epidemic-inverse-control-audit__wEHGvQq/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/chess-mate",
+      "mean_reward": 0.15,
+      "attempts": 1,
+      "rewards": [
+        0.15
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-flash/chess-mate__4ox7PDR/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/materials-phase-diagram-audit",
+      "mean_reward": 0.090418343784,
+      "attempts": 1,
+      "rewards": [
+        0.090418343784
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/materials-phase-diagram-audit__2YioB7M/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/microscopy-cell-count-qc-audit",
+      "mean_reward": 0.06,
+      "attempts": 1,
+      "rewards": [
+        0.06
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/microscopy-cell-count-qc-audit__YJPvWne/result.json"
+      ]
+    },
+    {
+      "task": "custom/rush-hour-campaign",
+      "mean_reward": 0.04,
+      "attempts": 1,
+      "rewards": [
+        0.04
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/rush_hour_campaign__kjT2kWQ/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/satellite-flood-change-detection-audit",
+      "mean_reward": 0.04,
+      "attempts": 1,
+      "rewards": [
+        0.04
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/satellite-flood-change-detection__ktANSeX/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/robotics-slam-benchmark-repair",
+      "mean_reward": 0.033261111111,
+      "attempts": 1,
+      "rewards": [
+        0.033261111111
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/robotics-slam-benchmark-repair__Ljd2J7c/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/super-mario",
+      "mean_reward": 0.030933,
+      "attempts": 1,
+      "rewards": [
+        0.030933
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/super-mario__8dj8kgh/result.json"
+      ]
+    }
+  ],
+  "all_measured": [
+    {
+      "task": "long-horizon-terminal-bench/langchain-version-migration",
+      "mean_reward": 1.0,
+      "attempts": 1,
+      "rewards": [
+        1.0
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/langchain-version-migration__nWj9N9f/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/nbody-accel-iterative",
+      "mean_reward": 0.994,
+      "attempts": 1,
+      "rewards": [
+        0.994
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/nbody-accel-iterative__3LW3GZj/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/grammar-fuzz-coverage-hunt",
+      "mean_reward": 0.9907,
+      "attempts": 1,
+      "rewards": [
+        0.9907
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/grammar-fuzz-coverage-hunt__g2gPjQb/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/generals-bot-arena",
+      "mean_reward": 0.95,
+      "attempts": 1,
+      "rewards": [
+        0.95
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/generals-bot-arena__F7uei3Q/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/riscv-core-debug",
+      "mean_reward": 0.88,
+      "attempts": 1,
+      "rewards": [
+        0.88
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/riscv-core-debug__ftDwu4k/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/dicom-radiology-audit",
+      "mean_reward": 0.8760045924225028,
+      "attempts": 1,
+      "rewards": [
+        0.8760045924225028
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/dicom-radiology-audit__CWJpc6Y/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/spice-ephemeris-regression",
+      "mean_reward": 0.8181818181818182,
+      "attempts": 1,
+      "rewards": [
+        0.8181818181818182
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/spice-ephemeris-regression__3n4d7uD/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/unknown-config-semantics",
+      "mean_reward": 0.7471264367816092,
+      "attempts": 1,
+      "rewards": [
+        0.7471264367816092
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/unknown-config-semantics__YTujN5J/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/2048",
+      "mean_reward": 0.646036,
+      "attempts": 1,
+      "rewards": [
+        0.646036
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-flash/2048__795CfpY/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/alp-paper-reproduction",
+      "mean_reward": 0.5,
+      "attempts": 1,
+      "rewards": [
+        0.5
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/alp-paper-reproduction__CaaUFPY/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/sudoku-recovery",
+      "mean_reward": 0.47619,
+      "attempts": 1,
+      "rewards": [
+        0.47619
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/sudoku-recovery__f2RCBBU/result.json"
+      ]
+    },
+    {
+      "task": "custom/snake-obstacle-campaign",
+      "mean_reward": 0.3842,
+      "attempts": 1,
+      "rewards": [
+        0.3842
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/snake_maze_campaign__tNz2G7s/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/great-expectations-audit",
+      "mean_reward": 0.36363636363636365,
+      "attempts": 1,
+      "rewards": [
+        0.36363636363636365
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/great-expectations-audit__i3H2CXe/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/commit0-multilib-tdd",
+      "mean_reward": 0.2691,
+      "attempts": 1,
+      "rewards": [
+        0.2691
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/commit0-multilib-tdd__kNnehDR/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/epidemic-inverse-control-audit",
+      "mean_reward": 0.17325949367088608,
+      "attempts": 1,
+      "rewards": [
+        0.17325949367088608
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/epidemic-inverse-control-audit__wEHGvQq/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/chess-mate",
+      "mean_reward": 0.15,
+      "attempts": 1,
+      "rewards": [
+        0.15
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-flash/chess-mate__4ox7PDR/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/materials-phase-diagram-audit",
+      "mean_reward": 0.090418343784,
+      "attempts": 1,
+      "rewards": [
+        0.090418343784
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/materials-phase-diagram-audit__2YioB7M/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/microscopy-cell-count-qc-audit",
+      "mean_reward": 0.06,
+      "attempts": 1,
+      "rewards": [
+        0.06
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/microscopy-cell-count-qc-audit__YJPvWne/result.json"
+      ]
+    },
+    {
+      "task": "custom/rush-hour-campaign",
+      "mean_reward": 0.04,
+      "attempts": 1,
+      "rewards": [
+        0.04
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/rush_hour_campaign__kjT2kWQ/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/satellite-flood-change-detection-audit",
+      "mean_reward": 0.04,
+      "attempts": 1,
+      "rewards": [
+        0.04
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/satellite-flood-change-detection__ktANSeX/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/robotics-slam-benchmark-repair",
+      "mean_reward": 0.033261111111,
+      "attempts": 1,
+      "rewards": [
+        0.033261111111
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/robotics-slam-benchmark-repair__Ljd2J7c/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/super-mario",
+      "mean_reward": 0.030933,
+      "attempts": 1,
+      "rewards": [
+        0.030933
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen/super-mario__8dj8kgh/result.json"
+      ]
+    },
+    {
+      "task": "long-horizon-terminal-bench/tabular-data-feature-covshift",
+      "mean_reward": 0.0,
+      "attempts": 1,
+      "rewards": [
+        0.0
+      ],
+      "result_files": [
+        "/srv/LHTB/jobs/week1-screen2/tabular-data-feature-covshift__tXYrfua/result.json"
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "task": "long-horizon-terminal-bench/duckdb-optimizer-closure",
+      "result": "/srv/LHTB/jobs/week1-screen/duckdb-optimizer-closure__y8BtWHM/result.json",
+      "reason": "ValueError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/grammar-fuzz-coverage-hunt",
+      "result": "/srv/LHTB/jobs/week1-screen/grammar-fuzz-coverage-hunt__pngLoPt/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/great-expectations-audit",
+      "result": "/srv/LHTB/jobs/week1-screen/great-expectations-audit__K6KD39c/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/langchain-version-migration",
+      "result": "/srv/LHTB/jobs/week1-screen/langchain-version-migration__afjt7d9/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/materials-phase-diagram-audit",
+      "result": "/srv/LHTB/jobs/week1-screen/materials-phase-diagram-audit__PdvMG2T/result.json",
+      "reason": "APIError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/microscopy-cell-count-qc-audit",
+      "result": "/srv/LHTB/jobs/week1-screen/microscopy-cell-count-qc-audit__DLU3BEQ/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/nbody-accel-iterative",
+      "result": "/srv/LHTB/jobs/week1-screen/nbody-accel-iterative__BY46Qoo/result.json",
+      "reason": "APIError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/sokoban",
+      "result": "/srv/LHTB/jobs/week1-screen/sokoban__QUmGoiG/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/sudoku-recovery",
+      "result": "/srv/LHTB/jobs/week1-screen/sudoku-recovery__ynLzu8x/result.json",
+      "reason": "APIError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/unknown-config-semantics",
+      "result": "/srv/LHTB/jobs/week1-screen/unknown-config-semantics__yFUXH9T/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/vector-db-iterative-build",
+      "result": "/srv/LHTB/jobs/week1-screen/vector-db-iterative-build__o4kX7MV/result.json",
+      "reason": "AuthenticationError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/sokoban",
+      "result": "/srv/LHTB/jobs/week1-screen2/sokoban__MJ9mAUy/result.json",
+      "reason": "RuntimeError"
+    },
+    {
+      "task": "long-horizon-terminal-bench/vector-db-iterative-build",
+      "result": "/srv/LHTB/jobs/week1-screen2/vector-db-iterative-build__u2nNsbV/result.json",
+      "reason": "ValueError"
+    }
+  ]
+}
