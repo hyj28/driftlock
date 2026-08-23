@@ -1,23 +1,25 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000..6741a39
+index 0000000..73f540f
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 10
++DRIFTLOCK_HARBOR_PATCH_VERSION = 11
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-index bcd0473..f6ba8fe 100644
+index bcd0473..58e1e2d 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
 +++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-@@ -1250,14 +1250,55 @@ so ask everything you need to know."""
-         Returns:
-             Tuple of (timeout_occurred, terminal_output)
-         """
--        for command in commands:
-+        boundary_index = next(
+@@ -1236,6 +1236,41 @@ so ask everything you need to know."""
+             llm_response,
+         )
+ 
++    @staticmethod
++    def _driftlock_boundary_index(commands) -> int | None:
++        """Index of the batch's last non-empty command, or None if there is none."""
++        return next(
 +            (
 +                index
 +                for index in range(len(commands) - 1, -1, -1)
@@ -25,6 +27,39 @@ index bcd0473..f6ba8fe 100644
 +            ),
 +            None,
 +        )
++
++    @classmethod
++    def _driftlock_boundary_feedback(cls, commands) -> str | None:
++        """Why this batch cannot run to a checkpoint boundary, or None if it can.
++
++        A model response truncated at the output ceiling ends mid-token, so its
++        last keystrokes do not execute. Running the batch anyway would leave the
++        shell mid-command and make the workspace unobservable at the checkpoint,
++        but refusing it is an ordinary bad-response event: the model is told and
++        gets to try again, exactly as it is for a parse error.
++        """
++        index = cls._driftlock_boundary_index(commands)
++        if index is None or TmuxSession.can_end_command_batch(
++            commands[index].keystrokes
++        ):
++            return None
++        return (
++            "ERROR: The final command in the batch does not execute -- it has no "
++            "trailing newline and is not a shell-return control key, so it would "
++            "leave the shell mid-command across the checkpoint boundary. This "
++            "usually means the response was cut off at the output limit. Send a "
++            "shorter batch whose last command ends with a newline."
++        )
++
+     async def _execute_commands(
+         self,
+         commands: list[Command],
+@@ -1250,14 +1285,48 @@ so ask everything you need to know."""
+         Returns:
+             Tuple of (timeout_occurred, terminal_output)
+         """
+-        for command in commands:
++        boundary_index = self._driftlock_boundary_index(commands)
 +        if boundary_index is not None and not TmuxSession.can_end_command_batch(
 +            commands[boundary_index].keystrokes
 +        ):
@@ -72,6 +107,22 @@ index bcd0473..f6ba8fe 100644
                  return True, self._timeout_template.format(
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
+@@ -1413,6 +1482,15 @@ so ask everything you need to know."""
+                 f"Episode {episode}: {len(commands)} commands",
+             )
+ 
++            if not (feedback and "ERROR:" in feedback):
++                boundary_feedback = self._driftlock_boundary_feedback(commands)
++                if boundary_feedback is not None:
++                    feedback = (
++                        boundary_feedback
++                        if not feedback
++                        else f"{feedback}\n{boundary_feedback}"
++                    )
++
+             if feedback and "ERROR:" in feedback:
+                 prompt = (
+                     f"Previous response had parsing errors:\n{feedback}\n\n"
 diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
 index 74f836b..718b984 100644
 --- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
@@ -384,12 +435,28 @@ index 7442a5f..6d9a900 100644
 -            response_id=response_id,
 -        )
 +        return llm_response
+diff --git a/harbor/src/harbor/trial/trial.py b/harbor/src/harbor/trial/trial.py
+index 5c5dd7f..33af5ad 100644
+--- a/harbor/src/harbor/trial/trial.py
++++ b/harbor/src/harbor/trial/trial.py
+@@ -1169,6 +1169,11 @@ class Trial:
+                         }
+                     )
+                 self.result.agent_result = aggregated
++            driftlock_finalize = getattr(
++                self._agent, "_driftlock_finalize_after_agent_run", None
++            )
++            if callable(driftlock_finalize):
++                await driftlock_finalize()
+             self.result.agent_execution.finished_at = datetime.now(timezone.utc)
+ 
+     async def _run_verification(self) -> None:
 diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 new file mode 100644
-index 0000000..7edf06c
+index 0000000..3b62108
 --- /dev/null
 +++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,500 @@
 +import os
 +import pty
 +import select
@@ -415,6 +482,9 @@ index 0000000..7edf06c
 +
 +    async def get_incremental_output(self):
 +        return "terminal output"
++
++    async def is_session_alive(self):
++        return True
 +
 +
 +def agent_stub() -> Terminus2:
@@ -495,6 +565,63 @@ index 0000000..7edf06c
 +        )
 +
 +    assert session.calls == []
++
++
++def test_boundary_feedback_names_a_batch_that_would_not_execute():
++    feedback = Terminus2._driftlock_boundary_feedback(
++        [
++            Command("touch /app/should-not-exist\n", 0.1),
++            Command("cat > /app/x <<'PY'\nimport sys\ndef f(", 0.1),
++        ]
++    )
++
++    assert feedback is not None
++    assert feedback.startswith("ERROR:")
++    assert "output limit" in feedback
++
++
++def test_boundary_feedback_is_silent_for_a_batch_that_ends_at_the_shell():
++    assert (
++        Terminus2._driftlock_boundary_feedback(
++            [Command("ls -la\n", 0.1), Command("", 0.1)]
++        )
++        is None
++    )
++    assert (
++        Terminus2._driftlock_boundary_feedback(
++            [Command("python3 -q\n", 1.0), Command("C-d", 0.1)]
++        )
++        is None
++    )
++
++
++def test_boundary_feedback_is_silent_for_an_empty_batch():
++    assert Terminus2._driftlock_boundary_feedback([]) is None
++    assert Terminus2._driftlock_boundary_feedback([Command("", 0.1)]) is None
++
++
++def test_boundary_feedback_and_execute_commands_agree_on_every_batch():
++    # The loop refuses a batch using _driftlock_boundary_feedback; _execute_commands
++    # raises on the same condition as a last line of defence. If the two ever
++    # disagree, either a bad batch runs or a good one is rejected forever.
++    batches = [
++        [],
++        [Command("", 0.1)],
++        [Command("ls\n", 0.1)],
++        [Command("printf PARTIAL", 0.1)],
++        [Command("ls\n", 0.1), Command("printf PARTIAL", 0.1)],
++        [Command("printf PARTIAL", 0.1), Command("", 0.1)],
++        [Command("python3 -q\n", 1.0), Command("C-c", 0.1)],
++        [Command("python3 -q\n", 1.0), Command("C-z", 0.1)],
++        [Command("vim x\n", 1.0), Command(":wq", 0.1)],
++    ]
++    for batch in batches:
++        refused = Terminus2._driftlock_boundary_feedback(batch) is not None
++        index = Terminus2._driftlock_boundary_index(batch)
++        raises = index is not None and not TmuxSession.can_end_command_batch(
++            batch[index].keystrokes
++        )
++        assert refused is raises, batch
 +
 +
 +@pytest.mark.asyncio
@@ -714,6 +841,122 @@ index 0000000..7edf06c
 +        "timeout 1.0s tmux wait driftlock-test-channel",
 +        "root",
 +    )
++
++
++class LoopChat:
++    total_input_tokens = 0
++    total_output_tokens = 0
++    total_cache_tokens = 0
++    total_cost = 0.0
++
++
++def loop_agent_stub(responses):
++    """A Terminus2 wired up just enough to run _run_agent_loop over `responses`."""
++    agent = object.__new__(Terminus2)
++    agent._context = SimpleNamespace(
++        n_input_tokens=0, n_output_tokens=0, n_cache_tokens=0, cost_usd=None
++    )
++    agent._session = FakeSession()
++    agent._n_episodes = 0
++    agent._max_episodes = len(responses)
++    agent._process_reward_tracker = None
++    agent._pending_subagent_refs = None
++    agent._pending_handoff_prompt = None
++    agent._pending_completion = False
++    agent._linear_history = False
++    agent._save_raw_content_in_trajectory = False
++    agent._trajectory_steps = []
++    agent._model_name = "test-model"
++    agent._last_response_model_name = None
++    agent._termination_reason = None
++    agent._limit_output_length = lambda value: value
++    agent._timeout_template = "timeout {timeout_sec}: {command}: {terminal_state}"
++    agent._setup_episode_logging = lambda logging_dir, episode: None
++    agent._record_asciinema_marker = lambda message: None
++    agent._get_error_response_type = lambda: "JSON response"
++    agent._terminal_interaction_times_msec = []
++    agent._dump_trajectory = lambda: None
++
++    agent.prompts_seen = []
++    agent.executed = []
++
++    async def handle(chat, prompt, logging_paths, original_instruction, session):
++        agent.prompts_seen.append(prompt)
++        return responses.pop(0)
++
++    async def execute(commands, session):
++        agent.executed.append(commands)
++        return False, "terminal output"
++
++    agent._handle_llm_interaction = handle
++    agent._execute_commands = execute
++    return agent
++
++
++def llm_response_stub():
++    return SimpleNamespace(
++        content="raw",
++        reasoning_content=None,
++        model_name="test-model",
++        prompt_token_ids=None,
++        completion_token_ids=None,
++        logprobs=None,
++    )
++
++
++@pytest.mark.asyncio
++async def test_a_truncated_batch_is_returned_to_the_model_instead_of_ending_the_trial():
++    truncated = (
++        [
++            Command("touch /app/marker\n", 0.1),
++            Command("cat > /app/x <<'PY'\nimport sys\ndef f(", 0.1),
++        ],
++        False,
++        None,
++        "analysis",
++        "plan",
++        llm_response_stub(),
++    )
++    recovered = (
++        [Command("ls -la\n", 0.1)],
++        False,
++        None,
++        "analysis",
++        "plan",
++        llm_response_stub(),
++    )
++    agent = loop_agent_stub([truncated, recovered])
++
++    await agent._run_agent_loop("start", LoopChat())
++
++    # The bad batch never reached the terminal, and the good one did.
++    assert len(agent.executed) == 1
++    assert agent.executed[0][0].keystrokes == "ls -la\n"
++    # The model was told why, in the prompt for the next episode.
++    assert len(agent.prompts_seen) == 2
++    assert "does not execute" in agent.prompts_seen[1]
++    assert "output limit" in agent.prompts_seen[1]
++
++
++@pytest.mark.asyncio
++async def test_a_parse_error_still_reports_the_parse_error_not_the_boundary():
++    parse_failed = (
++        [Command("printf PARTIAL", 0.1)],
++        False,
++        "ERROR: could not parse the response as JSON",
++        None,
++        None,
++        llm_response_stub(),
++    )
++    agent = loop_agent_stub([parse_failed])
++
++    await agent._run_agent_loop("start", LoopChat())
++
++    assert agent.executed == []
++    step = agent._trajectory_steps[-1]
++    reported = step.observation.results[0].content
++    assert "could not parse the response as JSON" in reported
++    assert "output limit" not in reported
 diff --git a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
 index 8dcd203..cc358f2 100644
 --- a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
@@ -786,20 +1029,6 @@ index b34b4fc..20cc6ac 100644
  @pytest.mark.asyncio
  async def test_chat_passes_previous_response_id():
      """Verify previous_response_id is passed as kwarg to model.call()."""
-diff --git a/harbor/src/harbor/trial/trial.py b/harbor/src/harbor/trial/trial.py
---- a/harbor/src/harbor/trial/trial.py
-+++ b/harbor/src/harbor/trial/trial.py
-@@ -1169,5 +1169,10 @@ class Trial:
-                     )
-                 self.result.agent_result = aggregated
-+            driftlock_finalize = getattr(
-+                self._agent, "_driftlock_finalize_after_agent_run", None
-+            )
-+            if callable(driftlock_finalize):
-+                await driftlock_finalize()
-             self.result.agent_execution.finished_at = datetime.now(timezone.utc)
- 
-     async def _run_verification(self) -> None:
 diff --git a/harbor/tests/unit/llms/test_lite_llm.py b/harbor/tests/unit/llms/test_lite_llm.py
 index 03266fb..dcf3332 100644
 --- a/harbor/tests/unit/llms/test_lite_llm.py

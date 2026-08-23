@@ -14,8 +14,18 @@ import pytest
 from harbor.models.agent.context import AgentContext
 
 import driftlock.harbor_agent as plugin
+from driftlock.lhtb_experiment import (
+    DEFAULT_JUDGE_PROVIDER,
+    DEFAULT_PROVIDER,
+    openrouter_provider_call_kwargs,
+)
 from driftlock.models import RunResult, RunStatus
 from driftlock.terminus import TerminusConversationCodec, TerminusConversationState
+
+
+def _pinned_judge_call_kwargs() -> dict[str, Any]:
+    """The routing the experiment generator emits for the pinned judge provider."""
+    return openrouter_provider_call_kwargs(DEFAULT_JUDGE_PROVIDER)
 
 
 class FakeRuntime:
@@ -52,7 +62,8 @@ class FakeStore:
 
     async def create(self, state: Any, **kwargs: Any) -> Any:
         checkpoint = SimpleNamespace(
-            path=self.store_dir / "checkpoints" / f"created-{len(self.creates)}"
+            path=self.store_dir / "checkpoints" / f"created-{len(self.creates)}",
+            unstable_paths=(),
         )
         type(self).creates.append(checkpoint)
         return checkpoint
@@ -111,7 +122,8 @@ class FakeRunner:
             rollbacks=(),
             checkpoints=(
                 SimpleNamespace(
-                    path=self.store.store_dir / "checkpoints" / f"initial-{count}"
+                    path=self.store.store_dir / "checkpoints" / f"initial-{count}",
+                    unstable_paths=(),
                 ),
             ),
             tokens_used=tokens_used,
@@ -145,6 +157,7 @@ def _agent(
         record_terminal_session=False,
         driftlock_retain_checkpoints=True,
         driftlock_max_tokens=max_tokens,
+        llm_call_kwargs=openrouter_provider_call_kwargs(DEFAULT_PROVIDER),
     )
 
 
@@ -335,6 +348,8 @@ async def test_later_phase_exception_restores_cumulative_judge_accounting(
         record_terminal_session=False,
         driftlock_retain_checkpoints=True,
         driftlock_judge_model=plugin.PINNED_LHTB_JUDGE_MODEL,
+        driftlock_judge_llm_call_kwargs=_pinned_judge_call_kwargs(),
+        llm_call_kwargs=openrouter_provider_call_kwargs(DEFAULT_PROVIDER),
     )
     environment = SimpleNamespace(
         default_user="root", task_env_config=SimpleNamespace(workdir="/app")
@@ -401,6 +416,7 @@ async def test_blind_retry_restores_initial_state_and_discards_feedback(
         enable_summarize=False,
         record_terminal_session=False,
         driftlock_max_tokens=100,
+        llm_call_kwargs=openrouter_provider_call_kwargs(DEFAULT_PROVIDER),
     )
     environment = SimpleNamespace(
         default_user="root", task_env_config=SimpleNamespace(workdir="/app")
@@ -435,6 +451,7 @@ async def test_blind_retry_does_not_restore_when_budget_is_exhausted(
         enable_summarize=False,
         record_terminal_session=False,
         driftlock_max_tokens=13,
+        llm_call_kwargs=openrouter_provider_call_kwargs(DEFAULT_PROVIDER),
     )
     environment = SimpleNamespace(
         default_user="root", task_env_config=SimpleNamespace(workdir="/app")
@@ -461,6 +478,7 @@ async def test_blind_retry_finalizer_removes_retained_checkpoint(
         model_name="fake-provider/fake-model",
         enable_summarize=False,
         record_terminal_session=False,
+        llm_call_kwargs=openrouter_provider_call_kwargs(DEFAULT_PROVIDER),
     )
     environment = SimpleNamespace(
         default_user="root", task_env_config=SimpleNamespace(workdir="/app")
@@ -508,6 +526,7 @@ async def test_judge_client_caps_one_call_and_merges_usage(
         api_base="https://example.invalid/v1",
         max_output_tokens=50,
         timeout_sec=10,
+        llm_call_kwargs=_pinned_judge_call_kwargs(),
     )
 
     completion = await client.complete("judge this", tokens_remaining=1_000)
@@ -559,6 +578,7 @@ async def test_judge_client_skips_request_when_budget_cannot_cover_prompt(
         api_base=None,
         max_output_tokens=50,
         timeout_sec=10,
+        llm_call_kwargs=_pinned_judge_call_kwargs(),
     )
 
     completion = await client.complete("large enough prompt", tokens_remaining=10)
@@ -578,6 +598,7 @@ def test_judge_client_rejects_unaudited_model_pricing(
             api_base=None,
             max_output_tokens=50,
             timeout_sec=10,
+            llm_call_kwargs=_pinned_judge_call_kwargs(),
         )
 
 
@@ -602,15 +623,13 @@ async def test_judge_client_conservatively_prices_missing_usage(
         api_base=None,
         max_output_tokens=50,
         timeout_sec=10,
+        llm_call_kwargs=_pinned_judge_call_kwargs(),
     )
 
     completion = await client.complete("judge this", tokens_remaining=1_000)
 
     expected_input = len(b"judge this") + 256
-    expected_cost = (
-        expected_input * plugin._JUDGE_INPUT_COST_PER_TOKEN
-        + 50 * plugin._JUDGE_OUTPUT_COST_PER_TOKEN
-    )
+    expected_cost = expected_input * 0.000001162 + 50 * 0.000003485
     assert completion.tokens == expected_input + 50
     assert client.cost_usd == pytest.approx(expected_cost)
     assert client.usage_fallbacks == 1
@@ -637,6 +656,7 @@ async def test_cancelled_judge_call_is_accounted_then_cancelled(
         api_base=None,
         max_output_tokens=50,
         timeout_sec=10,
+        llm_call_kwargs=_pinned_judge_call_kwargs(),
     )
 
     with pytest.raises(asyncio.CancelledError):
@@ -688,6 +708,7 @@ async def test_real_pinned_judge_litellm_path_is_one_physical_call(
         api_base="https://example.invalid/v1",
         max_output_tokens=50,
         timeout_sec=10,
+        llm_call_kwargs=_pinned_judge_call_kwargs(),
     )
 
     completion = await client.complete("judge this", tokens_remaining=1_000)

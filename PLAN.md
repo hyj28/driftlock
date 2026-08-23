@@ -197,6 +197,44 @@ Suppressed triggers are still recorded, in their own `suppressed` bucket
 alongside `upheld` and `vetoed`, so a gated detector's firing rate stays
 measurable and the decision above stays re-checkable against later data.
 
+### 3.2.1 What the boundary constraint costs
+
+Checkpointing requires the shell to be quiescent at a step boundary, so the
+driftlock arms append one instruction stock does not get: *each response's
+terminal-command batch must return to the login shell before it ends*. That
+constraint is load-bearing — a checkpoint taken mid-command archives a workspace
+the agent is still writing to — but it is not free, and the first four-arm round
+measured the price.
+
+| Arm | Median output tokens | Responses cut off at the 8,192-token ceiling |
+| --- | --- | --- |
+| `stock` | 912 | **0 / 1,242** |
+| `retry` | 1,533 | 53 / 1,052 (5.0%) |
+| `driftlock` | 2,034 | 34 / 570 (6.0%) |
+
+The gap is present in the first 25k tokens of context, before the trajectories
+could have diverged, and truncation does not correlate with context length —
+`retry`'s truncated calls had a *lower* median input than its untruncated ones.
+The constraint changes how the model writes: it favours large self-contained
+batches that set everything up and return, which are exactly the batches that run
+out of output budget.
+
+Two consequences.
+
+**It was killing trials, and that was a defect.** A response cut off at the
+ceiling ends mid-token, so its last keystrokes never execute. The companion patch
+refused to run such a batch — correctly — but did so by raising, which Harbor
+turns into an errored trial, and `lhtb_analysis` rejects any job containing one.
+Three of eight `retry` trials and three of eight `driftlock` trials died this way
+while `stock` lost none. From companion patch v11 the batch is refused and handed
+back to the model as feedback, the same path a parse error already took.
+
+**Part of any `stock` vs `driftlock` gap is prompt, not rollback.** This is why
+the `retry` arm exists: it carries the identical constraint and the identical
+loop, and differs from `driftlock` only in that it never rolls back. `retry` vs
+`driftlock` isolates rollback; `stock` vs `driftlock` does not, and is reported
+as loop-plus-constraint-plus-rollback rather than as a rollback effect.
+
 ### 3.3 Skill representation
 
 One schema, shared by **both** distillation arms. This is a correctness requirement,
@@ -443,6 +481,7 @@ the results section stays empty, per §1.
 | 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
 | 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin |
 | 12 | **The corroborating gate is fitted on 3 tasks** — `no_file_change` was demoted on one diagnostic run: 109 solo firings, 109 rejected, 2 rollbacks total (§3.2). The tasks were chosen for their spread on the week-1 screen, not sampled, and a task where the agent genuinely stalls *without* looping would now be missed | Missed intervention; a knob fitted on the data it is judged by | The miss is in the safe direction — a gated detector makes the driftlock arm behave more like the no-intervention arm, which can only understate the effect. Suppressed triggers keep being recorded, so the held-out week-9 run re-measures the gate on tasks it was not fitted on: if solo `no_file_change` ever precedes a genuine stall there, the demotion is wrong and the record shows it |
+| 13 | **Output-ceiling truncation** — the checkpoint boundary constraint roughly doubles median response length, so the driftlock arms hit the 8,192-token ceiling on 5–6% of calls where stock never does (§3.2.1) | Wasted steps; a confound in `stock` vs `driftlock` | A truncated batch is no longer fatal (patch v11) — it returns to the model as feedback and costs one step. The confound is structural, not fixable: `retry` is the arm that isolates rollback from the constraint |
 
 ---
 

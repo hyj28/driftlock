@@ -69,14 +69,14 @@ DRIFTLOCK_DETECTOR_DEFAULTS = {
     "driftlock_corroborating_signals": ["no_file_change"],
 }
 
-# SHA-256 of every Harbor file after applying the packaged version-10 patch to the
+# SHA-256 of every Harbor file after applying the packaged version-11 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
 _PATCHED_HARBOR_SHA256 = {
     "harbor/src/harbor/_driftlock_pin.py": (
-        "122fbebce971434c4774c26dce15d6382d1c69468c871477d2ab9c2b2d8258d8"
+        "9da8ba424621246e0836713932d75a0e94e14aadcb50fe93d008005f57970050"
     ),
     "harbor/src/harbor/agents/terminus_2/terminus_2.py": (
-        "2b1b9aabac4b4ec40ba6b9c63b17a7d04e5a5a15e78dbf39efa361541e42c2f4"
+        "7ec452a41b135d1fb1f130a9ff31578653280c7a6a6b12165776bc83080b61e5"
     ),
     "harbor/src/harbor/agents/terminus_2/tmux_session.py": (
         "3efd8216f7c9e276178b474a5c73e4a050026910af8876fa06b4f1bfae8b24f1"
@@ -94,7 +94,7 @@ _PATCHED_HARBOR_SHA256 = {
         "fc769a6fd7646ec8c3049e16ebb70c31e5a2a7a7ffe010ed30b4d5737184b2c5"
     ),
     "harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py": (
-        "6e65a65dd74195ad962401b425504831d412225e011e12f54d6701bd91cb81b5"
+        "fab5d8cd139ff8b6fce158a04d09fec77f47ae8cae58a2ba600a41055e13f186"
     ),
     "harbor/tests/unit/agents/terminus_2/test_tmux_session.py": (
         "0412e289ae6e8de7d2fc92fb1d1762761b1862b42102755638ce2a451d737d07"
