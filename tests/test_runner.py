@@ -8,7 +8,9 @@ from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.models import (
     DriftContext,
+    DriftSignal,
     DriftTriggerOutcome,
+    DriftTriggerRecord,
     FineJudgeStatus,
     JudgeVerdict,
     RunStatus,
@@ -41,6 +43,9 @@ def _store(tmp_path: Path) -> tuple[Path, DirectoryCheckpointStore]:
 
 
 def _quick_coarse_judge() -> HeuristicJudge:
+    # corroborating_signals is emptied deliberately: these tests exercise what
+    # happens once a signal reaches the fine judge, so every kind must be able to
+    # get there. The corroborating-only gate has its own tests below.
     return HeuristicJudge(
         HeuristicConfig(
             no_change_steps=2,
@@ -48,6 +53,7 @@ def _quick_coarse_judge() -> HeuristicJudge:
             loop_repetitions=2,
             error_window=2,
             reward_stall_steps=2,
+            corroborating_signals=frozenset(),
         )
     )
 
@@ -115,7 +121,9 @@ async def test_runner_rolls_back_workspace_and_state_then_retries(
         "verdict": None,
         "reason": None,
     }
-    assert result.signal_counts == {"no_file_change": {"upheld": 1, "vetoed": 0}}
+    assert result.signal_counts == {
+        "no_file_change": {"upheld": 1, "vetoed": 0, "suppressed": 0}
+    }
 
 
 async def test_fine_judge_can_veto_a_coarse_signal(tmp_path: Path) -> None:
@@ -154,7 +162,9 @@ async def test_fine_judge_can_veto_a_coarse_signal(tmp_path: Path) -> None:
             "lookback": 2,
         }
     ]
-    assert result.signal_counts == {"no_file_change": {"upheld": 0, "vetoed": 1}}
+    assert result.signal_counts == {
+        "no_file_change": {"upheld": 0, "vetoed": 1, "suppressed": 0}
+    }
 
 
 async def test_fine_judge_upheld_trigger_records_verdict_and_rollback_target(
@@ -238,7 +248,9 @@ async def test_rollback_limit_records_refused_trigger_without_a_rollback(
     assert trigger.outcome is DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED
     assert trigger.rollback_checkpoint_id is None
     assert trigger.rollback_checkpoint_step is None
-    assert result.signal_counts == {"no_file_change": {"upheld": 1, "vetoed": 0}}
+    assert result.signal_counts == {
+        "no_file_change": {"upheld": 1, "vetoed": 0, "suppressed": 0}
+    }
 
 
 async def test_signal_counts_split_upheld_and_vetoed_triggers(tmp_path: Path) -> None:
@@ -265,7 +277,9 @@ async def test_signal_counts_split_upheld_and_vetoed_triggers(tmp_path: Path) ->
         "vetoed",
         "rolled_back",
     ]
-    assert result.signal_counts == {"no_file_change": {"upheld": 1, "vetoed": 1}}
+    assert result.signal_counts == {
+        "no_file_change": {"upheld": 1, "vetoed": 1, "suppressed": 0}
+    }
 
 
 async def test_runner_passes_bounded_tool_observations_to_fine_judge(
@@ -299,6 +313,7 @@ async def test_runner_passes_bounded_tool_observations_to_fine_judge(
                 error_window=10,
                 command_failure_window=10,
                 reward_stall_steps=10,
+                corroborating_signals=frozenset(),
             )
         ),
         fine_judge=CapturingJudge(),
@@ -464,6 +479,7 @@ async def test_long_detector_window_does_not_block_periodic_checkpoints(
             loop_repetitions=100,
             error_window=100,
             reward_stall_steps=100,
+            corroborating_signals=frozenset(),
         )
     )
 
@@ -525,3 +541,154 @@ async def test_unexpected_agent_exception_is_not_misreported_as_zero_cost(
 
     with pytest.raises(RuntimeError, match="usage accounting"):
         await runner.run(goal="account exactly", step=agent_step, initial_state={})
+
+
+class CountingJudge:
+    """A fine judge that would always roll back, and counts how often it is asked."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def judge(self, context: DriftContext) -> JudgeVerdict:
+        self.calls += 1
+        return JudgeVerdict(Verdict.DRIFTED, "off goal", tokens=17)
+
+
+async def test_corroborating_only_trigger_is_recorded_without_calling_the_judge(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+    judge = CountingJudge()
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"read file {context.logical_step}",
+            state={"turn": context.logical_step},
+            tokens=5,
+            completed=context.logical_step == 3,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=2,
+                loop_window=100,
+                loop_repetitions=100,
+                error_window=100,
+                command_failure_window=100,
+                reward_stall_steps=100,
+            )
+        ),
+        fine_judge=judge,
+        config=RunnerConfig(max_steps=3, checkpoint_interval=10),
+    ).run(goal="explore before writing", step=agent_step, initial_state={})
+
+    assert judge.calls == 0
+    assert result.status is RunStatus.COMPLETED
+    assert result.rollbacks == ()
+    assert result.judge_tokens_used == 0
+    assert result.tokens_used == 15
+
+    assert len(result.coarse_triggers) == 1
+    trigger = result.coarse_triggers[0]
+    assert trigger.logical_step == 2
+    assert [signal.kind for signal in trigger.signals] == ["no_file_change"]
+    assert trigger.outcome is DriftTriggerOutcome.SUPPRESSED
+    assert trigger.judge_status is FineJudgeStatus.NOT_INVOKED
+    assert trigger.judge_verdict is None
+    assert trigger.judge_reason is None
+    assert trigger.to_dict()["judge"] == {
+        "status": "not_invoked",
+        "verdict": None,
+        "reason": None,
+    }
+    assert result.signal_counts == {
+        "no_file_change": {"upheld": 0, "vetoed": 0, "suppressed": 1}
+    }
+
+
+async def test_a_second_signal_lifts_the_same_trajectory_to_the_judge(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+    judge = CountingJudge()
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action="ls -la",
+            state={"turn": context.logical_step},
+            tokens=5,
+            completed=context.logical_step == 3,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=2,
+                loop_window=2,
+                loop_repetitions=2,
+                error_window=100,
+                command_failure_window=100,
+                reward_stall_steps=100,
+            )
+        ),
+        fine_judge=judge,
+        config=RunnerConfig(max_steps=3, max_rollbacks=1, checkpoint_interval=10),
+    ).run(goal="stop repeating yourself", step=agent_step, initial_state={})
+
+    assert judge.calls == 1
+    assert len(result.rollbacks) == 1
+    assert result.coarse_triggers[0].outcome is DriftTriggerOutcome.ROLLED_BACK
+    assert {signal.kind for signal in result.coarse_triggers[0].signals} == {
+        "no_file_change",
+        "action_loop",
+    }
+    assert result.signal_counts["action_loop"] == {
+        "upheld": 1,
+        "vetoed": 0,
+        "suppressed": 0,
+    }
+
+
+def test_a_suppressed_trigger_cannot_carry_a_verdict() -> None:
+    signal = DriftSignal("no_file_change", "no files changed in the last 2 steps", 2)
+    with pytest.raises(ValueError, match="a fine judge that did not run"):
+        DriftTriggerRecord(
+            sequence=2,
+            logical_step=2,
+            signals=(signal,),
+            judge_status=FineJudgeStatus.NOT_INVOKED,
+            judge_verdict=Verdict.HEALTHY,
+            judge_reason="looks fine",
+            outcome=DriftTriggerOutcome.SUPPRESSED,
+        )
+
+
+def test_a_judged_trigger_cannot_be_recorded_as_suppressed() -> None:
+    signal = DriftSignal("no_file_change", "no files changed in the last 2 steps", 2)
+    with pytest.raises(ValueError, match="never saw"):
+        DriftTriggerRecord(
+            sequence=2,
+            logical_step=2,
+            signals=(signal,),
+            judge_status=FineJudgeStatus.VERDICT,
+            judge_verdict=Verdict.HEALTHY,
+            judge_reason="looks fine",
+            outcome=DriftTriggerOutcome.SUPPRESSED,
+        )
+
+
+def test_an_unasked_judge_cannot_be_recorded_as_a_veto() -> None:
+    signal = DriftSignal("no_file_change", "no files changed in the last 2 steps", 2)
+    with pytest.raises(ValueError, match="never saw"):
+        DriftTriggerRecord(
+            sequence=2,
+            logical_step=2,
+            signals=(signal,),
+            judge_status=FineJudgeStatus.NOT_INVOKED,
+            judge_verdict=None,
+            judge_reason=None,
+            outcome=DriftTriggerOutcome.VETOED,
+        )

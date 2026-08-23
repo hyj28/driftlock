@@ -199,6 +199,7 @@ def _result(
                 "driftlock_command_failure_rate": 1.0,
                 "driftlock_reward_stall_steps": 5,
                 "driftlock_reward_epsilon": 0.000001,
+                "driftlock_corroborating_signals": ["no_file_change"],
             }
         )
     payload = {
@@ -729,6 +730,97 @@ def test_analyze_names_detector_threshold_and_both_values_on_mismatch(
     assert "driftlock_no_change_steps" in message
     assert "driftlock-heuristic=4" in message
     assert "driftlock=7" in message
+
+
+def test_analyze_rejects_arms_that_gate_different_signals(tmp_path: Path) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(heuristic, "short-1", "short", 1.0, checksum=checksum)
+    driftlock_result = _result(driftlock, "short-1", "short", 1.0, checksum=checksum)
+    payload = json.loads(driftlock_result.read_text())
+    payload["config"]["agent"]["kwargs"]["driftlock_corroborating_signals"] = []
+    driftlock_result.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={
+                "stock": stock,
+                "driftlock-heuristic": heuristic,
+                "driftlock": driftlock,
+            },
+        )
+
+    message = str(caught.value)
+    assert "driftlock_corroborating_signals" in message
+    assert "driftlock-heuristic=('no_file_change',)" in message
+    assert "driftlock=()" in message
+
+
+def test_analyze_accepts_the_same_gate_written_in_a_different_order(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    for job in (heuristic, driftlock):
+        result_file = _result(job, "short-1", "short", 1.0, checksum=checksum)
+        payload = json.loads(result_file.read_text())
+        kwargs = payload["config"]["agent"]["kwargs"]
+        kwargs["driftlock_corroborating_signals"] = (
+            ["no_file_change", "reward_stall"]
+            if job is heuristic
+            else ["reward_stall", "no_file_change"]
+        )
+        result_file.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={
+            "stock": stock,
+            "driftlock-heuristic": heuristic,
+            "driftlock": driftlock,
+        },
+    )
+
+    # Accepted: order is not part of the configuration. The neighbouring test
+    # shows a genuinely different set is still rejected.
+    assert sorted(report["arms"]) == ["driftlock", "driftlock-heuristic", "stock"]
+
+
+def test_analyze_rejects_a_corroborating_gate_that_is_not_a_list_of_strings(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "driftlock"
+    result_file = _result(job, "short-1", "short", 1.0)
+    payload = json.loads(result_file.read_text())
+    payload["config"]["agent"]["kwargs"]["driftlock_corroborating_signals"] = (
+        "no_file_change"
+    )
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid driftlock_corroborating_signals"):
+        _validate_arm_identity(
+            payload,
+            "driftlock",
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            result_file,
+        )
 
 
 def test_arm_identity_rejects_legacy_config_without_detector_thresholds(

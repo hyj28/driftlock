@@ -95,6 +95,7 @@ def test_build_driftlock_config_records_every_detector_threshold(
             "driftlock_command_failure_rate",
             "driftlock_reward_stall_steps",
             "driftlock_reward_epsilon",
+            "driftlock_corroborating_signals",
         )
     } == {
         "driftlock_no_change_steps": 4,
@@ -106,6 +107,7 @@ def test_build_driftlock_config_records_every_detector_threshold(
         "driftlock_command_failure_rate": 1.0,
         "driftlock_reward_stall_steps": 5,
         "driftlock_reward_epsilon": 0.000001,
+        "driftlock_corroborating_signals": ["no_file_change"],
     }
 
 

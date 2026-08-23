@@ -675,8 +675,8 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
         },
     ]
     expected_counts = {
-        "action_loop": {"upheld": 2, "vetoed": 0},
-        "no_file_change": {"upheld": 2, "vetoed": 1},
+        "action_loop": {"upheld": 2, "vetoed": 0, "suppressed": 0},
+        "no_file_change": {"upheld": 2, "vetoed": 1, "suppressed": 0},
     }
     assert phase["signal_counts"] == expected_counts
     assert context.metadata["preserved"] == "yes"

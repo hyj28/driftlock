@@ -580,6 +580,9 @@ async def test_native_runtime_rolls_back_workspace_and_ephemeral_feedback(
             error_window=10,
             command_failure_window=10,
             reward_stall_steps=10,
+            # Empty so this fixture's only live detector (no_file_change) can
+            # still reach the fine judge; the gate is tested in test_heuristics.
+            corroborating_signals=frozenset(),
         ),
         fine_judge=judge,
         retain_checkpoints=True,
@@ -779,6 +782,9 @@ async def test_failed_restore_keeps_native_phase_recovery_archive(
             error_window=10,
             command_failure_window=10,
             reward_stall_steps=10,
+            # Empty so this fixture's only live detector (no_file_change) can
+            # still reach the fine judge; the gate is tested in test_heuristics.
+            corroborating_signals=frozenset(),
         ),
         fine_judge=DriftOnceJudge(),
         environment=environment,
@@ -820,6 +826,9 @@ async def test_process_cleanup_failure_aborts_before_workspace_restore(
             error_window=10,
             command_failure_window=10,
             reward_stall_steps=10,
+            # Empty so this fixture's only live detector (no_file_change) can
+            # still reach the fine judge; the gate is tested in test_heuristics.
+            corroborating_signals=frozenset(),
         ),
         fine_judge=DriftOnceJudge(),
         environment=environment,

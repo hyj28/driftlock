@@ -32,6 +32,7 @@ class FineJudgeStatus(StrEnum):
 
     VERDICT = "verdict"
     NOT_CONFIGURED = "not_configured"
+    NOT_INVOKED = "not_invoked"
 
 
 class DriftTriggerOutcome(StrEnum):
@@ -40,6 +41,7 @@ class DriftTriggerOutcome(StrEnum):
     ROLLED_BACK = "rolled_back"
     VETOED = "vetoed"
     ROLLBACK_LIMIT_REFUSED = "rollback_limit_refused"
+    SUPPRESSED = "suppressed"
 
 
 class StepTokenBudgetExhausted(RuntimeError):
@@ -219,11 +221,17 @@ class DriftTriggerRecord:
             raise ValueError("logical_step must be positive")
         if not self.signals:
             raise ValueError("a trigger record must contain at least one signal")
-        if self.judge_status is FineJudgeStatus.NOT_CONFIGURED:
+        if self.judge_status is not FineJudgeStatus.VERDICT:
             if self.judge_verdict is not None or self.judge_reason is not None:
-                raise ValueError("an unconfigured fine judge cannot have a verdict")
+                raise ValueError("a fine judge that did not run cannot have a verdict")
         elif self.judge_verdict is None or self.judge_reason is None:
             raise ValueError("a configured fine judge must have a verdict and reason")
+        suppressed = self.outcome is DriftTriggerOutcome.SUPPRESSED
+        not_invoked = self.judge_status is FineJudgeStatus.NOT_INVOKED
+        if suppressed != not_invoked:
+            raise ValueError(
+                "a suppressed trigger is exactly one the fine judge never saw"
+            )
         has_checkpoint_id = self.rollback_checkpoint_id is not None
         has_checkpoint_step = self.rollback_checkpoint_step is not None
         if has_checkpoint_id != has_checkpoint_step:
@@ -284,13 +292,22 @@ class RunResult:
 
     @property
     def signal_counts(self) -> dict[str, dict[str, int]]:
-        """Count signal occurrences by kind and upheld/vetoed disposition."""
+        """Count signal occurrences by kind and disposition.
+
+        ``suppressed`` counts triggers the coarse tier raised but never escalated,
+        because every signal in them was corroborating-only. They are separate from
+        ``vetoed`` because they cost no judge tokens and carry no verdict.
+        """
         counts: dict[str, dict[str, int]] = {}
+        dispositions = {
+            DriftTriggerOutcome.VETOED: "vetoed",
+            DriftTriggerOutcome.SUPPRESSED: "suppressed",
+        }
         for trigger in self.coarse_triggers:
-            disposition = (
-                "vetoed" if trigger.outcome is DriftTriggerOutcome.VETOED else "upheld"
-            )
+            disposition = dispositions.get(trigger.outcome, "upheld")
             for signal in trigger.signals:
-                kind_counts = counts.setdefault(signal.kind, {"upheld": 0, "vetoed": 0})
+                kind_counts = counts.setdefault(
+                    signal.kind, {"upheld": 0, "vetoed": 0, "suppressed": 0}
+                )
                 kind_counts[disposition] += 1
         return {kind: counts[kind] for kind in sorted(counts)}

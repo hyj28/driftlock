@@ -58,6 +58,7 @@ _DRIFTLOCK_DETECTOR_FIELDS = (
     "driftlock_command_failure_rate",
     "driftlock_reward_stall_steps",
     "driftlock_reward_epsilon",
+    "driftlock_corroborating_signals",
 )
 
 
@@ -850,7 +851,7 @@ def _validate_arm_identity(
 
 def _detector_settings(
     *, kwargs: dict[str, Any], arm: str, result_file: Path
-) -> dict[str, int | float] | None:
+) -> dict[str, Any] | None:
     if arm not in _DRIFTLOCK_DETECTOR_ARMS:
         return None
     missing = [field for field in _DRIFTLOCK_DETECTOR_FIELDS if field not in kwargs]
@@ -858,7 +859,20 @@ def _detector_settings(
         raise ValueError(
             f"arm {arm!r} is missing detector setting {missing[0]} in {result_file}"
         )
-    settings = {field: kwargs[field] for field in _DRIFTLOCK_DETECTOR_FIELDS}
+    settings: dict[str, Any] = {
+        field: kwargs[field] for field in _DRIFTLOCK_DETECTOR_FIELDS
+    }
+    raw_corroborating = settings["driftlock_corroborating_signals"]
+    if not isinstance(raw_corroborating, (list, tuple)) or not all(
+        isinstance(kind, str) for kind in raw_corroborating
+    ):
+        raise ValueError(
+            f"arm {arm!r} has invalid driftlock_corroborating_signals in {result_file}"
+        )
+    # Hashable and order-independent: two arms that list the same kinds in a
+    # different order are the same configuration, and the cross-arm comparison
+    # below puts these into a set.
+    settings["driftlock_corroborating_signals"] = tuple(sorted(set(raw_corroborating)))
     try:
         HeuristicConfig(
             no_change_steps=settings["driftlock_no_change_steps"],
@@ -870,6 +884,9 @@ def _detector_settings(
             command_failure_rate=settings["driftlock_command_failure_rate"],
             reward_stall_steps=settings["driftlock_reward_stall_steps"],
             reward_epsilon=settings["driftlock_reward_epsilon"],
+            corroborating_signals=frozenset(
+                settings["driftlock_corroborating_signals"]
+            ),
         )
     except (TypeError, ValueError) as error:
         raise ValueError(
@@ -1362,7 +1379,7 @@ def _validate_matrix(
     experiment_signatures: set[str] = set()
     arm_budgets: dict[str, set[int]] = defaultdict(set)
     arm_versions: dict[str, set[str]] = defaultdict(set)
-    detector_values: dict[str, dict[str, set[int | float]]] = {
+    detector_values: dict[str, dict[str, set[Any]]] = {
         field: defaultdict(set) for field in _DRIFTLOCK_DETECTOR_FIELDS
     }
     for arm, trials in trials_by_arm.items():

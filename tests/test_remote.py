@@ -857,6 +857,9 @@ async def test_runner_accepts_async_remote_checkpoint_store(tmp_path: Path) -> N
             loop_repetitions=2,
             error_window=2,
             reward_stall_steps=2,
+            # Empty so this fixture's only live detector (no_file_change) can
+            # still reach the fine judge; the gate is tested in test_heuristics.
+            corroborating_signals=frozenset(),
         )
     )
 

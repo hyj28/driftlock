@@ -182,7 +182,11 @@ class DriftlockRunner:
 
             signals = self.coarse_judge.evaluate(recent_steps)
             checkpoint_is_healthy = not signals
-            if signals:
+            if signals and not self.coarse_judge.initiates_review(signals):
+                # Corroborating-only: recorded so the detector's firing rate stays
+                # measurable, but not escalated and not billed.
+                coarse_triggers.append(self._suppressed_trigger_record(record, signals))
+            elif signals:
                 rollback_checkpoint = self._select_rollback_checkpoint(
                     checkpoint_lineage,
                     signals,
@@ -350,6 +354,21 @@ class DriftlockRunner:
     def _budget_exhausted(self, tokens_used: int) -> bool:
         return (
             self.config.max_tokens is not None and tokens_used >= self.config.max_tokens
+        )
+
+    def _suppressed_trigger_record(
+        self,
+        step: StepRecord,
+        signals: tuple[DriftSignal, ...],
+    ) -> DriftTriggerRecord:
+        return DriftTriggerRecord(
+            sequence=step.sequence,
+            logical_step=step.logical_step,
+            signals=signals,
+            judge_status=FineJudgeStatus.NOT_INVOKED,
+            judge_verdict=None,
+            judge_reason=None,
+            outcome=DriftTriggerOutcome.SUPPRESSED,
         )
 
     def _trigger_record(

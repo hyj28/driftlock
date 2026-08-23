@@ -169,11 +169,33 @@ share an agent, and the LHTB tasks, hidden verifiers, and scoring stay intact.
 
 | Tier | What it does | Cost |
 | --- | --- | --- |
-| **Coarse — heuristics** | No file changes for N steps, action loops, error-rate spikes, reward stalls | Zero tokens |
-| **Fine — LLM** | Once the coarse tier fires, hand (original goal + current plan + recent trajectory + file diff) to a cheap model to judge semantic drift | DeepSeek V4-Flash; negligible |
+| **Coarse — heuristics** | Action loops, error-rate spikes, sustained command failure, reward stalls | Zero tokens |
+| **Fine — LLM** | Once the coarse tier fires, hand (original goal + current plan + recent trajectory + file diff) to a cheap model to judge semantic drift | DeepSeek V4-Pro 0813; see §5.2 |
 
 A useful side effect: **heuristics-only / LLM-only / two-tier are three ready-made
 ablation arms.** The experiment design falls out of the architecture.
+
+**Not every signal may open a review.** A detector kind can be marked
+*corroborating*: it is passed to the fine judge as evidence when something else
+fires, but on its own it is recorded and dropped. `no_file_change` is
+corroborating, and it is the only one — measured, not assumed. The 2026-08-23
+diagnostic run (3 LHTB tasks, 462 steps, `driftlock` arm) raised it alone **109
+times and the fine judge rejected all 109**, while both rollbacks that did happen
+came from `action_loop` + `error_spike` + `no_file_change` firing together. 54% of
+the solo firings landed in the first fifth of a phase, in runs of up to 28
+consecutive steps — the detector was reporting exploration, which is reading
+rather than writing, as drift.
+
+Two consequences follow. The fine judge was **52% of that run's spend**
+($0.63 of $1.23) and roughly 80% of its calls came from a signal that never
+survived, so gating is a budget decision as much as a correctness one. And the
+`driftlock-heuristic` arm, which has no fine judge to veto anything, previously
+exhausted its rollback budget within 16–28 steps on 8/8 trials; gating is what
+makes it a comparable arm rather than a degenerate one.
+
+Suppressed triggers are still recorded, in their own `suppressed` bucket
+alongside `upheld` and `vetoed`, so a gated detector's firing rate stays
+measurable and the decision above stays re-checkable against later data.
 
 ### 3.3 Skill representation
 
@@ -420,6 +442,7 @@ the results section stays empty, per §1.
 | 9 | **Attribution against external baselines** — with subagents in the agent, comparisons to Memento / ReasoningBank / GEPA can't isolate which component won | Weaker external claim | Accepted. All four arms per benchmark share the same agent, so every *internal* comparison is clean; external numbers are cited as reference points, not as controlled comparisons |
 | 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
 | 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin |
+| 12 | **The corroborating gate is fitted on 3 tasks** — `no_file_change` was demoted on one diagnostic run: 109 solo firings, 109 rejected, 2 rollbacks total (§3.2). The tasks were chosen for their spread on the week-1 screen, not sampled, and a task where the agent genuinely stalls *without* looping would now be missed | Missed intervention; a knob fitted on the data it is judged by | The miss is in the safe direction — a gated detector makes the driftlock arm behave more like the no-intervention arm, which can only understate the effect. Suppressed triggers keep being recorded, so the held-out week-9 run re-measures the gate on tasks it was not fitted on: if solo `no_file_change` ever precedes a genuine stall there, the demotion is wrong and the record shows it |
 
 ---
 

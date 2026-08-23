@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from importlib.metadata import version
 from pathlib import Path
@@ -228,6 +229,7 @@ class LHTBDriftlockAgent(Terminus2):
         driftlock_command_failure_rate: float = 1.0,
         driftlock_reward_stall_steps: int = 5,
         driftlock_reward_epsilon: float = 1e-6,
+        driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
         driftlock_judge_max_output_tokens: int = 512,
@@ -259,6 +261,7 @@ class LHTBDriftlockAgent(Terminus2):
             command_failure_rate=driftlock_command_failure_rate,
             reward_stall_steps=driftlock_reward_stall_steps,
             reward_epsilon=driftlock_reward_epsilon,
+            corroborating_signals=frozenset(driftlock_corroborating_signals),
         )
         self._driftlock_judge_client = (
             None

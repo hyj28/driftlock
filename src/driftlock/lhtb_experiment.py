@@ -66,6 +66,7 @@ DRIFTLOCK_DETECTOR_DEFAULTS = {
     "driftlock_command_failure_rate": 1.0,
     "driftlock_reward_stall_steps": 5,
     "driftlock_reward_epsilon": 1e-6,
+    "driftlock_corroborating_signals": ["no_file_change"],
 }
 
 # SHA-256 of every Harbor file after applying the packaged version-10 patch to the
