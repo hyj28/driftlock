@@ -672,11 +672,21 @@ def test_packaged_harbor_patch_is_available() -> None:
     patch = lhtb.lhtb_harbor_patch_path()
 
     assert patch.is_file()
-    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 10" in patch.read_text()
-    assert "_driftlock_finalize_after_agent_run" in patch.read_text()
-    assert "cat >>" in patch.read_text()
-    assert "block=True" in patch.read_text()
-    assert "__driftlock_status=$?" not in patch.read_text()
+    text = patch.read_text()
+    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 11" in text
+    # The packaged patch writes the marker the installed module then verifies, so
+    # bumping one without the other would ship a tree preflight always rejects.
+    assert (
+        f"DRIFTLOCK_HARBOR_PATCH_VERSION = {lhtb.DRIFTLOCK_HARBOR_PATCH_VERSION}"
+        in text
+    )
+    assert "_driftlock_finalize_after_agent_run" in text
+    assert "cat >>" in text
+    assert "block=True" in text
+    assert "__driftlock_status=$?" not in text
+    # A batch that cannot reach a shell boundary goes back to the model as
+    # feedback; only the unreachable last line of defence still raises.
+    assert "_driftlock_boundary_feedback" in text
 
 
 def test_recording_rotation_stays_based_on_original_path() -> None:

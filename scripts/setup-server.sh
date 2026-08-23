@@ -28,7 +28,7 @@ ROOT_DIR="${ROOT_DIR:-/srv}"
 LHTB_REPO="https://github.com/zli12321/LHTB.git"
 LHTB_COMMIT="0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
 EXPECTED_LITELLM="1.83.14"
-EXPECTED_PATCH_VERSION=10
+EXPECTED_PATCH_VERSION=11
 
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\n\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -161,9 +161,12 @@ PY
 
 log "Running the no-network integration smoke tests"
 uv pip install --quiet --python harbor/.venv/bin/python pytest pytest-asyncio
+# The last of these lives in Harbor's own tree because the companion patch puts it
+# there; it is the only place the patched checkpoint-boundary behaviour is covered.
 harbor/.venv/bin/python -m pytest -q \
   "$DRIFTLOCK_DIR/integrations/lhtb/test_runtime_smoke.py" \
-  "$DRIFTLOCK_DIR/integrations/lhtb/test_harbor_agent.py"
+  "$DRIFTLOCK_DIR/integrations/lhtb/test_harbor_agent.py" \
+  harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 
 # ------------------------------------------------------------------------- done
 
