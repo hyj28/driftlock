@@ -491,6 +491,7 @@ def set_native_result_metadata(
         "tokens_used": result.tokens_used,
         "agent_tokens_used": result.agent_tokens_used,
         "judge_tokens_used": result.judge_tokens_used,
+        "signal_counts": result.signal_counts,
         "trial_tokens_used": runtime.tokens_consumed,
         "trial_token_budget": trial_token_budget,
     }

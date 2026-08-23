@@ -8,6 +8,8 @@ from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.models import (
     DriftContext,
+    DriftTriggerOutcome,
+    FineJudgeStatus,
     JudgeVerdict,
     RunStatus,
     StepContext,
@@ -83,8 +85,37 @@ async def test_runner_rolls_back_workspace_and_state_then_retries(
     assert result.status is RunStatus.COMPLETED
     assert result.state == {"value": "solved"}
     assert len(result.rollbacks) == 1
+    assert [record.sequence for record in result.steps] == [1, 2, 3]
+    assert [record.logical_step for record in result.steps] == [1, 2, 1]
     assert [record.attempt for record in result.steps] == [1, 1, 2]
+    assert [record.sequence for record in result.rollbacks] == [2]
     assert result.tokens_used == 25
+    assert result.agent_tokens_used == 25
+    assert result.judge_tokens_used == 0
+
+    assert len(result.coarse_triggers) == 1
+    trigger = result.coarse_triggers[0]
+    assert trigger.sequence == 2
+    assert trigger.logical_step == 2
+    assert trigger.judge_status is FineJudgeStatus.NOT_CONFIGURED
+    assert trigger.judge_verdict is None
+    assert trigger.judge_reason is None
+    assert trigger.outcome is DriftTriggerOutcome.ROLLED_BACK
+    assert trigger.rollback_checkpoint_id == result.checkpoints[0].checkpoint_id
+    assert trigger.rollback_checkpoint_step == 0
+    assert trigger.to_dict()["signals"] == [
+        {
+            "kind": "no_file_change",
+            "detail": "no files changed in the last 2 steps",
+            "lookback": 2,
+        }
+    ]
+    assert trigger.to_dict()["judge"] == {
+        "status": "not_configured",
+        "verdict": None,
+        "reason": None,
+    }
+    assert result.signal_counts == {"no_file_change": {"upheld": 1, "vetoed": 0}}
 
 
 async def test_fine_judge_can_veto_a_coarse_signal(tmp_path: Path) -> None:
@@ -106,6 +137,135 @@ async def test_fine_judge_can_veto_a_coarse_signal(tmp_path: Path) -> None:
 
     assert result.status is RunStatus.COMPLETED
     assert result.rollbacks == ()
+    assert len(result.coarse_triggers) == 1
+    trigger = result.coarse_triggers[0]
+    assert trigger.sequence == 2
+    assert trigger.logical_step == 2
+    assert trigger.judge_status is FineJudgeStatus.VERDICT
+    assert trigger.judge_verdict is Verdict.HEALTHY
+    assert trigger.judge_reason == "exploration is still on goal"
+    assert trigger.outcome is DriftTriggerOutcome.VETOED
+    assert trigger.rollback_checkpoint_id is None
+    assert trigger.rollback_checkpoint_step is None
+    assert trigger.to_dict()["signals"] == [
+        {
+            "kind": "no_file_change",
+            "detail": "no files changed in the last 2 steps",
+            "lookback": 2,
+        }
+    ]
+    assert result.signal_counts == {"no_file_change": {"upheld": 0, "vetoed": 1}}
+
+
+async def test_fine_judge_upheld_trigger_records_verdict_and_rollback_target(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+    judge = SequencedJudge(
+        JudgeVerdict(Verdict.DRIFTED, "the trajectory repeated", tokens=7)
+    )
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        if context.attempt == 1:
+            return StepOutcome(
+                action=f"inspect {context.logical_step}",
+                state={"attempt": 1},
+                tokens=3,
+            )
+        return StepOutcome(
+            action="finish",
+            state={"done": True},
+            changed_paths=("answer.txt",),
+            tokens=5,
+            completed=True,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=judge,
+        config=RunnerConfig(max_steps=3, max_rollbacks=1, checkpoint_interval=5),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert len(result.rollbacks) == 1
+    assert result.tokens_used == 18
+    assert result.agent_tokens_used == 11
+    assert result.judge_tokens_used == 7
+    assert len(result.coarse_triggers) == 1
+    trigger = result.coarse_triggers[0]
+    assert trigger.sequence == 2
+    assert trigger.logical_step == 2
+    assert trigger.judge_status is FineJudgeStatus.VERDICT
+    assert trigger.judge_verdict is Verdict.DRIFTED
+    assert trigger.judge_reason == "the trajectory repeated"
+    assert trigger.outcome is DriftTriggerOutcome.ROLLED_BACK
+    assert trigger.rollback_checkpoint_id == result.checkpoints[0].checkpoint_id
+    assert trigger.rollback_checkpoint_step == 0
+
+
+async def test_rollback_limit_records_refused_trigger_without_a_rollback(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"inspect {context.logical_step}",
+            state={"turn": context.logical_step},
+            tokens=4,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        config=RunnerConfig(max_steps=3, max_rollbacks=0, checkpoint_interval=5),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.ROLLBACK_LIMIT
+    assert [record.logical_step for record in result.steps] == [1, 2]
+    assert result.rollbacks == ()
+    assert result.tokens_used == 8
+    assert result.agent_tokens_used == 8
+    assert result.judge_tokens_used == 0
+    assert len(result.coarse_triggers) == 1
+    trigger = result.coarse_triggers[0]
+    assert trigger.sequence == 2
+    assert trigger.logical_step == 2
+    assert trigger.judge_status is FineJudgeStatus.NOT_CONFIGURED
+    assert trigger.judge_verdict is None
+    assert trigger.judge_reason is None
+    assert trigger.outcome is DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED
+    assert trigger.rollback_checkpoint_id is None
+    assert trigger.rollback_checkpoint_step is None
+    assert result.signal_counts == {"no_file_change": {"upheld": 1, "vetoed": 0}}
+
+
+async def test_signal_counts_split_upheld_and_vetoed_triggers(tmp_path: Path) -> None:
+    _workspace, store = _store(tmp_path)
+    judge = SequencedJudge(
+        JudgeVerdict(Verdict.HEALTHY, "first trigger is useful exploration"),
+        JudgeVerdict(Verdict.DRIFTED, "second trigger confirms drift"),
+    )
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"inspect {context.sequence}",
+            state={"turn": context.sequence},
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=judge,
+        config=RunnerConfig(max_steps=3, max_rollbacks=1, checkpoint_interval=5),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert [trigger.outcome.value for trigger in result.coarse_triggers] == [
+        "vetoed",
+        "rolled_back",
+    ]
+    assert result.signal_counts == {"no_file_change": {"upheld": 1, "vetoed": 1}}
 
 
 async def test_runner_passes_bounded_tool_observations_to_fine_judge(
@@ -237,6 +397,8 @@ async def test_runner_creates_periodic_healthy_checkpoints(tmp_path: Path) -> No
     assert result.status is RunStatus.COMPLETED
     assert [checkpoint.step for checkpoint in result.checkpoints] == [0, 2, 4]
     assert result.checkpoints[1].parent_id == result.checkpoints[0].checkpoint_id
+    assert result.coarse_triggers == ()
+    assert result.signal_counts == {}
 
 
 async def test_uncertain_verdict_never_advances_healthy_checkpoint(

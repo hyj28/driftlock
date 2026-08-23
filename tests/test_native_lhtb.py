@@ -529,6 +529,7 @@ def test_native_metadata_writers_publish_literal_result_and_budget_fields() -> N
             "tokens_used": 17,
             "agent_tokens_used": 12,
             "judge_tokens_used": 5,
+            "signal_counts": {},
             "trial_tokens_used": 29,
             "trial_token_budget": 100,
         },

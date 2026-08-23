@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
 
 from driftlock.lhtb import openrouter_provider_from_call_kwargs
+from driftlock.models import (
+    DriftSignal,
+    DriftTriggerOutcome,
+    DriftTriggerRecord,
+    FineJudgeStatus,
+    RollbackRecord,
+    RunResult,
+    RunStatus,
+    Verdict,
+)
+from driftlock.runner import RunnerConfig
 
 
 class _FakeBaseAgent:
@@ -367,3 +379,195 @@ def test_native_agent_forwards_only_audited_call_kwargs_to_litellm(
                 "output_cost_per_token": 0,
             },
         )
+
+
+def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    no_change = DriftSignal(
+        "no_file_change",
+        "no files changed in the last 2 steps",
+        lookback=2,
+    )
+    action_loop = DriftSignal(
+        "action_loop",
+        "the same action appeared 2 times in the last 2 steps",
+        lookback=2,
+    )
+    result = RunResult(
+        status=RunStatus.ROLLBACK_LIMIT,
+        state={"turn": 3},
+        steps=(),
+        rollbacks=(
+            RollbackRecord(
+                sequence=3,
+                checkpoint_id="checkpoint-1",
+                signals=(no_change, action_loop),
+                reason="confirmed drift",
+            ),
+        ),
+        checkpoints=(),
+        tokens_used=19,
+        agent_tokens_used=14,
+        judge_tokens_used=5,
+        coarse_triggers=(
+            DriftTriggerRecord(
+                sequence=2,
+                logical_step=2,
+                signals=(no_change,),
+                judge_status=FineJudgeStatus.VERDICT,
+                judge_verdict=Verdict.HEALTHY,
+                judge_reason="useful exploration",
+                outcome=DriftTriggerOutcome.VETOED,
+            ),
+            DriftTriggerRecord(
+                sequence=3,
+                logical_step=3,
+                signals=(no_change, action_loop),
+                judge_status=FineJudgeStatus.VERDICT,
+                judge_verdict=Verdict.DRIFTED,
+                judge_reason="confirmed drift",
+                outcome=DriftTriggerOutcome.ROLLED_BACK,
+                rollback_checkpoint_id="checkpoint-1",
+                rollback_checkpoint_step=1,
+            ),
+            DriftTriggerRecord(
+                sequence=4,
+                logical_step=2,
+                signals=(no_change, action_loop),
+                judge_status=FineJudgeStatus.VERDICT,
+                judge_verdict=Verdict.DRIFTED,
+                judge_reason="rollback budget exhausted",
+                outcome=DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED,
+            ),
+        ),
+    )
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+    agent._driftlock_tokens_consumed = 23
+    agent._driftlock_runner_config = RunnerConfig(max_tokens=100)
+    phase_store = tmp_path / "phase-0"
+
+    agent._write_phase_record(result, phase_store, retained=False)
+    context = SimpleNamespace(metadata={"preserved": "yes"})
+    agent._set_result_metadata(context, result)
+
+    payload = json.loads((tmp_path / "driftlock-result.json").read_text())
+    phase = payload["phases"][0]
+    assert phase["phase"] == 0
+    assert phase["checkpoint_dir"] == str(phase_store)
+    assert phase["checkpoints_retained"] is False
+    assert phase["status"] == "rollback_limit"
+    assert phase["steps"] == 0
+    assert phase["rollbacks"] == 1
+    assert phase["tokens_used"] == 19
+    assert phase["checkpoint_count"] == 0
+    assert phase["coarse_triggers"] == [
+        {
+            "sequence": 2,
+            "logical_step": 2,
+            "signals": [
+                {
+                    "kind": "no_file_change",
+                    "detail": "no files changed in the last 2 steps",
+                    "lookback": 2,
+                }
+            ],
+            "judge": {
+                "status": "verdict",
+                "verdict": "healthy",
+                "reason": "useful exploration",
+            },
+            "outcome": "vetoed",
+            "rollback_checkpoint": None,
+        },
+        {
+            "sequence": 3,
+            "logical_step": 3,
+            "signals": [
+                {
+                    "kind": "no_file_change",
+                    "detail": "no files changed in the last 2 steps",
+                    "lookback": 2,
+                },
+                {
+                    "kind": "action_loop",
+                    "detail": ("the same action appeared 2 times in the last 2 steps"),
+                    "lookback": 2,
+                },
+            ],
+            "judge": {
+                "status": "verdict",
+                "verdict": "drifted",
+                "reason": "confirmed drift",
+            },
+            "outcome": "rolled_back",
+            "rollback_checkpoint": {
+                "checkpoint_id": "checkpoint-1",
+                "step": 1,
+            },
+        },
+        {
+            "sequence": 4,
+            "logical_step": 2,
+            "signals": [
+                {
+                    "kind": "no_file_change",
+                    "detail": "no files changed in the last 2 steps",
+                    "lookback": 2,
+                },
+                {
+                    "kind": "action_loop",
+                    "detail": ("the same action appeared 2 times in the last 2 steps"),
+                    "lookback": 2,
+                },
+            ],
+            "judge": {
+                "status": "verdict",
+                "verdict": "drifted",
+                "reason": "rollback budget exhausted",
+            },
+            "outcome": "rollback_limit_refused",
+            "rollback_checkpoint": None,
+        },
+    ]
+    expected_counts = {
+        "action_loop": {"upheld": 2, "vetoed": 0},
+        "no_file_change": {"upheld": 2, "vetoed": 1},
+    }
+    assert phase["signal_counts"] == expected_counts
+    assert context.metadata["preserved"] == "yes"
+    assert context.metadata["driftlock"]["signal_counts"] == expected_counts
+
+    native = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    native.logs_dir = tmp_path
+    native._native_phases = []
+    native._native_retain_checkpoints = False
+    native._write_phase_record(result)
+
+    native_payload = json.loads((tmp_path / "driftlock-native-result.json").read_text())
+    native_phase = native_payload["phases"][0]
+    assert native_phase["phase"] == 0
+    assert native_phase["status"] == "rollback_limit"
+    assert native_phase["coarse_triggers"] == phase["coarse_triggers"]
+    assert native_phase["signal_counts"] == expected_counts
+
+    empty_result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={"done": True},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+    )
+    agent._write_phase_record(empty_result, tmp_path / "phase-1", retained=False)
+    empty_phase = json.loads((tmp_path / "driftlock-result.json").read_text())[
+        "phases"
+    ][1]
+    assert empty_phase["coarse_triggers"] == []
+    assert empty_phase["signal_counts"] == {}

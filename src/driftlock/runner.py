@@ -13,6 +13,9 @@ from driftlock.models import (
     Checkpoint,
     DriftContext,
     DriftSignal,
+    DriftTriggerOutcome,
+    DriftTriggerRecord,
+    FineJudgeStatus,
     JudgeVerdict,
     RollbackRecord,
     RunResult,
@@ -89,6 +92,7 @@ class DriftlockRunner:
         all_steps: list[StepRecord] = []
         recent_steps: list[StepRecord] = []
         rollbacks: list[RollbackRecord] = []
+        coarse_triggers: list[DriftTriggerRecord] = []
         agent_tokens_used = 0
         judge_tokens_used = 0
         logical_step = 0
@@ -117,6 +121,7 @@ class DriftlockRunner:
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
@@ -151,6 +156,7 @@ class DriftlockRunner:
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
@@ -166,6 +172,7 @@ class DriftlockRunner:
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
@@ -196,11 +203,20 @@ class DriftlockRunner:
                 )
                 if should_rollback:
                     if len(rollbacks) >= self.config.max_rollbacks:
+                        coarse_triggers.append(
+                            self._trigger_record(
+                                record,
+                                signals,
+                                verdict,
+                                DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED,
+                            )
+                        )
                         return await self._finish(
                             RunStatus.ROLLBACK_LIMIT,
                             state,
                             all_steps,
                             rollbacks,
+                            coarse_triggers,
                             checkpoints,
                             agent_tokens_used,
                             judge_tokens_used,
@@ -209,6 +225,15 @@ class DriftlockRunner:
                         )
                     checkpoint = rollback_checkpoint
                     state = await self._restore_checkpoint(checkpoint)
+                    coarse_triggers.append(
+                        self._trigger_record(
+                            record,
+                            signals,
+                            verdict,
+                            DriftTriggerOutcome.ROLLED_BACK,
+                            rollback_checkpoint=checkpoint,
+                        )
+                    )
                     rollbacks.append(
                         RollbackRecord(
                             sequence=sequence,
@@ -229,6 +254,7 @@ class DriftlockRunner:
                             state,
                             all_steps,
                             rollbacks,
+                            coarse_triggers,
                             checkpoints,
                             agent_tokens_used,
                             judge_tokens_used,
@@ -236,6 +262,14 @@ class DriftlockRunner:
                             logical_step=logical_step,
                         )
                     continue
+                coarse_triggers.append(
+                    self._trigger_record(
+                        record,
+                        signals,
+                        verdict,
+                        DriftTriggerOutcome.VETOED,
+                    )
+                )
                 checkpoint_is_healthy = verdict.verdict is Verdict.HEALTHY
 
             if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
@@ -244,6 +278,7 @@ class DriftlockRunner:
                     state,
                     all_steps,
                     rollbacks,
+                    coarse_triggers,
                     checkpoints,
                     agent_tokens_used,
                     judge_tokens_used,
@@ -270,6 +305,7 @@ class DriftlockRunner:
             state,
             all_steps,
             rollbacks,
+            coarse_triggers,
             checkpoints,
             agent_tokens_used,
             judge_tokens_used,
@@ -316,6 +352,38 @@ class DriftlockRunner:
             self.config.max_tokens is not None and tokens_used >= self.config.max_tokens
         )
 
+    def _trigger_record(
+        self,
+        step: StepRecord,
+        signals: tuple[DriftSignal, ...],
+        verdict: JudgeVerdict,
+        outcome: DriftTriggerOutcome,
+        *,
+        rollback_checkpoint: Checkpoint | None = None,
+    ) -> DriftTriggerRecord:
+        judge_configured = self.fine_judge is not None
+        return DriftTriggerRecord(
+            sequence=step.sequence,
+            logical_step=step.logical_step,
+            signals=signals,
+            judge_status=(
+                FineJudgeStatus.VERDICT
+                if judge_configured
+                else FineJudgeStatus.NOT_CONFIGURED
+            ),
+            judge_verdict=verdict.verdict if judge_configured else None,
+            judge_reason=verdict.reason if judge_configured else None,
+            outcome=outcome,
+            rollback_checkpoint_id=(
+                rollback_checkpoint.checkpoint_id
+                if rollback_checkpoint is not None
+                else None
+            ),
+            rollback_checkpoint_step=(
+                rollback_checkpoint.step if rollback_checkpoint is not None else None
+            ),
+        )
+
     @staticmethod
     def _select_rollback_checkpoint(
         checkpoint_lineage: list[Checkpoint],
@@ -360,6 +428,7 @@ class DriftlockRunner:
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
+        coarse_triggers: list[DriftTriggerRecord],
         checkpoints: list[Checkpoint],
         agent_tokens_used: int,
         judge_tokens_used: int,
@@ -373,6 +442,7 @@ class DriftlockRunner:
             tokens_used=agent_tokens_used + judge_tokens_used,
             agent_tokens_used=agent_tokens_used,
             judge_tokens_used=judge_tokens_used,
+            coarse_triggers=tuple(coarse_triggers),
         )
 
     async def _finish(
@@ -381,6 +451,7 @@ class DriftlockRunner:
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
+        coarse_triggers: list[DriftTriggerRecord],
         checkpoints: list[Checkpoint],
         agent_tokens_used: int,
         judge_tokens_used: int,
@@ -401,6 +472,7 @@ class DriftlockRunner:
             state,
             steps,
             rollbacks,
+            coarse_triggers,
             checkpoints,
             agent_tokens_used,
             judge_tokens_used,

@@ -284,6 +284,9 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             runtime=runtime,
             trial_token_budget=self._native_runner_config.max_tokens,
         )
+        self._write_phase_record(result)
+
+    def _write_phase_record(self, result: RunResult) -> None:
         record = {
             "phase": len(self._native_phases),
             "status": result.status.value,
@@ -292,6 +295,10 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             "tokens_used": result.tokens_used,
             "checkpoint_count": len(result.checkpoints),
             "checkpoints_retained": self._native_retain_checkpoints,
+            "coarse_triggers": [
+                trigger.to_dict() for trigger in result.coarse_triggers
+            ],
+            "signal_counts": result.signal_counts,
         }
         self._native_phases.append(record)
         output = Path(self.logs_dir) / "driftlock-native-result.json"

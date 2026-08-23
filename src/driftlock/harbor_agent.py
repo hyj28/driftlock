@@ -460,6 +460,7 @@ class LHTBDriftlockAgent(Terminus2):
             "tokens_used": result.tokens_used,
             "agent_tokens_used": result.agent_tokens_used,
             "judge_tokens_used": result.judge_tokens_used,
+            "signal_counts": result.signal_counts,
             "trial_tokens_used": self._driftlock_tokens_consumed,
             "trial_token_budget": self._driftlock_runner_config.max_tokens,
         }
@@ -489,6 +490,10 @@ class LHTBDriftlockAgent(Terminus2):
                     "rollbacks": len(result.rollbacks),
                     "tokens_used": result.tokens_used,
                     "checkpoint_count": len(result.checkpoints),
+                    "coarse_triggers": [
+                        trigger.to_dict() for trigger in result.coarse_triggers
+                    ],
+                    "signal_counts": result.signal_counts,
                 }
             )
         self._driftlock_phases.append(record)
