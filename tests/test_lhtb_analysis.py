@@ -180,6 +180,27 @@ def _result(
                     },
                 }
             )
+    if resolved_arm in {
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    }:
+        kwargs = agent_config["kwargs"]
+        assert isinstance(kwargs, dict)
+        kwargs.update(
+            {
+                "driftlock_no_change_steps": 4,
+                "driftlock_loop_window": 6,
+                "driftlock_loop_repetitions": 3,
+                "driftlock_error_window": 5,
+                "driftlock_error_rate": 0.6,
+                "driftlock_command_failure_window": 8,
+                "driftlock_command_failure_rate": 1.0,
+                "driftlock_reward_stall_steps": 5,
+                "driftlock_reward_epsilon": 0.000001,
+            }
+        )
     payload = {
         "id": str(uuid5(NAMESPACE_URL, f"{job.resolve()}:{trial}")),
         "task_name": result_task,
@@ -645,6 +666,98 @@ def test_arm_identity_accepts_matching_provider_and_names_mismatch(
     message = str(caught.value)
     assert "sail-research/fp4" in message
     assert "baidu/fp8" in message
+
+
+def test_analyze_accepts_matching_detector_thresholds_across_controlled_arms(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(heuristic, "short-1", "short", 1.0, checksum=checksum)
+    _result(driftlock, "short-1", "short", 1.0, checksum=checksum)
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={
+            "stock": stock,
+            "driftlock-heuristic": heuristic,
+            "driftlock": driftlock,
+        },
+    )
+
+    assert report["matrix"]["complete"] is True
+
+
+def test_analyze_names_detector_threshold_and_both_values_on_mismatch(
+    tmp_path: Path,
+) -> None:
+    lhtb = tmp_path / "LHTB"
+    _task(lhtb, "short", expert_minutes=60, category="build")
+    checksum = _task_directory_sha256(lhtb / "tasks" / "short")
+    stock = tmp_path / "stock"
+    heuristic = tmp_path / "driftlock-heuristic"
+    driftlock = tmp_path / "driftlock"
+    _result(stock, "short-1", "short", 0.0, checksum=checksum)
+    _result(heuristic, "short-1", "short", 1.0, checksum=checksum)
+    driftlock_result = _result(driftlock, "short-1", "short", 1.0, checksum=checksum)
+    payload = json.loads(driftlock_result.read_text())
+    payload["config"]["agent"]["kwargs"]["driftlock_no_change_steps"] = 7
+    driftlock_result.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 1)
+    _job_summary(heuristic, 1)
+    _job_summary(driftlock, 1)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={
+                "stock": stock,
+                "driftlock-heuristic": heuristic,
+                "driftlock": driftlock,
+            },
+        )
+
+    message = str(caught.value)
+    assert "driftlock_no_change_steps" in message
+    assert "driftlock-heuristic=4" in message
+    assert "driftlock=7" in message
+
+
+def test_arm_identity_rejects_legacy_config_without_detector_thresholds(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "driftlock"
+    result_file = _result(job, "short-1", "short", 1.0)
+    payload = json.loads(result_file.read_text())
+    kwargs = payload["config"]["agent"]["kwargs"]
+    for name in tuple(kwargs):
+        if name.startswith("driftlock_") and name not in {
+            "driftlock_max_tokens",
+            "driftlock_max_steps",
+            "driftlock_max_rollbacks",
+            "driftlock_checkpoint_interval",
+            "driftlock_judge_model",
+            "driftlock_judge_api_base",
+            "driftlock_judge_max_output_tokens",
+            "driftlock_judge_llm_call_kwargs",
+        }:
+            del kwargs[name]
+
+    with pytest.raises(ValueError, match="missing detector setting"):
+        _validate_arm_identity(
+            payload,
+            "driftlock",
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            result_file,
+        )
 
 
 def test_analyze_rejects_trial_provider_different_from_canonical_arm_lock(

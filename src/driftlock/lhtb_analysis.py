@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from driftlock.heuristics import HeuristicConfig
 from driftlock.lhtb import (
     LHTB_REPOSITORY_REVISION,
     lhtb_experiment_fingerprint,
@@ -39,6 +40,25 @@ NATIVE_ANALYSIS_ARMS = ("native-driftlock-heuristic", "native-driftlock")
 _ACCEPTED_ANALYSIS_ARMS = (*ANALYSIS_ARMS, *NATIVE_ANALYSIS_ARMS)
 SOLVE_THRESHOLD = 0.95
 _FINE_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
+_DRIFTLOCK_DETECTOR_ARMS = frozenset(
+    {
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    }
+)
+_DRIFTLOCK_DETECTOR_FIELDS = (
+    "driftlock_no_change_steps",
+    "driftlock_loop_window",
+    "driftlock_loop_repetitions",
+    "driftlock_error_window",
+    "driftlock_error_rate",
+    "driftlock_command_failure_window",
+    "driftlock_command_failure_rate",
+    "driftlock_reward_stall_steps",
+    "driftlock_reward_epsilon",
+)
 
 
 def goal_drift_actions(
@@ -499,6 +519,9 @@ def _load_trial(
         "judge_provider": judge_provider,
         "agent_version": data["agent_info"]["version"],
         "total_token_budget": total_token_budget,
+        "detector_settings": _detector_settings(
+            kwargs=data["config"]["agent"]["kwargs"], arm=arm, result_file=result_file
+        ),
         "experiment_signature": experiment_signature,
         "lock_trial_signature": _lock_trial_signature(task, data["config"]),
         "expert_time_estimate_min": task_metadata["expert_time_estimate_min"],
@@ -787,6 +810,9 @@ def _validate_arm_identity(
         "driftlock_max_rollbacks",
         "driftlock_checkpoint_interval",
     }
+    if arm in _DRIFTLOCK_DETECTOR_ARMS:
+        _detector_settings(kwargs=kwargs, arm=arm, result_file=result_file)
+        expected_keys.update(_DRIFTLOCK_DETECTOR_FIELDS)
     if "driftlock_retain_checkpoints" in kwargs:
         if (
             arm not in {"driftlock-heuristic", "driftlock"}
@@ -820,6 +846,36 @@ def _validate_arm_identity(
     if set(kwargs) != expected_keys:
         raise ValueError(f"arm {arm!r} has unexpected agent settings: {result_file}")
     return budget, experiment_signature
+
+
+def _detector_settings(
+    *, kwargs: dict[str, Any], arm: str, result_file: Path
+) -> dict[str, int | float] | None:
+    if arm not in _DRIFTLOCK_DETECTOR_ARMS:
+        return None
+    missing = [field for field in _DRIFTLOCK_DETECTOR_FIELDS if field not in kwargs]
+    if missing:
+        raise ValueError(
+            f"arm {arm!r} is missing detector setting {missing[0]} in {result_file}"
+        )
+    settings = {field: kwargs[field] for field in _DRIFTLOCK_DETECTOR_FIELDS}
+    try:
+        HeuristicConfig(
+            no_change_steps=settings["driftlock_no_change_steps"],
+            loop_window=settings["driftlock_loop_window"],
+            loop_repetitions=settings["driftlock_loop_repetitions"],
+            error_window=settings["driftlock_error_window"],
+            error_rate=settings["driftlock_error_rate"],
+            command_failure_window=settings["driftlock_command_failure_window"],
+            command_failure_rate=settings["driftlock_command_failure_rate"],
+            reward_stall_steps=settings["driftlock_reward_stall_steps"],
+            reward_epsilon=settings["driftlock_reward_epsilon"],
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"arm {arm!r} has invalid detector settings in {result_file}: {error}"
+        ) from error
+    return settings
 
 
 def _validate_oracle_identity(
@@ -1306,6 +1362,9 @@ def _validate_matrix(
     experiment_signatures: set[str] = set()
     arm_budgets: dict[str, set[int]] = defaultdict(set)
     arm_versions: dict[str, set[str]] = defaultdict(set)
+    detector_values: dict[str, dict[str, set[int | float]]] = {
+        field: defaultdict(set) for field in _DRIFTLOCK_DETECTOR_FIELDS
+    }
     for arm, trials in trials_by_arm.items():
         counts: dict[str, int] = defaultdict(int)
         for trial in trials:
@@ -1320,6 +1379,10 @@ def _validate_matrix(
             arm_versions[arm].add(trial["agent_version"])
             if trial["total_token_budget"] is not None:
                 arm_budgets[arm].add(trial["total_token_budget"])
+            settings = trial["detector_settings"]
+            if settings is not None:
+                for field in _DRIFTLOCK_DETECTOR_FIELDS:
+                    detector_values[field][arm].add(settings[field])
         task_counts[arm] = dict(sorted(counts.items()))
     mismatched_checksums = sorted(
         task for task, checksums in task_checksums.items() if len(checksums) != 1
@@ -1342,6 +1405,16 @@ def _validate_matrix(
             "fine-judge arms use different providers: "
             + ", ".join(sorted(judge_providers))
         )
+    for field, values_by_arm in detector_values.items():
+        distinct_values = {
+            value for arm_values in values_by_arm.values() for value in arm_values
+        }
+        if len(distinct_values) > 1:
+            details = ", ".join(
+                f"{arm}={'/'.join(repr(value) for value in sorted(values))}"
+                for arm, values in sorted(values_by_arm.items())
+            )
+            raise ValueError(f"controlled arms use different {field}: {details}")
     if len(experiment_signatures) != 1:
         raise ValueError("experiment arms use different non-treatment configurations")
     inconsistent_version_arms = sorted(

@@ -63,6 +63,70 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
 @pytest.mark.parametrize(
     "arm",
     [
+        "driftlock-heuristic",
+        "driftlock",
+        "native-driftlock-heuristic",
+        "native-driftlock",
+    ],
+)
+def test_build_driftlock_config_records_every_detector_threshold(
+    tmp_path: Path, arm: str
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name=f"detectors-{arm}",
+        arm=arm,
+        tasks=["task-a"],
+    )
+
+    kwargs = config["agents"][0]["kwargs"]
+    assert {
+        name: kwargs[name]
+        for name in (
+            "driftlock_no_change_steps",
+            "driftlock_loop_window",
+            "driftlock_loop_repetitions",
+            "driftlock_error_window",
+            "driftlock_error_rate",
+            "driftlock_command_failure_window",
+            "driftlock_command_failure_rate",
+            "driftlock_reward_stall_steps",
+            "driftlock_reward_epsilon",
+        )
+    } == {
+        "driftlock_no_change_steps": 4,
+        "driftlock_loop_window": 6,
+        "driftlock_loop_repetitions": 3,
+        "driftlock_error_window": 5,
+        "driftlock_error_rate": 0.6,
+        "driftlock_command_failure_window": 8,
+        "driftlock_command_failure_rate": 1.0,
+        "driftlock_reward_stall_steps": 5,
+        "driftlock_reward_epsilon": 0.000001,
+    }
+
+
+def test_build_stock_config_has_no_detector_thresholds(tmp_path: Path) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+
+    config = build_job_config(
+        lhtb_dir=root,
+        jobs_dir=tmp_path / "jobs",
+        job_name="stock-without-detectors",
+        arm="stock",
+        tasks=["task-a"],
+    )
+
+    kwargs = config["agents"][0]["kwargs"]
+    assert not any(name.startswith("driftlock_") for name in kwargs)
+
+
+@pytest.mark.parametrize(
+    "arm",
+    [
         "stock",
         "retry",
         "driftlock-heuristic",

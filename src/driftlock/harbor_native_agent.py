@@ -127,7 +127,10 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_loop_repetitions: int = 3,
         driftlock_error_window: int = 5,
         driftlock_error_rate: float = 0.6,
+        driftlock_command_failure_window: int = 8,
+        driftlock_command_failure_rate: float = 1.0,
         driftlock_reward_stall_steps: int = 5,
+        driftlock_reward_epsilon: float = 1e-6,
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
         driftlock_judge_max_output_tokens: int = 512,
@@ -191,7 +194,10 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             loop_repetitions=driftlock_loop_repetitions,
             error_window=driftlock_error_window,
             error_rate=driftlock_error_rate,
+            command_failure_window=driftlock_command_failure_window,
+            command_failure_rate=driftlock_command_failure_rate,
             reward_stall_steps=driftlock_reward_stall_steps,
+            reward_epsilon=driftlock_reward_epsilon,
         )
         self._native_judge_client = (
             None

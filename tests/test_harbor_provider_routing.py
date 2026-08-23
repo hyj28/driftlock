@@ -10,7 +10,9 @@ from typing import Any, ClassVar
 
 import pytest
 
+from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.lhtb import openrouter_provider_from_call_kwargs
+from driftlock.lhtb_experiment import build_job_config
 from driftlock.models import (
     Checkpoint,
     DriftSignal,
@@ -20,6 +22,8 @@ from driftlock.models import (
     RollbackRecord,
     RunResult,
     RunStatus,
+    StepOutcome,
+    StepRecord,
     Verdict,
 )
 from driftlock.runner import RunnerConfig
@@ -381,6 +385,139 @@ def test_native_agent_forwards_only_audited_call_kwargs_to_litellm(
                 "output_cost_per_token": 0,
             },
         )
+
+
+def test_generated_config_constructs_unchanged_terminus_detector_behavior(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+    task = tmp_path / "LHTB" / "tasks" / "task-a"
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        "[task]\nname = 'long-horizon-terminal-bench/task-a'\n",
+        encoding="utf-8",
+    )
+    config = build_job_config(
+        lhtb_dir=tmp_path / "LHTB",
+        jobs_dir=tmp_path / "jobs",
+        job_name="detector-construction",
+        arm="driftlock-heuristic",
+        tasks=["task-a"],
+    )
+    agent_config = config["agents"][0]
+    agent = harbor_agent.LHTBDriftlockAgent(
+        model_name=agent_config["model_name"], **agent_config["kwargs"]
+    )
+
+    assert agent._driftlock_heuristic_config == HeuristicConfig(
+        no_change_steps=4,
+        loop_window=6,
+        loop_repetitions=3,
+        error_window=5,
+        error_rate=0.6,
+        command_failure_window=8,
+        command_failure_rate=1.0,
+        reward_stall_steps=5,
+        reward_epsilon=0.000001,
+    )
+
+    def record(
+        sequence: int,
+        *,
+        action: str,
+        changed: bool = True,
+        error: str | None = None,
+        commands_run: int = 0,
+        commands_failed: int = 0,
+        reward: float | None = None,
+    ) -> StepRecord:
+        return StepRecord(
+            sequence=sequence,
+            logical_step=sequence,
+            attempt=1,
+            outcome=StepOutcome(
+                action=action,
+                state={},
+                changed_paths=(f"file-{sequence}",) if changed else (),
+                error=error,
+                commands_run=commands_run,
+                commands_failed=commands_failed,
+                reward=reward,
+            ),
+        )
+
+    judge = HeuristicJudge(agent._driftlock_heuristic_config)
+    no_change = [
+        record(sequence, action=f"inspect-{sequence}", changed=False)
+        for sequence in range(1, 5)
+    ]
+    loop = [
+        record(sequence, action=action)
+        for sequence, action in enumerate(
+            ("repeat", "edit-a", "repeat", "edit-b", "repeat", "edit-c"),
+            start=1,
+        )
+    ]
+    errors = [
+        record(
+            sequence,
+            action=f"error-{sequence}",
+            error="failed" if sequence <= 3 else None,
+        )
+        for sequence in range(1, 6)
+    ]
+    commands = [
+        record(
+            sequence,
+            action=f"command-{sequence}",
+            commands_run=1,
+            commands_failed=1,
+        )
+        for sequence in range(1, 9)
+    ]
+    rewards = [
+        record(sequence, action=f"reward-{sequence}", reward=reward)
+        for sequence, reward in enumerate((0.0, 0.000001, 0.0, 0.000001, 0.0), start=1)
+    ]
+
+    for steps, expected in (
+        (no_change, ("no_file_change", 4)),
+        (loop, ("action_loop", 6)),
+        (errors, ("error_spike", 5)),
+        (commands, ("sustained_command_failure", 8)),
+        (rewards, ("reward_stall", 5)),
+    ):
+        assert judge.evaluate(steps[:-1]) == ()
+        assert [(signal.kind, signal.lookback) for signal in judge.evaluate(steps)] == [
+            expected
+        ]
+
+    commands[3] = record(
+        4,
+        action="command-4",
+        commands_run=2,
+        commands_failed=1,
+    )
+    assert judge.evaluate(commands) == ()
+    rewards[-1] = record(5, action="reward-5", reward=0.0000011)
+    assert judge.evaluate(rewards) == ()
+
+
+def test_terminus_agent_accepts_command_failure_detector_settings(
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+
+    agent = harbor_agent.LHTBDriftlockAgent(
+        model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+        llm_call_kwargs=_agent_call_kwargs(),
+        driftlock_command_failure_window=3,
+        driftlock_command_failure_rate=0.5,
+    )
+
+    assert agent._driftlock_heuristic_config.command_failure_window == 3
+    assert agent._driftlock_heuristic_config.command_failure_rate == 0.5
 
 
 def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(

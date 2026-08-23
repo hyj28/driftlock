@@ -56,6 +56,17 @@ RUNNABLE_ARMS = (
     "native-driftlock-heuristic",
     "native-driftlock",
 )
+DRIFTLOCK_DETECTOR_DEFAULTS = {
+    "driftlock_no_change_steps": 4,
+    "driftlock_loop_window": 6,
+    "driftlock_loop_repetitions": 3,
+    "driftlock_error_window": 5,
+    "driftlock_error_rate": 0.6,
+    "driftlock_command_failure_window": 8,
+    "driftlock_command_failure_rate": 1.0,
+    "driftlock_reward_stall_steps": 5,
+    "driftlock_reward_epsilon": 1e-6,
+}
 
 # SHA-256 of every Harbor file after applying the packaged version-10 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
@@ -199,6 +210,13 @@ def build_job_config(
                 "driftlock_checkpoint_interval": 5,
             }
         )
+        if arm in {
+            "driftlock-heuristic",
+            "driftlock",
+            "native-driftlock-heuristic",
+            "native-driftlock",
+        }:
+            agent["kwargs"].update(DRIFTLOCK_DETECTOR_DEFAULTS)
         if retain_checkpoints:
             agent["kwargs"]["driftlock_retain_checkpoints"] = True
         if arm in {"driftlock", "native-driftlock"}:
