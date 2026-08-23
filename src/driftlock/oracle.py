@@ -26,6 +26,7 @@ _MANIFEST_FIELDS = {
     "label",
     "remote_workspace",
 }
+_OPTIONAL_MANIFEST_FIELDS = {"unstable_paths"}
 
 
 class OracleCheckpointError(SnapshotIntegrityError):
@@ -252,7 +253,10 @@ def load_remote_checkpoint_bundle(
     state_path = _direct_file(directory, "state.json")
     archive_path = _direct_file(directory, "workspace.tar.gz")
     manifest = _read_object(manifest_path, "checkpoint manifest")
-    if set(manifest) != _MANIFEST_FIELDS:
+    if (
+        not _MANIFEST_FIELDS.issubset(manifest)
+        or set(manifest) - _MANIFEST_FIELDS - _OPTIONAL_MANIFEST_FIELDS
+    ):
         raise OracleCheckpointError("checkpoint manifest has unexpected fields")
 
     checkpoint_id = manifest["checkpoint_id"]
@@ -291,6 +295,11 @@ def load_remote_checkpoint_bundle(
         expected_workspace
     ):
         raise OracleCheckpointError("checkpoint workspace differs from replay target")
+    unstable_paths = manifest.get("unstable_paths", [])
+    if not isinstance(unstable_paths, list) or any(
+        not isinstance(path, str) or not path for path in unstable_paths
+    ):
+        raise OracleCheckpointError("checkpoint unstable paths are invalid")
 
     try:
         state_text = state_path.read_text(encoding="utf-8")
@@ -320,6 +329,7 @@ def load_remote_checkpoint_bundle(
             path=directory,
             parent_id=parent_id,
             label=label,
+            unstable_paths=tuple(unstable_paths),
         ),
         state=state,
         remote_workspace=workspace,

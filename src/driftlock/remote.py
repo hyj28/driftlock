@@ -114,7 +114,7 @@ class RemoteArchiveCheckpointStore:
                     ".",
                 ]
             )
-            await self._checked_exec(command, operation="create remote archive")
+            unstable_paths = await self._create_remote_archive(command)
             await self.environment.download_file(remote_archive, local_archive)
             if not local_archive.is_file():
                 raise RemoteCheckpointError(
@@ -132,6 +132,8 @@ class RemoteArchiveCheckpointStore:
                 "label": label,
                 "remote_workspace": self.remote_workspace,
             }
+            if unstable_paths:
+                manifest["unstable_paths"] = list(unstable_paths)
             (temporary / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
             )
@@ -149,6 +151,7 @@ class RemoteArchiveCheckpointStore:
             path=final,
             parent_id=parent_id,
             label=label,
+            unstable_paths=unstable_paths,
         )
 
     async def restore(self, checkpoint: Checkpoint) -> dict[str, Any]:
@@ -430,12 +433,32 @@ find "$workspace_real" -type d -samefile "$tmp_real" -print -quit
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
-        if result.return_code != 0:
-            detail = (result.stderr or result.stdout or "no output").strip()
-            raise RemoteCheckpointError(
-                f"{operation} failed with exit code {result.return_code}: {detail}"
-            )
+        _require_success(result, operation=operation)
         return result
+
+    async def _create_remote_archive(self, command: str) -> tuple[str, ...]:
+        result = await self.environment.exec(
+            command,
+            timeout_sec=self.timeout_sec,
+            user=self.user,
+        )
+        if result.return_code == 0:
+            return ()
+        unstable_paths = _parse_file_changed_warnings(result)
+        if unstable_paths is None:
+            _require_success(result, operation="create remote archive")
+
+        retry = await self.environment.exec(
+            command,
+            timeout_sec=self.timeout_sec,
+            user=self.user,
+        )
+        if retry.return_code == 0:
+            return ()
+        retry_unstable_paths = _parse_file_changed_warnings(retry)
+        if retry_unstable_paths is None:
+            _require_success(retry, operation="create remote archive")
+        return retry_unstable_paths
 
     async def _best_effort_remove(self, *paths: str) -> None:
         if not paths:
@@ -480,6 +503,31 @@ def _is_relative_to(path: str, parent: str) -> bool:
     path_parts = PurePosixPath(path).parts
     parent_parts = PurePosixPath(parent).parts
     return path_parts[: len(parent_parts)] == parent_parts
+
+
+def _parse_file_changed_warnings(result: ExecResultLike) -> tuple[str, ...] | None:
+    if result.return_code != 1 or not result.stderr:
+        return None
+    prefix = "tar: "
+    suffix = ": file changed as we read it"
+    paths: list[str] = []
+    for line in result.stderr.splitlines():
+        if not line.startswith(prefix) or not line.endswith(suffix):
+            return None
+        path = line[len(prefix) : -len(suffix)]
+        if not path:
+            return None
+        if path not in paths:
+            paths.append(path)
+    return tuple(paths) if paths else None
+
+
+def _require_success(result: ExecResultLike, *, operation: str) -> None:
+    if result.return_code != 0:
+        detail = (result.stderr or result.stdout or "no output").strip()
+        raise RemoteCheckpointError(
+            f"{operation} failed with exit code {result.return_code}: {detail}"
+        )
 
 
 def _archive_digest(archive: Path, state_json: str) -> str:

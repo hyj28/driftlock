@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, ClassVar
@@ -11,6 +12,7 @@ import pytest
 
 from driftlock.lhtb import openrouter_provider_from_call_kwargs
 from driftlock.models import (
+    Checkpoint,
     DriftSignal,
     DriftTriggerOutcome,
     DriftTriggerRecord,
@@ -465,6 +467,7 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     assert phase["rollbacks"] == 1
     assert phase["tokens_used"] == 19
     assert phase["checkpoint_count"] == 0
+    assert phase["unstable_checkpoint_count"] == 0
     assert phase["coarse_triggers"] == [
         {
             "sequence": 2,
@@ -554,6 +557,7 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     assert native_phase["status"] == "rollback_limit"
     assert native_phase["coarse_triggers"] == phase["coarse_triggers"]
     assert native_phase["signal_counts"] == expected_counts
+    assert native_phase["unstable_checkpoint_count"] == 0
 
     empty_result = RunResult(
         status=RunStatus.COMPLETED,
@@ -571,3 +575,58 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     ][1]
     assert empty_phase["coarse_triggers"] == []
     assert empty_phase["signal_counts"] == {}
+    assert empty_phase["unstable_checkpoint_count"] == 0
+
+
+def test_phase_record_counts_checkpoints_with_unstable_paths(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    created_at = datetime(2026, 8, 23, tzinfo=UTC)
+    clean = Checkpoint(
+        checkpoint_id="clean-checkpoint",
+        step=0,
+        created_at=created_at,
+        digest="clean-digest",
+        path=tmp_path / "clean-checkpoint",
+    )
+    unstable = Checkpoint(
+        checkpoint_id="unstable-checkpoint",
+        step=1,
+        created_at=created_at,
+        digest="unstable-digest",
+        path=tmp_path / "unstable-checkpoint",
+        unstable_paths=("./output/live.log", "./output/server.log"),
+    )
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={"done": True},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(clean, unstable),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+    )
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+
+    agent._write_phase_record(result, tmp_path / "phase-0", retained=True)
+
+    phase = json.loads((tmp_path / "driftlock-result.json").read_text())["phases"][0]
+    assert phase["checkpoint_count"] == 2
+    assert phase["unstable_checkpoint_count"] == 1
+
+    native = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    native.logs_dir = tmp_path
+    native._native_phases = []
+    native._native_retain_checkpoints = False
+    native._write_phase_record(result)
+
+    native_phase = json.loads((tmp_path / "driftlock-native-result.json").read_text())[
+        "phases"
+    ][0]
+    assert native_phase["checkpoint_count"] == 2
+    assert native_phase["unstable_checkpoint_count"] == 1

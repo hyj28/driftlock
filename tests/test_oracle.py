@@ -59,6 +59,20 @@ def test_load_remote_checkpoint_bundle_binds_archive_state_and_workspace(
     assert len(bundle.state_sha256) == 64
 
 
+def test_load_remote_checkpoint_bundle_accepts_recorded_unstable_paths(
+    tmp_path: Path,
+) -> None:
+    directory = _checkpoint(tmp_path)
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["unstable_paths"] = ["./output/live.log"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    bundle = load_remote_checkpoint_bundle(directory)
+
+    assert bundle.checkpoint.unstable_paths == ("./output/live.log",)
+
+
 @pytest.mark.parametrize("name", ["workspace.tar.gz", "state.json", "manifest.json"])
 def test_load_remote_checkpoint_bundle_rejects_symlinked_inputs(
     tmp_path: Path, name: str

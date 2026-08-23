@@ -490,6 +490,10 @@ class LHTBDriftlockAgent(Terminus2):
                     "rollbacks": len(result.rollbacks),
                     "tokens_used": result.tokens_used,
                     "checkpoint_count": len(result.checkpoints),
+                    "unstable_checkpoint_count": sum(
+                        bool(checkpoint.unstable_paths)
+                        for checkpoint in result.checkpoints
+                    ),
                     "coarse_triggers": [
                         trigger.to_dict() for trigger in result.coarse_triggers
                     ],

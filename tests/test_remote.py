@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import shutil
 import tarfile
@@ -52,6 +53,30 @@ class LocalRemoteEnvironment:
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         shutil.copy2(source_path, target_path)
+
+
+class ArchiveResultEnvironment(LocalRemoteEnvironment):
+    def __init__(self, archive_results: list[LocalExecResult]) -> None:
+        self.archive_results = list(archive_results)
+        self.archive_attempts = 0
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        result = await super().exec(
+            command,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+        if not command.startswith("tar -czf"):
+            return result
+        assert result.return_code == 0
+        self.archive_attempts += 1
+        return self.archive_results.pop(0)
 
 
 class PartialApplyFailureEnvironment(LocalRemoteEnvironment):
@@ -259,6 +284,167 @@ def _remote_store(
         remote_tmp_dir=str(remote_tmp),
     )
     return workspace, store
+
+
+def _remote_store_with_archive_results(
+    tmp_path: Path, archive_results: list[LocalExecResult]
+) -> tuple[Path, RemoteArchiveCheckpointStore, ArchiveResultEnvironment]:
+    workspace = tmp_path / "remote workspace"
+    remote_tmp = tmp_path / "remote tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    environment = ArchiveResultEnvironment(archive_results)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host checkpoints",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    return workspace, store, environment
+
+
+async def test_clean_remote_archive_is_not_retried_or_annotated(
+    tmp_path: Path,
+) -> None:
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path, [LocalExecResult(0, "", "")]
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    checkpoint = await store.create({"turn": 1}, step=1)
+
+    manifest = json.loads((checkpoint.path / "manifest.json").read_text())
+    assert environment.archive_attempts == 1
+    assert checkpoint.unstable_paths == ()
+    assert "unstable_paths" not in manifest
+
+
+async def test_transient_file_changed_warning_retries_to_clean_checkpoint(
+    tmp_path: Path,
+) -> None:
+    warning = (
+        "tar: ./output/workspace/tests/retire_trace.log: file changed as we read it"
+    )
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, "", warning), LocalExecResult(0, "", "")],
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    manifest = json.loads((checkpoint.path / "manifest.json").read_text())
+    assert environment.archive_attempts == 2
+    assert checkpoint.unstable_paths == ()
+    assert "unstable_paths" not in manifest
+
+
+async def test_persistent_file_changed_warning_records_path_and_restores(
+    tmp_path: Path,
+) -> None:
+    warning = (
+        "tar: ./output/workspace/tests/retire_trace.log: file changed as we read it"
+    )
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, "", warning), LocalExecResult(1, "", warning)],
+    )
+    affected = workspace / "output" / "workspace" / "tests" / "retire_trace.log"
+    affected.parent.mkdir(parents=True)
+    affected.write_text("checkpoint", encoding="utf-8")
+
+    checkpoint = await store.create({"turn": 2}, step=2)
+    affected.write_text("changed", encoding="utf-8")
+    state = await store.restore(checkpoint)
+
+    manifest = json.loads((checkpoint.path / "manifest.json").read_text())
+    assert environment.archive_attempts == 2
+    assert checkpoint.unstable_paths == ("./output/workspace/tests/retire_trace.log",)
+    assert manifest["unstable_paths"] == ["./output/workspace/tests/retire_trace.log"]
+    assert state == {"turn": 2}
+    assert affected.read_text(encoding="utf-8") == "checkpoint"
+
+
+async def test_persistent_file_changed_warnings_record_every_path(
+    tmp_path: Path,
+) -> None:
+    first_warning = "tar: ./first.log: file changed as we read it"
+    both_warnings = "\n".join(
+        [
+            "tar: ./first.log: file changed as we read it",
+            "tar: ./second.log: file changed as we read it",
+        ]
+    )
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path,
+        [
+            LocalExecResult(1, "", first_warning),
+            LocalExecResult(1, "", both_warnings),
+        ],
+    )
+    (workspace / "first.log").write_text("one", encoding="utf-8")
+    (workspace / "second.log").write_text("two", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    manifest = json.loads((checkpoint.path / "manifest.json").read_text())
+    assert environment.archive_attempts == 2
+    assert manifest["unstable_paths"] == ["./first.log", "./second.log"]
+
+
+async def test_unrelated_exit_one_archive_warning_still_raises(
+    tmp_path: Path,
+) -> None:
+    warning = "tar: ./ignored.sock: socket ignored"
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path, [LocalExecResult(1, "", warning)]
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError) as raised:
+        await store.create({}, step=0)
+
+    assert environment.archive_attempts == 1
+    assert str(raised.value) == (
+        "create remote archive failed with exit code 1: "
+        "tar: ./ignored.sock: socket ignored"
+    )
+
+
+async def test_fatal_archive_exit_still_raises_without_retry(tmp_path: Path) -> None:
+    error = "tar: Cowardly refusing to create an empty archive"
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path, [LocalExecResult(2, "", error)]
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError) as raised:
+        await store.create({}, step=0)
+
+    assert environment.archive_attempts == 1
+    assert str(raised.value) == (
+        "create remote archive failed with exit code 2: "
+        "tar: Cowardly refusing to create an empty archive"
+    )
+
+
+async def test_unparseable_file_changed_warning_still_raises(
+    tmp_path: Path,
+) -> None:
+    warning = "tar: : file changed as we read it"
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path, [LocalExecResult(1, "", warning)]
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError) as raised:
+        await store.create({}, step=0)
+
+    assert environment.archive_attempts == 1
+    assert str(raised.value) == (
+        "create remote archive failed with exit code 1: "
+        "tar: : file changed as we read it"
+    )
 
 
 async def test_remote_checkpoint_round_trip_preserves_workspace_inode(

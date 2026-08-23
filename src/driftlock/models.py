@@ -57,6 +57,7 @@ class Checkpoint:
     path: Path
     parent_id: str | None = None
     label: str | None = None
+    unstable_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
