@@ -6,7 +6,23 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from driftlock.models import DriftContext, JudgeCompletion, JudgeVerdict, Verdict
+from driftlock.models import (
+    DriftContext,
+    FineJudgeStatus,
+    JudgeCompletion,
+    JudgeVerdict,
+    Verdict,
+)
+
+# The pinned reasoning judge exposes an 8,192-token output window. Reasoning and
+# the final JSON share that allowance, so use the full declared window: the old
+# 512-token cap frequently spent the entire allowance before emitting any JSON.
+DEFAULT_JUDGE_MAX_OUTPUT_TOKENS = 8_192
+_JUDGE_INPUT_TOKEN_MARGIN = 256
+
+
+class JudgeTokenBudgetExhausted(RuntimeError):
+    """Raised before a judge call when no safe output allowance remains."""
 
 
 class FineJudge(Protocol):
@@ -56,13 +72,52 @@ class CallableLLMJudge:
                 confidence=float(confidence_value),
                 tokens=tokens,
             )
+        except JudgeTokenBudgetExhausted as error:
+            return JudgeVerdict(
+                verdict=None,
+                reason=f"fine judge has no output-token allowance: {error}",
+                confidence=0.0,
+                tokens=tokens,
+                status=FineJudgeStatus.BUDGET_EXHAUSTED,
+            )
         except Exception as error:
             return JudgeVerdict(
-                verdict=Verdict.UNCERTAIN,
+                verdict=None,
                 reason=f"fine judge failed or returned an invalid response: {error}",
                 confidence=0.0,
                 tokens=tokens,
+                status=FineJudgeStatus.FAILED,
             )
+
+
+def judge_output_token_limit(
+    prompt: str,
+    *,
+    max_output_tokens: int,
+    tokens_remaining: int | None,
+) -> int:
+    """Return a conservative output ceiling or report preflight exhaustion."""
+    if max_output_tokens <= 0:
+        raise ValueError("judge output limit must be positive")
+    if tokens_remaining is not None and tokens_remaining < 0:
+        raise ValueError("tokens remaining cannot be negative")
+    # One token per UTF-8 byte plus a fixed margin deliberately overestimates the
+    # prompt charge. The shared run budget must never be exceeded by a judge call.
+    input_bound = judge_input_token_bound(prompt)
+    ceiling = max_output_tokens
+    if tokens_remaining is not None:
+        ceiling = min(ceiling, tokens_remaining - input_bound)
+    if ceiling <= 0:
+        raise JudgeTokenBudgetExhausted(
+            f"{tokens_remaining} tokens remain but the judge prompt reserves "
+            f"{input_bound} input tokens"
+        )
+    return ceiling
+
+
+def judge_input_token_bound(prompt: str) -> int:
+    """Conservatively bound the prompt charge used by shared-budget accounting."""
+    return len(prompt.encode("utf-8")) + _JUDGE_INPUT_TOKEN_MARGIN
 
 
 def _build_prompt(context: DriftContext) -> str:

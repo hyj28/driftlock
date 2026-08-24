@@ -53,6 +53,7 @@ def test_build_driftlock_config_has_total_budget_and_no_retries(
     assert agent["kwargs"]["driftlock_max_tokens"] == 123_456
     assert agent["kwargs"]["driftlock_judge_model"] == experiment.DEFAULT_JUDGE_MODEL
     assert agent["kwargs"]["driftlock_judge_api_base"] == experiment.DEFAULT_API_BASE
+    assert agent["kwargs"]["driftlock_judge_max_output_tokens"] == 8192
     assert agent["kwargs"]["enable_summarize"] is False
     assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
     assert len(agent["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"]) == 64
@@ -228,6 +229,7 @@ def test_build_controlled_arm_configs(
             agent["kwargs"]["driftlock_judge_model"] == experiment.DEFAULT_JUDGE_MODEL
         )
         assert agent["kwargs"]["driftlock_judge_api_base"] == "https://judge.invalid/v1"
+        assert agent["kwargs"]["driftlock_judge_max_output_tokens"] == 8192
 
 
 def test_oracle_cannot_be_misrepresented_as_an_online_agent(tmp_path: Path) -> None:

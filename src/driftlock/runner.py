@@ -8,7 +8,7 @@ from typing import Any
 
 from driftlock.checkpoints import CheckpointStore
 from driftlock.heuristics import HeuristicJudge
-from driftlock.judges import FineJudge
+from driftlock.judges import FineJudge, JudgeTokenBudgetExhausted
 from driftlock.models import (
     Checkpoint,
     DriftContext,
@@ -201,9 +201,12 @@ class DriftlockRunner:
                     tokens_used=agent_tokens_used + judge_tokens_used,
                 )
                 judge_tokens_used += verdict.tokens
-                should_rollback = verdict.verdict is Verdict.DRIFTED or (
-                    verdict.verdict is Verdict.UNCERTAIN
-                    and self.config.rollback_on_uncertain
+                should_rollback = verdict.status is FineJudgeStatus.VERDICT and (
+                    verdict.verdict is Verdict.DRIFTED
+                    or (
+                        verdict.verdict is Verdict.UNCERTAIN
+                        and self.config.rollback_on_uncertain
+                    )
                 )
                 if should_rollback:
                     if len(rollbacks) >= self.config.max_rollbacks:
@@ -266,15 +269,24 @@ class DriftlockRunner:
                             logical_step=logical_step,
                         )
                     continue
+                failure_outcome = {
+                    FineJudgeStatus.FAILED: DriftTriggerOutcome.JUDGE_FAILED,
+                    FineJudgeStatus.BUDGET_EXHAUSTED: (
+                        DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED
+                    ),
+                }.get(verdict.status)
                 coarse_triggers.append(
                     self._trigger_record(
                         record,
                         signals,
                         verdict,
-                        DriftTriggerOutcome.VETOED,
+                        failure_outcome or DriftTriggerOutcome.VETOED,
                     )
                 )
-                checkpoint_is_healthy = verdict.verdict is Verdict.HEALTHY
+                checkpoint_is_healthy = (
+                    verdict.status is FineJudgeStatus.VERDICT
+                    and verdict.verdict is Verdict.HEALTHY
+                )
 
             if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
                 return await self._finish(
@@ -333,18 +345,33 @@ class DriftlockRunner:
                 "coarse heuristic fired in heuristics-only mode",
             )
         recent = tuple(recent_steps[-self.config.recent_steps_for_judge :])
-        return await self.fine_judge.judge(
-            DriftContext(
-                goal=goal,
-                plan=plan,
-                checkpoint=checkpoint,
-                signals=signals,
-                recent_steps=recent,
-                diff=recent[-1].outcome.diff if recent else "",
-                tokens_remaining=self._tokens_remaining(tokens_used),
-                tool_observations=_bounded_tool_observations(recent),
+        try:
+            return await self.fine_judge.judge(
+                DriftContext(
+                    goal=goal,
+                    plan=plan,
+                    checkpoint=checkpoint,
+                    signals=signals,
+                    recent_steps=recent,
+                    diff=recent[-1].outcome.diff if recent else "",
+                    tokens_remaining=self._tokens_remaining(tokens_used),
+                    tool_observations=_bounded_tool_observations(recent),
+                )
             )
-        )
+        except JudgeTokenBudgetExhausted as error:
+            return JudgeVerdict(
+                verdict=None,
+                reason=f"fine judge has no output-token allowance: {error}",
+                confidence=0.0,
+                status=FineJudgeStatus.BUDGET_EXHAUSTED,
+            )
+        except Exception as error:
+            return JudgeVerdict(
+                verdict=None,
+                reason=f"fine judge raised unexpectedly: {error}",
+                confidence=0.0,
+                status=FineJudgeStatus.FAILED,
+            )
 
     def _tokens_remaining(self, tokens_used: int) -> int | None:
         if self.config.max_tokens is None:
@@ -386,9 +413,7 @@ class DriftlockRunner:
             logical_step=step.logical_step,
             signals=signals,
             judge_status=(
-                FineJudgeStatus.VERDICT
-                if judge_configured
-                else FineJudgeStatus.NOT_CONFIGURED
+                verdict.status if judge_configured else FineJudgeStatus.NOT_CONFIGURED
             ),
             judge_verdict=verdict.verdict if judge_configured else None,
             judge_reason=verdict.reason if judge_configured else None,

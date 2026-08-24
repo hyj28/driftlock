@@ -317,6 +317,30 @@ total wall clock are unchanged; what changes is that the four arms meet the same
 provider conditions at the same moment, and an incident degrades all of them
 equally rather than annihilating the ones that had not started yet.
 
+### 3.2.3 A fine judge that cannot answer is not a veto
+
+The 2026-08-24 four-arm round exposed a second degeneracy: 33 of 34 escalated
+triggers produced no parseable JSON. The pinned reasoning model had only 512
+output tokens for both hidden reasoning and its answer, while the eight-step
+judge trajectory reached 33,079 characters. Those failures became ordinary
+`uncertain` verdicts and therefore looked like 33 considered decisions not to
+roll back.
+
+Judge transport/parse failures, preflight output-budget exhaustion, and real
+model verdicts are now separate states in every trigger record and in
+`signal_counts`. One failed call followed by an answer remains non-fatal. At four
+or more escalations, a failure rate of at least 75% records judge reliability as
+`failed`; this catches both observed broken rounds (117/137 and 33/34) while
+allowing a single transient among four calls. If every call fails in a smaller
+sample, reliability is `inconclusive` rather than guessed clean or dead. Judge
+reliability is separate from the terminal run status, so a token-limited phase
+records both `status=token_limit` and `judge_reliability=failed` instead of blaming
+the judge for the budget stop. Trial metadata accumulates the evidence across
+phases, and neither failed nor inconclusive reliability is admitted as a valid
+measurement. The output cap is the pinned model's declared 8,192-token maximum.
+The judge is a reasoning model, so its reasoning and compact JSON must share that
+full allowance rather than the former 512-token slice.
+
 ### 3.3 Skill representation
 
 One schema, shared by **both** distillation arms. This is a correctness requirement,

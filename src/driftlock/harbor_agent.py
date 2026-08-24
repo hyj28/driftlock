@@ -22,7 +22,12 @@ from harbor.agents.terminus_2 import Terminus2
 from harbor.llms.lite_llm import LiteLLM
 
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
-from driftlock.judges import CallableLLMJudge
+from driftlock.judges import (
+    DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
+    CallableLLMJudge,
+    judge_input_token_bound,
+    judge_output_token_limit,
+)
 from driftlock.lhtb import (
     HarborWorkspaceDeltaObserver,
     LHTBTerminusRuntime,
@@ -34,6 +39,7 @@ from driftlock.models import (
     JudgeVerdict,
     RunResult,
     RunStatus,
+    aggregate_run_summary,
 )
 from driftlock.oracle import (
     ReplayUsage,
@@ -232,7 +238,7 @@ class LHTBDriftlockAgent(Terminus2):
         driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
-        driftlock_judge_max_output_tokens: int = 512,
+        driftlock_judge_max_output_tokens: int = DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
         driftlock_judge_timeout_sec: float = 120.0,
         driftlock_judge_llm_call_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -364,11 +370,17 @@ class LHTBDriftlockAgent(Terminus2):
         if remaining_budget is not None and remaining_budget <= 0:
             metadata = dict(context.metadata or {})
             metadata["termination_reason"] = "driftlock_token_limit"
-            metadata["driftlock"] = {
-                "status": RunStatus.TOKEN_LIMIT.value,
-                "tokens_used": self._driftlock_tokens_consumed,
-                "trial_token_budget": configured_budget,
-            }
+            previous = metadata.get("driftlock")
+            summary = dict(previous) if isinstance(previous, dict) else {}
+            summary.update(
+                {
+                    "status": RunStatus.TOKEN_LIMIT.value,
+                    "tokens_used": self._driftlock_tokens_consumed,
+                    "trial_tokens_used": self._driftlock_tokens_consumed,
+                    "trial_token_budget": configured_budget,
+                }
+            )
+            metadata["driftlock"] = summary
             context.metadata = metadata
             return
         phase_store = self._driftlock_store_root / (
@@ -472,18 +484,18 @@ class LHTBDriftlockAgent(Terminus2):
 
     def _set_result_metadata(self, context: Any, result: RunResult) -> None:
         metadata = dict(context.metadata or {})
-        summary = {
-            "status": result.status.value,
-            "steps": len(result.steps),
-            "rollbacks": len(result.rollbacks),
-            "tokens_used": result.tokens_used,
-            "agent_tokens_used": result.agent_tokens_used,
-            "judge_tokens_used": result.judge_tokens_used,
-            "signal_counts": result.signal_counts,
-            "rate_limited_calls": self._driftlock_rate_limited_calls(),
-            "trial_tokens_used": self._driftlock_tokens_consumed,
-            "trial_token_budget": self._driftlock_runner_config.max_tokens,
-        }
+        previous = metadata.get("driftlock")
+        summary = aggregate_run_summary(
+            previous if isinstance(previous, dict) else None,
+            result,
+        )
+        summary.update(
+            {
+                "rate_limited_calls": self._driftlock_rate_limited_calls(),
+                "trial_tokens_used": self._driftlock_tokens_consumed,
+                "trial_token_budget": self._driftlock_runner_config.max_tokens,
+            }
+        )
         metadata["driftlock"] = summary
         metadata["termination_reason"] = (
             "confirmed_task_complete"
@@ -506,6 +518,9 @@ class LHTBDriftlockAgent(Terminus2):
             record.update(
                 {
                     "status": result.status.value,
+                    "judge_reliability": result.judge_reliability.value,
+                    "judge_attempts": result.judge_attempts,
+                    "judge_failures": result.judge_failures,
                     "steps": len(result.steps),
                     "rollbacks": len(result.rollbacks),
                     "tokens_used": result.tokens_used,
@@ -729,7 +744,7 @@ class _LHTBJudgeClient:
             temperature=0.0,
             model_info={
                 "max_input_tokens": 1_000_000,
-                "max_output_tokens": 8_192,
+                "max_output_tokens": DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
                 "input_cost_per_token": pricing.input_cost_per_token,
                 "cache_read_input_token_cost": pricing.cache_cost_per_token,
                 "output_cost_per_token": pricing.output_cost_per_token,
@@ -753,12 +768,12 @@ class _LHTBJudgeClient:
     async def complete(
         self, prompt: str, *, tokens_remaining: int | None
     ) -> JudgeCompletion:
-        input_bound = len(prompt.encode("utf-8")) + 256
-        ceiling = self.max_output_tokens
-        if tokens_remaining is not None:
-            ceiling = min(ceiling, max(0, tokens_remaining - input_bound))
-        if ceiling <= 0:
-            return JudgeCompletion(text="", tokens=0)
+        input_bound = judge_input_token_bound(prompt)
+        ceiling = judge_output_token_limit(
+            prompt,
+            max_output_tokens=self.max_output_tokens,
+            tokens_remaining=tokens_remaining,
+        )
 
         started = time.monotonic()
         response: Any | None = None

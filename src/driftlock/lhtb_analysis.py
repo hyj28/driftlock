@@ -16,11 +16,17 @@ from typing import Any
 from uuid import UUID
 
 from driftlock.heuristics import HeuristicConfig
+from driftlock.judges import DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
 from driftlock.lhtb import (
     LHTB_REPOSITORY_REVISION,
     lhtb_runtime_fingerprint,
     openrouter_provider_from_call_kwargs,
     task_directory_sha256,
+)
+from driftlock.models import (
+    JudgeReliabilityStatus,
+    RunStatus,
+    classify_judge_reliability,
 )
 from driftlock.oracle import (
     OracleCheckpointError,
@@ -550,6 +556,9 @@ def _load_trial(
     )
     provider, judge_provider = _trial_providers(data, arm, result_file)
     usage, usage_source = _usage(data, result_file)
+    driftlock_run_statuses, judge_reliability = _driftlock_run_metadata(
+        data, arm, result_file
+    )
     task_metadata = task_metadata_cache.get(task)
     if task_metadata is None:
         task_metadata = _task_metadata(task_index[task], task)
@@ -585,10 +594,105 @@ def _load_trial(
         "total_tokens": usage["input_tokens"] + usage["output_tokens"],
         "cost_usd": usage["cost_usd"],
         "usage_source": usage_source,
+        "driftlock_run_statuses": driftlock_run_statuses,
+        "judge_reliability": judge_reliability,
         "duration_sec": duration,
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
     }
+
+
+def _driftlock_run_metadata(
+    data: dict[str, Any], arm: str, result_file: Path
+) -> tuple[tuple[str, ...], str | None]:
+    """Validate terminal and cumulative judge statuses before analysis."""
+    if arm not in _DRIFTLOCK_DETECTOR_ARMS:
+        return (), None
+    direct = data.get("agent_result")
+    step_results = data.get("step_results")
+    if isinstance(direct, dict):
+        contexts = [direct]
+    elif isinstance(step_results, list):
+        contexts = [
+            step["agent_result"]
+            for step in step_results
+            if isinstance(step, dict) and isinstance(step.get("agent_result"), dict)
+        ]
+    else:
+        contexts = []
+
+    # This is intentionally an allow-list. A newly added RunStatus must be
+    # classified here before analysis can treat it as a valid measurement.
+    measurable = {
+        RunStatus.COMPLETED.value,
+        RunStatus.STEP_LIMIT.value,
+        RunStatus.TOKEN_LIMIT.value,
+        RunStatus.ROLLBACK_LIMIT.value,
+    }
+    statuses: list[str] = []
+    reliabilities: list[str] = []
+    for context in contexts:
+        metadata = context.get("metadata")
+        driftlock = metadata.get("driftlock") if isinstance(metadata, dict) else None
+        if driftlock is None:
+            continue
+        if not isinstance(driftlock, dict) or not isinstance(
+            driftlock.get("status"), str
+        ):
+            raise ValueError(f"invalid driftlock run status in {result_file}")
+        status = driftlock["status"]
+        if status not in measurable:
+            raise ValueError(
+                f"non-measurable driftlock run status {status!r} in {result_file}"
+            )
+        expected_termination = (
+            "confirmed_task_complete"
+            if status == RunStatus.COMPLETED.value
+            else f"driftlock_{status}"
+        )
+        if metadata.get("termination_reason") != expected_termination:
+            raise ValueError(
+                f"driftlock termination reason disagrees with status in {result_file}"
+            )
+        statuses.append(status)
+        reliability = driftlock.get("judge_reliability")
+        if reliability is None:
+            continue
+        if not isinstance(reliability, str):
+            raise ValueError(f"invalid judge reliability in {result_file}")
+        attempts = driftlock.get("judge_attempts")
+        failures = driftlock.get("judge_failures")
+        if (
+            not isinstance(attempts, int)
+            or isinstance(attempts, bool)
+            or not isinstance(failures, int)
+            or isinstance(failures, bool)
+        ):
+            raise ValueError(f"invalid judge reliability counts in {result_file}")
+        try:
+            expected_reliability = classify_judge_reliability(
+                attempts=attempts,
+                failures=failures,
+            ).value
+        except ValueError as error:
+            raise ValueError(
+                f"invalid judge reliability counts in {result_file}: {error}"
+            ) from error
+        if reliability != expected_reliability:
+            raise ValueError(
+                f"judge reliability disagrees with its counts in {result_file}"
+            )
+        reliabilities.append(reliability)
+
+    final_reliability = reliabilities[-1] if reliabilities else None
+    if final_reliability in {
+        JudgeReliabilityStatus.FAILED.value,
+        JudgeReliabilityStatus.INCONCLUSIVE.value,
+    }:
+        raise ValueError(
+            f"non-measurable judge reliability {final_reliability!r} in {result_file}"
+        )
+    return tuple(statuses), final_reliability
 
 
 def _lock_trial_signature(task_name: str, config: dict[str, Any]) -> str:
@@ -883,7 +987,8 @@ def _validate_arm_identity(
             kwargs.get("driftlock_judge_model") != _FINE_JUDGE_MODEL
             or not isinstance(kwargs.get("driftlock_judge_api_base"), str)
             or not kwargs["driftlock_judge_api_base"]
-            or kwargs.get("driftlock_judge_max_output_tokens") != 512
+            or kwargs.get("driftlock_judge_max_output_tokens")
+            != DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
         ):
             raise ValueError(f"driftlock arm lacks its fine judge: {result_file}")
         if (

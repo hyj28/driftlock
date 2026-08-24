@@ -148,7 +148,7 @@ def _result(
             {
                 "driftlock_judge_model": ("openrouter/deepseek/deepseek-v4-pro-0813"),
                 "driftlock_judge_api_base": "https://judge.invalid/v1",
-                "driftlock_judge_max_output_tokens": 512,
+                "driftlock_judge_max_output_tokens": 8192,
                 "driftlock_judge_llm_call_kwargs": {
                     "extra_body": {
                         "provider": {
@@ -173,7 +173,7 @@ def _result(
                         "openrouter/deepseek/deepseek-v4-pro-0813"
                     ),
                     "driftlock_judge_api_base": "https://judge.invalid/v1",
-                    "driftlock_judge_max_output_tokens": 512,
+                    "driftlock_judge_max_output_tokens": 8192,
                     "driftlock_judge_llm_call_kwargs": {
                         "extra_body": {
                             "provider": {
@@ -1372,6 +1372,94 @@ def test_analyze_requires_canonical_reward_key(tmp_path: Path) -> None:
     payload_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="canonical verifier reward"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["judge_failed", "judge_inconclusive", "future_unclassified_status"],
+)
+def test_analyze_rejects_non_measurable_driftlock_status(
+    tmp_path: Path, status: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"]["metadata"] = {
+        "driftlock": {"status": status},
+        "termination_reason": f"driftlock_{status}",
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-measurable driftlock run status"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
+def test_analyze_reports_validated_driftlock_status(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"]["metadata"] = {
+        "driftlock": {
+            "status": "completed",
+            "judge_reliability": "reliable",
+            "judge_attempts": 4,
+            "judge_failures": 1,
+        },
+        "termination_reason": "confirmed_task_complete",
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    trial = next(
+        trial
+        for trial in report["arms"]["driftlock"]["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert trial["driftlock_run_statuses"] == ("completed",)
+    assert trial["judge_reliability"] == "reliable"
+
+
+@pytest.mark.parametrize(
+    ("status", "termination", "reliability", "attempts", "failures"),
+    [
+        ("token_limit", "driftlock_token_limit", "failed", 13, 12),
+        ("completed", "confirmed_task_complete", "inconclusive", 1, 1),
+    ],
+)
+def test_analyze_rejects_invalid_cumulative_judge_reliability(
+    tmp_path: Path,
+    status: str,
+    termination: str,
+    reliability: str,
+    attempts: int,
+    failures: int,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"]["metadata"] = {
+        "driftlock": {
+            "status": status,
+            "judge_reliability": reliability,
+            "judge_attempts": attempts,
+            "judge_failures": failures,
+        },
+        "termination_reason": termination,
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-measurable judge reliability"):
         analyze_jobs(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},

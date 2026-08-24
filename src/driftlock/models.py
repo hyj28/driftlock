@@ -27,10 +27,21 @@ class RunStatus(StrEnum):
     ROLLBACK_LIMIT = "rollback_limit"
 
 
+class JudgeReliabilityStatus(StrEnum):
+    """Whether fine-judge availability made the run a valid measurement."""
+
+    NOT_ASSESSED = "not_assessed"
+    RELIABLE = "reliable"
+    FAILED = "failed"
+    INCONCLUSIVE = "inconclusive"
+
+
 class FineJudgeStatus(StrEnum):
     """Whether a coarse trigger was evaluated by a configured fine judge."""
 
     VERDICT = "verdict"
+    FAILED = "failed"
+    BUDGET_EXHAUSTED = "budget_exhausted"
     NOT_CONFIGURED = "not_configured"
     NOT_INVOKED = "not_invoked"
 
@@ -42,6 +53,8 @@ class DriftTriggerOutcome(StrEnum):
     VETOED = "vetoed"
     ROLLBACK_LIMIT_REFUSED = "rollback_limit_refused"
     SUPPRESSED = "suppressed"
+    JUDGE_FAILED = "judge_failed"
+    JUDGE_BUDGET_EXHAUSTED = "judge_budget_exhausted"
 
 
 class StepTokenBudgetExhausted(RuntimeError):
@@ -178,12 +191,21 @@ class JudgeCompletion:
 class JudgeVerdict:
     """Structured fine-judge response."""
 
-    verdict: Verdict
+    verdict: Verdict | None
     reason: str
     confidence: float = 1.0
     tokens: int = 0
+    status: FineJudgeStatus = FineJudgeStatus.VERDICT
 
     def __post_init__(self) -> None:
+        if self.status not in {
+            FineJudgeStatus.VERDICT,
+            FineJudgeStatus.FAILED,
+            FineJudgeStatus.BUDGET_EXHAUSTED,
+        }:
+            raise ValueError("a judge result must describe an invoked fine judge")
+        if (self.verdict is not None) != (self.status is FineJudgeStatus.VERDICT):
+            raise ValueError("only an adjudicated fine judge may return a verdict")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0 and 1")
         if self.tokens < 0:
@@ -221,11 +243,47 @@ class DriftTriggerRecord:
             raise ValueError("logical_step must be positive")
         if not self.signals:
             raise ValueError("a trigger record must contain at least one signal")
-        if self.judge_status is not FineJudgeStatus.VERDICT:
-            if self.judge_verdict is not None or self.judge_reason is not None:
-                raise ValueError("a fine judge that did not run cannot have a verdict")
-        elif self.judge_verdict is None or self.judge_reason is None:
-            raise ValueError("a configured fine judge must have a verdict and reason")
+        if self.judge_status is FineJudgeStatus.VERDICT:
+            if self.judge_verdict is None or self.judge_reason is None:
+                raise ValueError(
+                    "an adjudicated fine judge must have a verdict and reason"
+                )
+        elif self.judge_status in {
+            FineJudgeStatus.FAILED,
+            FineJudgeStatus.BUDGET_EXHAUSTED,
+        }:
+            if self.judge_verdict is not None or self.judge_reason is None:
+                raise ValueError(
+                    "a failed fine judge must have a reason but no verdict"
+                )
+        elif self.judge_verdict is not None or self.judge_reason is not None:
+            raise ValueError("a fine judge that did not run cannot have a verdict")
+        if self.judge_status is FineJudgeStatus.VERDICT and (
+            self.outcome
+            in {
+                DriftTriggerOutcome.JUDGE_FAILED,
+                DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED,
+            }
+        ):
+            raise ValueError(
+                "an adjudicated trigger cannot have a judge-failure outcome"
+            )
+        expected_failure_outcome = {
+            FineJudgeStatus.FAILED: DriftTriggerOutcome.JUDGE_FAILED,
+            FineJudgeStatus.BUDGET_EXHAUSTED: (
+                DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED
+            ),
+        }.get(self.judge_status)
+        if (
+            expected_failure_outcome is not None
+            and self.outcome is not expected_failure_outcome
+        ):
+            raise ValueError("a judge failure must have its matching trigger outcome")
+        if expected_failure_outcome is None and self.outcome in {
+            DriftTriggerOutcome.JUDGE_FAILED,
+            DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED,
+        }:
+            raise ValueError("a judge-failure outcome requires a matching judge status")
         suppressed = self.outcome is DriftTriggerOutcome.SUPPRESSED
         not_invoked = self.judge_status is FineJudgeStatus.NOT_INVOKED
         if suppressed != not_invoked:
@@ -291,23 +349,149 @@ class RunResult:
     coarse_triggers: tuple[DriftTriggerRecord, ...] = ()
 
     @property
+    def judge_attempts(self) -> int:
+        """Count coarse triggers escalated to a configured fine judge."""
+        return sum(
+            trigger.judge_status
+            in {
+                FineJudgeStatus.VERDICT,
+                FineJudgeStatus.FAILED,
+                FineJudgeStatus.BUDGET_EXHAUSTED,
+            }
+            for trigger in self.coarse_triggers
+        )
+
+    @property
+    def judge_failures(self) -> int:
+        """Count escalations that produced no fine-judge verdict."""
+        return sum(
+            trigger.judge_status
+            in {FineJudgeStatus.FAILED, FineJudgeStatus.BUDGET_EXHAUSTED}
+            for trigger in self.coarse_triggers
+        )
+
+    @property
+    def judge_reliability(self) -> JudgeReliabilityStatus:
+        """Classify the fine judge independently of why the run stopped."""
+        return classify_judge_reliability(
+            attempts=self.judge_attempts,
+            failures=self.judge_failures,
+        )
+
+    @property
     def signal_counts(self) -> dict[str, dict[str, int]]:
         """Count signal occurrences by kind and disposition.
 
         ``suppressed`` counts triggers the coarse tier raised but never escalated,
         because every signal in them was corroborating-only. They are separate from
-        ``vetoed`` because they cost no judge tokens and carry no verdict.
+        ``vetoed`` because they cost no judge tokens and carry no verdict. Judge
+        failures and output-budget exhaustion have separate buckets so neither can
+        be mistaken for an adjudicated veto.
         """
         counts: dict[str, dict[str, int]] = {}
         dispositions = {
             DriftTriggerOutcome.VETOED: "vetoed",
             DriftTriggerOutcome.SUPPRESSED: "suppressed",
+            DriftTriggerOutcome.JUDGE_FAILED: "judge_failed",
+            DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED: ("judge_budget_exhausted"),
         }
         for trigger in self.coarse_triggers:
             disposition = dispositions.get(trigger.outcome, "upheld")
             for signal in trigger.signals:
                 kind_counts = counts.setdefault(
-                    signal.kind, {"upheld": 0, "vetoed": 0, "suppressed": 0}
+                    signal.kind,
+                    {
+                        "upheld": 0,
+                        "vetoed": 0,
+                        "suppressed": 0,
+                        "judge_failed": 0,
+                        "judge_budget_exhausted": 0,
+                    },
                 )
                 kind_counts[disposition] += 1
         return {kind: counts[kind] for kind in sorted(counts)}
+
+
+def classify_judge_reliability(
+    *, attempts: int, failures: int
+) -> JudgeReliabilityStatus:
+    """Classify whether fine-judge failures invalidate a measurement."""
+    if attempts < 0 or not 0 <= failures <= attempts:
+        raise ValueError("judge failures must be between zero and attempts")
+    if attempts == 0:
+        return JudgeReliabilityStatus.NOT_ASSESSED
+    if failures == 0:
+        return JudgeReliabilityStatus.RELIABLE
+    # Four calls is the first sample where one transient failure and repeated
+    # failure are cleanly separated: 1/4 remains valid, while 3/4 means the
+    # treatment adjudicated at most one quarter of escalations. The 75% boundary
+    # rejects both observed broken rounds (117/137 and 33/34). An all-failed
+    # smaller sample is explicitly inconclusive instead of guessed clean or dead.
+    if attempts < 4:
+        return (
+            JudgeReliabilityStatus.INCONCLUSIVE
+            if failures == attempts
+            else JudgeReliabilityStatus.RELIABLE
+        )
+    if failures * 4 >= attempts * 3:
+        return JudgeReliabilityStatus.FAILED
+    return JudgeReliabilityStatus.RELIABLE
+
+
+def merge_signal_counts(
+    *summaries: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    """Add per-phase signal counts into one stable trial-level summary."""
+    dispositions = (
+        "upheld",
+        "vetoed",
+        "suppressed",
+        "judge_failed",
+        "judge_budget_exhausted",
+    )
+    merged: dict[str, dict[str, int]] = {}
+    for summary in summaries:
+        for kind, counts in summary.items():
+            kind_counts = merged.setdefault(
+                kind, {disposition: 0 for disposition in dispositions}
+            )
+            for disposition in dispositions:
+                kind_counts[disposition] += counts.get(disposition, 0)
+    return {kind: merged[kind] for kind in sorted(merged)}
+
+
+def aggregate_run_summary(
+    previous: Mapping[str, Any] | None, result: RunResult
+) -> dict[str, Any]:
+    """Merge one phase result into cumulative trial-level driftlock metadata."""
+    prior = previous or {}
+
+    def accumulated(name: str, current: int) -> int:
+        value = prior.get(name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"prior driftlock {name} must be a non-negative integer")
+        return value + current
+
+    prior_signal_counts = prior.get("signal_counts", {})
+    if not isinstance(prior_signal_counts, Mapping):
+        raise ValueError("prior driftlock signal_counts must be a mapping")
+    judge_attempts = accumulated("judge_attempts", result.judge_attempts)
+    judge_failures = accumulated("judge_failures", result.judge_failures)
+    return {
+        "status": result.status.value,
+        "judge_reliability": classify_judge_reliability(
+            attempts=judge_attempts,
+            failures=judge_failures,
+        ).value,
+        "judge_attempts": judge_attempts,
+        "judge_failures": judge_failures,
+        "steps": accumulated("steps", len(result.steps)),
+        "rollbacks": accumulated("rollbacks", len(result.rollbacks)),
+        "tokens_used": accumulated("tokens_used", result.tokens_used),
+        "agent_tokens_used": accumulated("agent_tokens_used", result.agent_tokens_used),
+        "judge_tokens_used": accumulated("judge_tokens_used", result.judge_tokens_used),
+        "signal_counts": merge_signal_counts(
+            prior_signal_counts,
+            result.signal_counts,
+        ),
+    }
