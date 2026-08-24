@@ -6,7 +6,11 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-from driftlock.lhtb import LHTB_REPOSITORY_REVISION, lhtb_experiment_fingerprint
+from driftlock.lhtb import (
+    LHTB_REPOSITORY_REVISION,
+    lhtb_experiment_fingerprint,
+    lhtb_runtime_fingerprint,
+)
 from driftlock.lhtb_analysis import (
     _task_directory_sha256,
     _validate_arm_identity,
@@ -946,7 +950,9 @@ def test_analyze_requires_globally_unique_trial_ids(tmp_path: Path) -> None:
         ("retry", "forbidden retries"),
         ("concurrency", "different Harbor job-level settings"),
         ("harbor", "pinned editable build"),
-        ("fingerprint", "invalid trial provenance"),
+        ("fingerprint", "mix driftlock builds"),
+        ("no-fingerprint", "missing or malformed build fingerprint"),
+        ("short-fingerprint", "missing or malformed build fingerprint"),
     ],
 )
 def test_analyze_validates_canonical_job_lock(
@@ -961,6 +967,10 @@ def test_analyze_validates_canonical_job_lock(
         lock["n_concurrent_trials"] = 2
     elif mutation == "harbor":
         lock["harbor"]["git_commit_hash"] = "0" * 40
+    elif mutation == "no-fingerprint":
+        del lock["trials"][0]["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"]
+    elif mutation == "short-fingerprint":
+        lock["trials"][0]["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = "abc"
     else:
         lock["trials"][0]["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = "0" * 64
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
@@ -970,6 +980,63 @@ def test_analyze_validates_canonical_job_lock(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
         )
+
+
+def _restamp_build(job: Path, fingerprint: str) -> None:
+    """Rewrite a job's recorded build fingerprint in the lock and every trial."""
+    lock_path = job / "lock.json"
+    lock = json.loads(lock_path.read_text())
+    for trial in lock["trials"]:
+        trial["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = fingerprint
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    for result_file in job.glob("*/result.json"):
+        payload = json.loads(result_file.read_text())
+        payload["config"]["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = (
+            fingerprint
+        )
+        result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_analyze_rejects_two_arms_produced_by_different_builds(
+    tmp_path: Path,
+) -> None:
+    # The hazard the fingerprint exists for: comparing an arm built by one
+    # revision against an arm built by another. Each lock is internally
+    # consistent here, so only a cross-arm check can catch it -- the old
+    # per-lock comparison against the installed build never looked across arms.
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    _restamp_build(driftlock, "b" * 64)
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+    message = str(caught.value)
+    assert "experiment arms mix driftlock builds" in message
+    assert "b" * 64 in message
+    assert "not comparable" in message
+
+
+def test_analyze_records_whether_the_reader_was_the_producing_build(
+    tmp_path: Path,
+) -> None:
+    # Analysing with a different build is reported, not refused: making it fatal
+    # meant an analyzer bug permanently locked out the run it affected.
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    for job in (stock, driftlock):
+        _restamp_build(job, "c" * 64)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    matrix = report["matrix"]
+    assert matrix["driftlock_build_fingerprint"] == "c" * 64
+    assert matrix["analyzer_build_fingerprint"] == lhtb_runtime_fingerprint()
+    assert matrix["analyzed_by_producing_build"] is False
 
 
 def test_analyze_distinguishes_heuristic_and_fine_judge_arms(
