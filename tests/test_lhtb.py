@@ -802,3 +802,117 @@ def test_generated_process_scripts_are_valid_shell_and_quote_inputs() -> None:
         assert result.returncode == 0, result.stderr
     assert "'session name; touch /tmp/nope'" in cleanup
     assert "'/workspace with spaces'" in cleanup
+
+
+class FakeRateLimitError(Exception):
+    """Shaped like litellm.RateLimitError: an HTTP 429 with a status attribute."""
+
+    def __init__(self, message: str = "rate limited") -> None:
+        super().__init__(message)
+        self.status_code = 429
+
+
+class FakeServerError(Exception):
+    def __init__(self) -> None:
+        super().__init__("bad gateway")
+        self.status_code = 502
+
+
+def test_rate_limit_rejection_matches_429_only() -> None:
+    assert lhtb.is_rate_limit_rejection(FakeRateLimitError()) is True
+    assert lhtb.is_rate_limit_rejection(FakeServerError()) is False
+    assert lhtb.is_rate_limit_rejection(TimeoutError("slow")) is False
+    assert lhtb.is_rate_limit_rejection(ValueError("nope")) is False
+
+
+def test_rate_limit_rejection_recognises_the_class_name_without_a_status() -> None:
+    # litellm raises RateLimitError; some transports leave status_code unset.
+    named = type("RateLimitError", (Exception,), {})()
+
+    assert lhtb.is_rate_limit_rejection(named) is True
+    assert lhtb.is_rate_limit_rejection(type("Other", (Exception,), {})()) is False
+
+
+async def test_counting_llm_retries_a_rate_limited_call_on_the_same_provider() -> None:
+    response = FakeResponse("done", FakeUsage(10, 2))
+    llm = FakeLLM([FakeRateLimitError(), FakeRateLimitError(), response])
+    slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    counting = lhtb._CountingLLM(
+        llm,
+        bypass_retry_wrapper=False,
+        rate_limit_retries=3,
+        rate_limit_backoff_sec=1.0,
+        rate_limit_backoff_cap_sec=2.0,
+        sleep=sleep,
+    )
+
+    assert await counting.call("go", extra_body={"provider": {"only": ["baidu/fp8"]}})
+    # One logical call, three physical attempts, two of them refused.
+    assert counting.call_count == 1
+    assert counting.rate_limited_call_count == 2
+    assert len(llm.calls) == 3
+    assert slept == [1.0, 2.0]
+    # The routing is never rewritten: a retry must not become a provider switch.
+    assert {call["extra_body"]["provider"]["only"][0] for call in llm.calls} == {
+        "baidu/fp8"
+    }
+
+
+async def test_counting_llm_gives_up_after_the_configured_retries() -> None:
+    llm = FakeLLM([FakeRateLimitError() for _ in range(4)])
+
+    async def sleep(seconds: float) -> None:
+        return None
+
+    counting = lhtb._CountingLLM(
+        llm,
+        bypass_retry_wrapper=False,
+        rate_limit_retries=2,
+        rate_limit_backoff_sec=1.0,
+        sleep=sleep,
+    )
+
+    with pytest.raises(FakeRateLimitError):
+        await counting.call("go")
+
+    assert len(llm.calls) == 3
+    assert counting.rate_limited_call_count == 2
+
+
+async def test_counting_llm_does_not_retry_a_non_rate_limit_failure() -> None:
+    llm = FakeLLM([FakeServerError(), FakeResponse("unreachable", FakeUsage(10, 2))])
+
+    counting = lhtb._CountingLLM(
+        llm, bypass_retry_wrapper=False, rate_limit_retries=5, rate_limit_backoff_sec=0
+    )
+
+    with pytest.raises(FakeServerError):
+        await counting.call("go")
+
+    assert len(llm.calls) == 1
+    assert counting.rate_limited_call_count == 0
+
+
+async def test_counting_llm_makes_one_attempt_when_retries_are_disabled() -> None:
+    llm = FakeLLM([FakeRateLimitError(), FakeResponse("unreachable", FakeUsage(10, 2))])
+
+    counting = lhtb._CountingLLM(llm, bypass_retry_wrapper=False)
+
+    with pytest.raises(FakeRateLimitError):
+        await counting.call("go")
+
+    assert len(llm.calls) == 1
+    assert counting.rate_limited_call_count == 0
+
+
+def test_counting_llm_rejects_a_negative_retry_policy() -> None:
+    llm = FakeLLM([])
+
+    with pytest.raises(ValueError, match="rate_limit_retries cannot be negative"):
+        lhtb._CountingLLM(llm, bypass_retry_wrapper=False, rate_limit_retries=-1)
+    with pytest.raises(ValueError, match="backoff cannot be negative"):
+        lhtb._CountingLLM(llm, bypass_retry_wrapper=False, rate_limit_backoff_sec=-1.0)

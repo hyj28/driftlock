@@ -549,7 +549,7 @@ async def test_step_adapter_rejects_multiple_physical_provider_calls() -> None:
 
     adapter = TerminusStepAdapter(SummarizingRuntime())
 
-    with pytest.raises(RuntimeError, match="exactly one provider call"):
+    with pytest.raises(RuntimeError, match="exactly one billable provider call"):
         await adapter(_context(adapter.initial_state()))
 
 
@@ -595,4 +595,86 @@ async def test_step_adapter_rejects_runtime_that_skips_episodes() -> None:
     adapter = TerminusStepAdapter(SkippingRuntime())
 
     with pytest.raises(RuntimeError, match="exactly one episode"):
+        await adapter(_context(adapter.initial_state()))
+
+
+async def test_step_adapter_allows_a_step_that_retried_a_rate_limited_provider() -> (
+    None
+):
+    class RateLimitedRuntime(FakeBoundaryRuntime):
+        rate_limited_call_count = 0
+
+        async def start(
+            self,
+            *,
+            prompt: str,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            # Two 429s and then the one call that actually generated something.
+            self.provider_call_count += 3
+            type(self).rate_limited_call_count += 2
+            return _boundary(
+                episode=1,
+                next_prompt="next",
+                tokens=100,
+                user_prompt=prompt,
+            )
+
+    adapter = TerminusStepAdapter(RateLimitedRuntime())
+
+    outcome = await adapter(_context(adapter.initial_state()))
+
+    assert outcome.tokens == 100
+
+
+async def test_step_adapter_still_rejects_extra_calls_that_were_not_rate_limited() -> (
+    None
+):
+    class PartlyRateLimitedRuntime(FakeBoundaryRuntime):
+        rate_limited_call_count = 0
+
+        async def start(
+            self,
+            *,
+            prompt: str,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            # Four physical calls, only one refused: two generations were billed.
+            self.provider_call_count += 4
+            type(self).rate_limited_call_count += 1
+            return _boundary(
+                episode=1,
+                next_prompt="next",
+                tokens=100,
+                user_prompt=prompt,
+            )
+
+    adapter = TerminusStepAdapter(PartlyRateLimitedRuntime())
+
+    with pytest.raises(RuntimeError, match="leaving 3"):
+        await adapter(_context(adapter.initial_state()))
+
+
+async def test_step_adapter_rejects_a_rate_limit_counter_that_moves_backwards() -> None:
+    class RewindingRuntime(FakeBoundaryRuntime):
+        rate_limited_call_count = 5
+
+        async def start(
+            self,
+            *,
+            prompt: str,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.provider_call_count += 1
+            type(self).rate_limited_call_count = 1
+            return _boundary(
+                episode=1,
+                next_prompt="next",
+                tokens=100,
+                user_prompt=prompt,
+            )
+
+    adapter = TerminusStepAdapter(RewindingRuntime())
+
+    with pytest.raises(RuntimeError, match="must be monotonic"):
         await adapter(_context(adapter.initial_state()))

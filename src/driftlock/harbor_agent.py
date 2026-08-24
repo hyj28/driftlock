@@ -460,6 +460,16 @@ class LHTBDriftlockAgent(Terminus2):
         self._driftlock_runtime = runtime
         self._driftlock_step = TerminusStepAdapter(runtime)
 
+    def _driftlock_rate_limited_calls(self) -> int:
+        """Physical calls refused with 429 so far, or 0 before setup has run."""
+        runtime = getattr(self, "_driftlock_runtime", None)
+        rejected = getattr(runtime, "rate_limited_call_count", 0)
+        if not isinstance(rejected, int) or isinstance(rejected, bool) or rejected < 0:
+            raise RuntimeError(
+                "runtime rate_limited_call_count must be a non-negative integer"
+            )
+        return rejected
+
     def _set_result_metadata(self, context: Any, result: RunResult) -> None:
         metadata = dict(context.metadata or {})
         summary = {
@@ -470,6 +480,7 @@ class LHTBDriftlockAgent(Terminus2):
             "agent_tokens_used": result.agent_tokens_used,
             "judge_tokens_used": result.judge_tokens_used,
             "signal_counts": result.signal_counts,
+            "rate_limited_calls": self._driftlock_rate_limited_calls(),
             "trial_tokens_used": self._driftlock_tokens_consumed,
             "trial_token_budget": self._driftlock_runner_config.max_tokens,
         }
@@ -507,6 +518,7 @@ class LHTBDriftlockAgent(Terminus2):
                         trigger.to_dict() for trigger in result.coarse_triggers
                     ],
                     "signal_counts": result.signal_counts,
+                    "rate_limited_calls": self._driftlock_rate_limited_calls(),
                 }
             )
         self._driftlock_phases.append(record)
@@ -616,7 +628,9 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
             user=self._driftlock_environment.default_user,
             before_restore=self._driftlock_step.before_workspace_restore,
         )
-        provider_calls_before = self._driftlock_runtime.provider_call_count
+        # Billable, not physical: a phase whose only calls were refused with 429
+        # generated nothing, so the blind retry has not actually started.
+        billable_before = self._driftlock_billable_call_count()
         try:
             initial_state = await store.restore(checkpoint)
             await self._run_driftlock_phase(
@@ -626,13 +640,18 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
                 initial_state=initial_state,
             )
         finally:
-            provider_calls_after = self._driftlock_runtime.provider_call_count
-            if provider_calls_after == provider_calls_before:
+            billable_after = self._driftlock_billable_call_count()
+            if billable_after == billable_before:
                 await guard_store.restore(guard_checkpoint)
             else:
                 self._driftlock_retry_count += 1
             shutil.rmtree(guard_root, ignore_errors=True)
         self._set_retry_metadata(context)
+
+    def _driftlock_billable_call_count(self) -> int:
+        runtime = self._driftlock_runtime
+        rejected = self._driftlock_rate_limited_calls()
+        return runtime.provider_call_count - rejected
 
     def _retain_phase_checkpoints(self, phase: int) -> bool:
         return phase == 0
