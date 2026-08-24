@@ -391,6 +391,12 @@ class _CountingLLM:
         self._sleep = sleep or asyncio.sleep
 
     async def _attempt(self, prompt: str, **kwargs: Any) -> Any:
+        # Counted per physical attempt, not per logical call, so that the
+        # fallback counter in provider_call_count means the same thing as the
+        # patched LiteLLM's own counter. Mixing a logical count with the
+        # physical rate-limit count would make the boundary arithmetic reject
+        # valid steps wherever the patch is absent.
+        self.call_count += 1
         call = self.delegate.call
         if self.bypass_retry_wrapper:
             unwrapped = getattr(call, "__wrapped__", None)
@@ -402,7 +408,6 @@ class _CountingLLM:
         return await call(prompt=prompt, **kwargs)
 
     async def call(self, prompt: str, **kwargs: Any) -> Any:
-        self.call_count += 1
         delay = self.rate_limit_backoff_sec
         for remaining in range(self.rate_limit_retries, -1, -1):
             try:
@@ -649,6 +654,7 @@ class LHTBTerminusRuntime:
         _validate_token_ceiling(tokens_remaining)
         before = await self.observer.snapshot()
         calls_before = self.provider_call_count
+        rate_limited_before = self.rate_limited_call_count
         steps_before = len(self.agent._trajectory_steps)
         old_max_episodes = self.agent._max_episodes
         old_call_kwargs = dict(self.agent._llm_call_kwargs)
@@ -702,9 +708,15 @@ class LHTBTerminusRuntime:
             self.agent._llm_call_kwargs.clear()
             self.agent._llm_call_kwargs.update(old_call_kwargs)
 
-        if self.provider_call_count != calls_before + 1:
+        # Billable, not physical. A 429 is refused before the model runs, so a
+        # retried step still made exactly one call that generated anything.
+        rejected = self.rate_limited_call_count - rate_limited_before
+        if self.provider_call_count - calls_before - rejected != 1:
             raise RuntimeError(
-                "pinned Terminus boundary did not make exactly one provider call"
+                "pinned Terminus boundary did not make exactly one billable "
+                f"provider call: counter went {calls_before} -> "
+                f"{self.provider_call_count} with {rejected} refused by rate "
+                "limiting"
             )
 
         if truncation is not None:

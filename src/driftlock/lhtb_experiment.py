@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from collections.abc import Sequence
 from importlib.metadata import version as package_version
@@ -43,9 +45,11 @@ from driftlock.oracle import (
 # so arms run on different days would use different models while the recorded
 # model string stayed identical - the comparison would be void with no evidence.
 DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
-DEFAULT_PROVIDER = "baidu/fp8"
+DEFAULT_PROVIDER = "deepinfra/fp8"
 DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
 DEFAULT_JUDGE_PROVIDER = "alibaba"
+# Arms that pay for a fine judge, and therefore need its provider probed too.
+_FINE_JUDGE_ARMS = frozenset({"driftlock", "native-driftlock"})
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 RUNNABLE_ARMS = (
@@ -657,6 +661,57 @@ def select_tasks(
     }
 
 
+def probe_provider(
+    *,
+    model: str,
+    provider: str,
+    api_base: str,
+    credential_env: str = DEFAULT_CREDENTIAL_ENV,
+    timeout_sec: float = 60.0,
+    opener: Any = None,
+) -> None:
+    """Ask *provider* for one token, so a dead pin fails now instead of in an hour.
+
+    This costs a fraction of a cent and is the only paid call the launcher makes
+    itself. It exists because on 2026-08-24 a four-arm round ran for three hours
+    against a provider whose shared upstream pool had been returning 429
+    continuously since before the round started, and produced nothing at all.
+    """
+    key = os.environ.get(credential_env)
+    if not key:
+        raise PreflightError(
+            f"credential environment variable {credential_env} is not set"
+        )
+    body = json.dumps(
+        {
+            "model": model.removeprefix("openrouter/"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            **openrouter_provider_call_kwargs(provider)["extra_body"],
+        }
+    ).encode()
+    request = urllib.request.Request(
+        api_base.rstrip("/") + "/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    send = opener or urllib.request.urlopen
+    try:
+        with send(request, timeout=timeout_sec) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:200].replace("\n", " ")
+        raise PreflightError(
+            f"pinned provider {provider!r} for {model!r} answered HTTP "
+            f"{error.code}: {detail}"
+        ) from error
+    except Exception as error:
+        raise PreflightError(
+            f"pinned provider {provider!r} for {model!r} is unreachable: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -682,6 +737,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "--ack-unbounded-stock-tokens after setting a provider "
                         "spend cap"
                     )
+                if not args.no_provider_probe:
+                    probe_provider(
+                        model=args.model,
+                        provider=args.provider,
+                        api_base=args.api_base,
+                        credential_env=args.credential_env,
+                    )
+                    if args.arm in _FINE_JUDGE_ARMS:
+                        probe_provider(
+                            model=DEFAULT_JUDGE_MODEL,
+                            provider=args.judge_provider,
+                            api_base=args.judge_api_base or args.api_base,
+                            credential_env=args.credential_env,
+                        )
             config = build_job_config(
                 lhtb_dir=args.lhtb_dir,
                 jobs_dir=args.jobs_dir,
@@ -810,6 +879,7 @@ def _parser() -> argparse.ArgumentParser:
         # driftlock-job.json and then all four ran the file the last writer left,
         # so every arm executed as driftlock into one job directory.
         command.add_argument("--config", type=Path, default=None)
+        command.add_argument("--no-provider-probe", action="store_true")
         command.add_argument("--job-name", required=True)
         command.add_argument("--arm", choices=RUNNABLE_ARMS, required=True)
         command.add_argument("--tasks", nargs="+", required=True)
