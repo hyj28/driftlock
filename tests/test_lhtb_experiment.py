@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
+import urllib.error
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,7 +153,7 @@ def test_every_paid_agent_arm_has_strict_provider_routing(
     )
 
     assert config["agents"][0]["kwargs"]["llm_call_kwargs"]["extra_body"] == {
-        "provider": {"only": ["baidu/fp8"], "allow_fallbacks": False}
+        "provider": {"only": ["deepinfra/fp8"], "allow_fallbacks": False}
     }
 
 
@@ -608,6 +610,7 @@ def test_run_uses_current_python_harbor_and_pins_continuation_environment(
     monkeypatch.setattr(experiment.subprocess, "run", fake_run)
     arguments = [
         "run",
+        "--no-provider-probe",
         "--lhtb-dir",
         str(root),
         "--config",
@@ -633,6 +636,223 @@ def test_run_uses_current_python_harbor_and_pins_continuation_environment(
     assert "HB_PROCESS_REWARD" not in child_env
 
 
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes = b"{}") -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _FakeHTTPResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def test_provider_probe_asks_the_pinned_provider_for_one_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret-value")
+    seen: list[tuple[str, dict[str, object], dict[str, str]]] = []
+
+    def opener(request: object, timeout: float = 0.0) -> _FakeHTTPResponse:
+        seen.append(
+            (
+                request.full_url,
+                json.loads(request.data),
+                dict(request.headers),
+            )
+        )
+        return _FakeHTTPResponse()
+
+    experiment.probe_provider(
+        model="openrouter/deepseek/deepseek-v4-flash-0731",
+        provider="deepinfra/fp8",
+        api_base="https://openrouter.ai/api/v1",
+        opener=opener,
+    )
+
+    assert len(seen) == 1
+    url, body, headers = seen[0]
+    assert url == "https://openrouter.ai/api/v1/chat/completions"
+    # The openrouter/ prefix is a LiteLLM routing convention, not part of the id.
+    assert body["model"] == "deepseek/deepseek-v4-flash-0731"
+    assert body["max_tokens"] == 1
+    assert body["provider"] == {
+        "only": ["deepinfra/fp8"],
+        "allow_fallbacks": False,
+    }
+    assert headers["Authorization"] == "Bearer secret-value"
+
+
+def test_provider_probe_reports_a_rate_limited_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret-value")
+
+    def opener(request: object, timeout: float = 0.0) -> _FakeHTTPResponse:
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(b'{"error":{"code":429,"metadata":{"raw":"rate-limited"}}}'),
+        )
+
+    with pytest.raises(experiment.PreflightError) as caught:
+        experiment.probe_provider(
+            model="openrouter/deepseek/deepseek-v4-flash-0731",
+            provider="baidu/fp8",
+            api_base="https://openrouter.ai/api/v1",
+            opener=opener,
+        )
+
+    message = str(caught.value)
+    assert "baidu/fp8" in message
+    assert "429" in message
+    assert "rate-limited" in message
+
+
+def test_run_probes_both_providers_before_spending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    monkeypatch.setattr(experiment, "preflight", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        experiment, "_pinned_harbor_command", lambda: ["/pinned/bin/harbor"]
+    )
+    probed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        experiment,
+        "probe_provider",
+        lambda **kwargs: probed.append((kwargs["model"], kwargs["provider"])),
+    )
+    started: list[list[str]] = []
+    monkeypatch.setattr(
+        experiment.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            started.append(command) or SimpleNamespace(returncode=0)
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "run",
+                "--lhtb-dir",
+                str(root),
+                "--jobs-dir",
+                str(tmp_path / "jobs"),
+                "--job-name",
+                "probed",
+                "--arm",
+                "driftlock",
+                "--tasks",
+                "task-a",
+            ]
+        )
+        == 0
+    )
+
+    assert probed == [
+        ("openrouter/deepseek/deepseek-v4-flash-0731", "deepinfra/fp8"),
+        ("openrouter/deepseek/deepseek-v4-pro-0813", "alibaba"),
+    ]
+    assert len(started) == 1
+
+
+def test_run_does_not_probe_a_judge_the_arm_never_pays_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    monkeypatch.setattr(experiment, "preflight", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        experiment, "_pinned_harbor_command", lambda: ["/pinned/bin/harbor"]
+    )
+    probed: list[str] = []
+    monkeypatch.setattr(
+        experiment,
+        "probe_provider",
+        lambda **kwargs: probed.append(kwargs["provider"]),
+    )
+    monkeypatch.setattr(
+        experiment.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "run",
+                "--lhtb-dir",
+                str(root),
+                "--jobs-dir",
+                str(tmp_path / "jobs"),
+                "--job-name",
+                "heuristic-probed",
+                "--arm",
+                "driftlock-heuristic",
+                "--tasks",
+                "task-a",
+            ]
+        )
+        == 0
+    )
+
+    assert probed == ["deepinfra/fp8"]
+
+
+def test_a_dead_provider_stops_the_run_before_harbor_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    monkeypatch.setattr(experiment, "preflight", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        experiment, "_pinned_harbor_command", lambda: ["/pinned/bin/harbor"]
+    )
+
+    def dead(**kwargs: object) -> None:
+        raise experiment.PreflightError("pinned provider 'x' answered HTTP 429")
+
+    monkeypatch.setattr(experiment, "probe_provider", dead)
+    started: list[list[str]] = []
+    monkeypatch.setattr(
+        experiment.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            started.append(command) or SimpleNamespace(returncode=0)
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    # A failed precondition exits through argparse, like every other one.
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "run",
+                "--lhtb-dir",
+                str(root),
+                "--jobs-dir",
+                str(tmp_path / "jobs"),
+                "--job-name",
+                "doomed",
+                "--arm",
+                "stock",
+                "--ack-unbounded-stock-tokens",
+                "--tasks",
+                "task-a",
+            ]
+        )
+
+    assert caught.value.code == 2
+    assert started == []
+
+
 def test_two_jobs_do_not_share_a_config_path_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -655,6 +875,7 @@ def test_two_jobs_do_not_share_a_config_path_by_default(
     for arm, job in (("stock", "round-stock"), ("driftlock", "round-driftlock")):
         arguments = [
             "run",
+            "--no-provider-probe",
             "--lhtb-dir",
             str(root),
             "--jobs-dir",
@@ -710,6 +931,7 @@ def test_run_refuses_a_config_another_writer_replaced(
         main(
             [
                 "run",
+                "--no-provider-probe",
                 "--lhtb-dir",
                 str(root),
                 "--jobs-dir",

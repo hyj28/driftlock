@@ -352,6 +352,7 @@ def _runtime(
     responses: list[FakeResponse | BaseException],
     *,
     observer: FakeObserver | None = None,
+    rate_limit_retries: int = 0,
 ) -> tuple[LHTBTerminusRuntime, FakeAgent, FakeLLM, Any]:
     llm = FakeLLM(responses)
     agent = FakeAgent(llm)
@@ -364,6 +365,8 @@ def _runtime(
         remote_workspace="/app",
         observer=observer or FakeObserver(),
         require_pinned_harbor=False,
+        rate_limit_retries=rate_limit_retries,
+        rate_limit_backoff_sec=0.0,
     )
     return runtime, agent, llm, context
 
@@ -851,9 +854,10 @@ async def test_counting_llm_retries_a_rate_limited_call_on_the_same_provider() -
     )
 
     assert await counting.call("go", extra_body={"provider": {"only": ["baidu/fp8"]}})
-    # One logical call, three physical attempts, two of them refused.
-    assert counting.call_count == 1
+    # Three physical attempts, two of them refused, so one generation was billed.
+    assert counting.call_count == 3
     assert counting.rate_limited_call_count == 2
+    assert counting.call_count - counting.rate_limited_call_count == 1
     assert len(llm.calls) == 3
     assert slept == [1.0, 2.0]
     # The routing is never rewritten: a retry must not become a provider switch.
@@ -916,3 +920,44 @@ def test_counting_llm_rejects_a_negative_retry_policy() -> None:
         lhtb._CountingLLM(llm, bypass_retry_wrapper=False, rate_limit_retries=-1)
     with pytest.raises(ValueError, match="backoff cannot be negative"):
         lhtb._CountingLLM(llm, bypass_retry_wrapper=False, rate_limit_backoff_sec=-1.0)
+
+
+async def test_a_rate_limited_retry_still_counts_as_one_boundary_call(
+    fake_harbor_symbols: None,
+) -> None:
+    # The boundary check counts *billable* calls. Two 429s and one generation is
+    # one step, not three: this is what killed 12 trials on 2026-08-24, when the
+    # retry worked and the invariant threw the result away.
+    runtime, _agent, llm, _context = _runtime(
+        [
+            FakeRateLimitError(),
+            FakeRateLimitError(),
+            FakeResponse("done", FakeUsage(20, 4)),
+        ],
+        rate_limit_retries=3,
+    )
+
+    prompt = await runtime.prepare_start("fix it", plan="p", rollback_feedback=None)
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert boundary.tokens == 24
+    assert len(llm.calls) == 3
+    assert runtime.provider_call_count == 3
+    assert runtime.rate_limited_call_count == 2
+
+
+async def test_an_exhausted_rate_limit_retry_propagates(
+    fake_harbor_symbols: None,
+) -> None:
+    # When the provider stays down past the retry budget the step must fail
+    # loudly with the provider's own error, not be silently absorbed.
+    runtime, _agent, llm, _context = _runtime(
+        [FakeRateLimitError() for _ in range(5)], rate_limit_retries=2
+    )
+    prompt = await runtime.prepare_start("fix it", plan="p", rollback_feedback=None)
+
+    with pytest.raises(FakeRateLimitError):
+        await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert len(llm.calls) == 3
+    assert runtime.rate_limited_call_count == 2

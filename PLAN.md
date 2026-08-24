@@ -235,6 +235,33 @@ loop, and differs from `driftlock` only in that it never rolls back. `retry` vs
 `driftlock` isolates rollback; `stock` vs `driftlock` does not, and is reported
 as loop-plus-constraint-plus-rollback rather than as a rollback effect.
 
+### 3.2.1a Why the agent provider moved off `baidu/fp8`
+
+`baidu/fp8` was the original pin: fp8 rather than fp4, a full 1M context, and the
+cheapest fp8 endpoint at the time. It is no longer usable. On 2026-08-24 it
+returned `tpm_rate_limit_exceeded` continuously from roughly 00:35 to at least
+03:30 — a live one-token probe at 03:40 was still refused — and a four-arm round
+launched into that window produced nothing at all across three hours and 32
+trials.
+
+The agent is now pinned to `deepinfra/fp8`: same fp8 quantisation, same 1M
+context, cheaper ($0.08/$0.18 against Baidu's current $0.14/$0.28), and answering
+when Baidu was not. The judge stays on `alibaba`, which answered throughout.
+
+None of this is a claim that DeepInfra has more headroom — every routable
+endpoint here is a shared pool and the API exposes no per-pool capacity. It is a
+claim that the previous pin was measurably dead and this one was measurably
+alive. What actually protects the round is the check below, not the choice of
+slug.
+
+**`run` now probes before it spends.** Every paid launch first asks each pinned
+provider — the agent's, and the judge's for the arms that pay for one — for a
+single token, and refuses to start if either does not answer. It costs a
+fraction of a cent and it is the only paid call the launcher makes itself. Had it
+existed, the 2026-08-24 round would have refused to start at 00:34 instead of
+discovering the same fact three hours and four dead arms later. `preflight`
+itself is unchanged and still spends nothing.
+
 ### 3.2.2 Why the arms now run concurrently
 
 Round 1 and round 2 ran the four arms one after another, so `stock` executed
@@ -412,7 +439,7 @@ that, and from a constraint the original plan got backwards.
 
 | Role | Model and pinned provider | Price per 1M tokens |
 | --- | --- | --- |
-| Agent — high call count | DeepSeek **V4-Flash 0731**, `baidu/fp8` | $0.069 in / $0.0137 cache / $0.137 out |
+| Agent — high call count | DeepSeek **V4-Flash 0731**, `deepinfra/fp8` | $0.08 in / $0.18 out |
 | Fine judge — fires only when the coarse tier trips | DeepSeek **V4-Pro 0813**, `alibaba` | $1.162 in / $0.1162 cache / $3.485 out |
 | Skill retrieval | Local sentence-transformers | $0 |
 
