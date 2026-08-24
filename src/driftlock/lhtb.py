@@ -7,6 +7,7 @@ pinned LHTB checkout and apply the packaged companion patch.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import importlib.metadata
@@ -32,6 +33,13 @@ from driftlock.terminus import (
 LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
 LHTB_LITELLM_VERSION = "1.83.14"
 DRIFTLOCK_HARBOR_PATCH_VERSION = 11
+
+# On 2026-08-23 the pinned agent provider's *shared* upstream pool was saturated
+# for at least 11 minutes and every trial then in flight died. These defaults cover
+# roughly 12 minutes of continuous 429s per step: 15 + 30 + 60 + 120 * 5.
+DEFAULT_RATE_LIMIT_RETRIES = 8
+DEFAULT_RATE_LIMIT_BACKOFF_SEC = 15.0
+DEFAULT_RATE_LIMIT_BACKOFF_CAP_SEC = 120.0
 
 _RETRY_OR_FALLBACK_KEYS = frozenset(
     {
@@ -334,16 +342,55 @@ PY
         return WorkspaceDelta(changed_paths=changed_paths, diff=diff)
 
 
+def is_rate_limit_rejection(error: BaseException) -> bool:
+    """Whether *error* is a provider rejection that generated and billed nothing.
+
+    Only HTTP 429 qualifies. A 429 is refused before the model runs, so no
+    completion exists to be billed and retrying the *same* provider cannot make
+    a billed call look free -- which is the property that lets a retry coexist
+    with the one-billable-call-per-step invariant in ``terminus.py``.
+
+    LiteLLM is not importable where this is tested, so the check is
+    duck-typed: an explicit 429 status, or the exception's own class name.
+    Anything else is left to propagate.
+    """
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status == 429
+    return type(error).__name__ == "RateLimitError"
+
+
 class _CountingLLM:
     """Count calls at the lowest Harbor provider abstraction."""
 
-    def __init__(self, delegate: Any, *, bypass_retry_wrapper: bool) -> None:
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        bypass_retry_wrapper: bool,
+        rate_limit_retries: int = 0,
+        rate_limit_backoff_sec: float = 0.0,
+        rate_limit_backoff_cap_sec: float = 0.0,
+        sleep: Any = None,
+    ) -> None:
+        if rate_limit_retries < 0:
+            raise ValueError("rate_limit_retries cannot be negative")
+        if rate_limit_backoff_sec < 0 or rate_limit_backoff_cap_sec < 0:
+            raise ValueError("rate limit backoff cannot be negative")
         self.delegate = delegate
         self.call_count = 0
+        # Physical calls that ended in a 429. They generated nothing, so they are
+        # excluded from the one-call-per-step check -- but they are counted, not
+        # discarded, so a run that only survived by hammering a saturated
+        # provider is visible in the record instead of looking clean.
+        self.rate_limited_call_count = 0
         self.bypass_retry_wrapper = bypass_retry_wrapper
+        self.rate_limit_retries = rate_limit_retries
+        self.rate_limit_backoff_sec = rate_limit_backoff_sec
+        self.rate_limit_backoff_cap_sec = rate_limit_backoff_cap_sec
+        self._sleep = sleep or asyncio.sleep
 
-    async def call(self, prompt: str, **kwargs: Any) -> Any:
-        self.call_count += 1
+    async def _attempt(self, prompt: str, **kwargs: Any) -> Any:
         call = self.delegate.call
         if self.bypass_retry_wrapper:
             unwrapped = getattr(call, "__wrapped__", None)
@@ -353,6 +400,26 @@ class _CountingLLM:
                 )
             return await unwrapped(self.delegate, prompt=prompt, **kwargs)
         return await call(prompt=prompt, **kwargs)
+
+    async def call(self, prompt: str, **kwargs: Any) -> Any:
+        self.call_count += 1
+        delay = self.rate_limit_backoff_sec
+        for remaining in range(self.rate_limit_retries, -1, -1):
+            try:
+                return await self._attempt(prompt, **kwargs)
+            except LHTBRuntimeCompatibilityError:
+                raise
+            except Exception as error:
+                if not remaining or not is_rate_limit_rejection(error):
+                    raise
+                self.rate_limited_call_count += 1
+                if delay:
+                    await self._sleep(delay)
+                    if self.rate_limit_backoff_cap_sec:
+                        delay = min(delay * 2, self.rate_limit_backoff_cap_sec)
+                    else:
+                        delay *= 2
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
@@ -378,6 +445,9 @@ class LHTBTerminusRuntime:
         remote_workspace: str,
         observer: WorkspaceDeltaObserver,
         require_pinned_harbor: bool = True,
+        rate_limit_retries: int = DEFAULT_RATE_LIMIT_RETRIES,
+        rate_limit_backoff_sec: float = DEFAULT_RATE_LIMIT_BACKOFF_SEC,
+        rate_limit_backoff_cap_sec: float = DEFAULT_RATE_LIMIT_BACKOFF_CAP_SEC,
     ) -> None:
         self.agent = agent
         self.environment = environment
@@ -420,7 +490,11 @@ class LHTBTerminusRuntime:
                 "Terminus agent is already owned by an LHTBTerminusRuntime"
             )
         self._counting_llm = _CountingLLM(
-            llm, bypass_retry_wrapper=require_pinned_harbor
+            llm,
+            bypass_retry_wrapper=require_pinned_harbor,
+            rate_limit_retries=rate_limit_retries,
+            rate_limit_backoff_sec=rate_limit_backoff_sec,
+            rate_limit_backoff_cap_sec=rate_limit_backoff_cap_sec,
         )
         if require_pinned_harbor:
             llm._driftlock_single_attempt = True
@@ -436,6 +510,11 @@ class LHTBTerminusRuntime:
         if isinstance(physical_count, int) and not isinstance(physical_count, bool):
             return physical_count
         return self._counting_llm.call_count
+
+    @property
+    def rate_limited_call_count(self) -> int:
+        """Physical calls refused with 429, which generated and billed nothing."""
+        return self._counting_llm.rate_limited_call_count
 
     async def prepare_start(
         self,

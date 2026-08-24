@@ -235,6 +235,28 @@ loop, and differs from `driftlock` only in that it never rolls back. `retry` vs
 `driftlock` isolates rollback; `stock` vs `driftlock` does not, and is reported
 as loop-plus-constraint-plus-rollback rather than as a rollback effect.
 
+### 3.2.2 Why the arms now run concurrently
+
+Round 1 and round 2 ran the four arms one after another, so `stock` executed
+between 21:52 and 23:34 and the other three started only after it finished. That
+is two problems, not one.
+
+It is a **confound**: provider latency, queue depth and rate-limit headroom are
+not constant across a twelve-hour window, and an arm that ran at a quiet hour is
+not compute-matched to one that ran at a busy one in any sense the token counter
+can see.
+
+It is also **fragile**: when the shared pool saturated at 23:28 it caught three
+arms that had not started, and all 24 of their trials died within 90 seconds of
+each other. Sequencing turned one provider incident into a total loss instead of
+a partial one.
+
+The arms therefore run as four concurrent Harbor jobs, one trial in flight each,
+rather than one job at a time with four trials in flight. Total concurrency and
+total wall clock are unchanged; what changes is that the four arms meet the same
+provider conditions at the same moment, and an incident degrades all of them
+equally rather than annihilating the ones that had not started yet.
+
 ### 3.3 Skill representation
 
 One schema, shared by **both** distillation arms. This is a correctness requirement,
@@ -479,7 +501,7 @@ the results section stays empty, per §1.
 | 8 | **Budget overrun** — ~$41 of API leaves room for roughly one redo | Can't iterate | Use V4-Flash during development; hold the 8-task LHTB subset |
 | 9 | **Attribution against external baselines** — with subagents in the agent, comparisons to Memento / ReasoningBank / GEPA can't isolate which component won | Weaker external claim | Accepted. All four arms per benchmark share the same agent, so every *internal* comparison is clean; external numbers are cited as reference points, not as controlled comparisons |
 | 10 | **`sustained_command_failure` misses an alternating wedged toolchain** — the detector requires all commands to fail on every step of an 8-step window, which is exactly what excludes ordinary red-green TDD; an agent whose toolchain is broken but which alternates edit-only steps with command steps evades it entirely (measured: fires on 8/8 all-fail, silent on alternating) | Missed intervention | Accepted for now. The miss is in the safe direction: a missed detection makes the driftlock arm behave like the no-intervention arm, so it can only understate the effect, never inflate it. Loosening the threshold enough to catch it also re-catches TDD, because every command-running step in a TDD loop is also all-fail. Retune from week-1 measurements rather than from speculation |
-| 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin. **Resilience is deliberately not bought back.** Strict pinning means a provider outage fails the trial, and across 51 trials in the week-1 and first four-arm rounds that cost exactly one trial (a Baidu 429). Allowing fallbacks would void the comparison, and letting Harbor retry the trial would re-spend tokens the final `result.json` never records, which breaks compute-matching — so `max_retries` stays 0 and the analyzer keeps rejecting any job that used one. A lost trial is re-run as a fresh job |
+| 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin. **Resilience is bought back inside the step, not by relaxing the pin.** The pinned provider is served from a *shared* upstream pool: on 2026-08-23 it returned `tpm_rate_limit_exceeded` continuously for at least 11 minutes and took 28 of that round's 32 trials with it, including three whole arms that never ran a single step. A 429 is refused before the model runs, so it generates and bills nothing — which is what lets a step retry the *same* provider without weakening the one-billable-call-per-step rule. Refused attempts are counted, excluded from that rule, and reported per phase as `rate_limited_calls`, so a run that only survived by hammering a saturated provider does not look clean. `max_retries` stays 0 at the Harbor level and the analyzer keeps rejecting trial-level retries, which would re-spend tokens the final `result.json` never records |
 | 12 | **The corroborating gate is fitted on 3 tasks** — `no_file_change` was demoted on one diagnostic run: 109 solo firings, 109 rejected, 2 rollbacks total (§3.2). The tasks were chosen for their spread on the week-1 screen, not sampled, and a task where the agent genuinely stalls *without* looping would now be missed | Missed intervention; a knob fitted on the data it is judged by | The miss is in the safe direction — a gated detector makes the driftlock arm behave more like the no-intervention arm, which can only understate the effect. Suppressed triggers keep being recorded, so the held-out week-9 run re-measures the gate on tasks it was not fitted on: if solo `no_file_change` ever precedes a genuine stall there, the demotion is wrong and the record shows it |
 | 13 | **Output-ceiling truncation** — the checkpoint boundary constraint roughly doubles median response length, so the driftlock arms hit the 8,192-token ceiling on 5–6% of calls where stock never does (§3.2.1) | Wasted steps; a confound in `stock` vs `driftlock` | A truncated batch is no longer fatal (patch v11) — it returns to the model as feedback and costs one step. The confound is structural, not fixable: `retry` is the arm that isolates rollback from the constraint |
 

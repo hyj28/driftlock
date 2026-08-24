@@ -120,6 +120,16 @@ class TerminusBoundaryRuntime(Protocol):
         ...
 
     @property
+    def rate_limited_call_count(self) -> int:
+        """Monotonic count of physical calls refused with HTTP 429.
+
+        A 429 is refused before the model runs, so it generates nothing and bills
+        nothing. Subtracting it is what lets a step retry a saturated provider
+        without weakening the one-billable-call-per-step rule below.
+        """
+        ...
+
+    @property
     def summarization_enabled(self) -> bool:
         """Whether Terminus may make internal summarization model calls."""
         ...
@@ -332,6 +342,7 @@ class TerminusStepAdapter:
 
     async def __call__(self, context: StepContext) -> StepOutcome:
         provider_calls_before = _provider_call_count(self.runtime)
+        rate_limited_before = _rate_limited_call_count(self.runtime)
         previous = self.codec.decode(context.state)
         if previous is None:
             submitted_prompt = await self.runtime.prepare_start(
@@ -363,12 +374,19 @@ class TerminusStepAdapter:
             expected_episode = previous.episode + 1
 
         provider_calls_after = _provider_call_count(self.runtime)
-        if provider_calls_after != provider_calls_before + 1:
+        rate_limited_after = _rate_limited_call_count(self.runtime)
+        rejected = rate_limited_after - rate_limited_before
+        if rejected < 0:
             raise RuntimeError(
-                "Terminus runtime must make exactly one provider call per "
+                "Terminus runtime rate_limited_call_count must be monotonic"
+            )
+        billable = provider_calls_after - provider_calls_before - rejected
+        if billable != 1:
+            raise RuntimeError(
+                "Terminus runtime must make exactly one billable provider call per "
                 "driftlock step: "
-                f"expected counter {provider_calls_before + 1}, got "
-                f"{provider_calls_after}"
+                f"counter went {provider_calls_before} -> {provider_calls_after} "
+                f"with {rejected} refused by rate limiting, leaving {billable}"
             )
 
         if boundary.conversation.episode != expected_episode:
@@ -422,6 +440,15 @@ def _provider_call_count(runtime: TerminusBoundaryRuntime) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise RuntimeError(
             "Terminus runtime provider_call_count must be a non-negative integer"
+        )
+    return value
+
+
+def _rate_limited_call_count(runtime: TerminusBoundaryRuntime) -> int:
+    value = getattr(runtime, "rate_limited_call_count", 0)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(
+            "Terminus runtime rate_limited_call_count must be a non-negative integer"
         )
     return value
 
