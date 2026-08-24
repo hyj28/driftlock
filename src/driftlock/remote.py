@@ -505,16 +505,41 @@ def _is_relative_to(path: str, parent: str) -> bool:
     return path_parts[: len(parent_parts)] == parent_parts
 
 
+# Lines GNU tar emits alongside a "file changed" warning that carry no new
+# information: the first is its exit-status summary, the second is printed
+# whenever an absolute path is archived. Recognising them is not leniency -- an
+# unrecognised line still fails closed, below.
+_BENIGN_TAR_LINES = frozenset(
+    {
+        "tar: Exiting with failure status due to previous errors",
+        "tar: Removing leading `/' from member names",
+        "tar: Removing leading `/' from hard link targets",
+    }
+)
+
+
 def _parse_file_changed_warnings(result: ExecResultLike) -> tuple[str, ...] | None:
+    """Paths tar reported as changing mid-read, or None if this is a real failure.
+
+    Whitespace tolerance is load-bearing rather than cosmetic. The first version
+    compared raw lines, so a leading newline or a trailing space anywhere in
+    tar's stderr made an ordinary concurrent-write warning indistinguishable
+    from a genuine archive failure -- and because the error text is stripped for
+    display, the resulting message looked exactly like the case that is handled.
+    That cost one trial in round 1 and two more in round 4.
+    """
     if result.return_code != 1 or not result.stderr:
         return None
     prefix = "tar: "
     suffix = ": file changed as we read it"
     paths: list[str] = []
-    for line in result.stderr.splitlines():
+    for raw_line in result.stderr.splitlines():
+        line = raw_line.strip()
+        if not line or line in _BENIGN_TAR_LINES:
+            continue
         if not line.startswith(prefix) or not line.endswith(suffix):
             return None
-        path = line[len(prefix) : -len(suffix)]
+        path = line[len(prefix) : -len(suffix)].strip()
         if not path:
             return None
         if path not in paths:
