@@ -885,3 +885,76 @@ async def test_runner_accepts_async_remote_checkpoint_store(tmp_path: Path) -> N
 
     assert result.status is RunStatus.COMPLETED
     assert len(result.rollbacks) == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "stderr"),
+    [
+        (
+            "leading blank line",
+            "\ntar: ./out/x.log: file changed as we read it",
+        ),
+        (
+            "trailing whitespace",
+            "tar: ./out/x.log: file changed as we read it  \n",
+        ),
+        (
+            "tar's exit summary",
+            "tar: ./out/x.log: file changed as we read it\n"
+            "tar: Exiting with failure status due to previous errors\n",
+        ),
+        (
+            "leading-slash notice",
+            "tar: Removing leading `/' from member names\n"
+            "tar: ./out/x.log: file changed as we read it\n",
+        ),
+        (
+            "blank lines between warnings",
+            "tar: ./out/x.log: file changed as we read it\n\n"
+            "tar: ./out/y.log: file changed as we read it\n",
+        ),
+    ],
+)
+async def test_a_concurrent_write_is_recognised_whatever_tar_pads_it_with(
+    tmp_path: Path, label: str, stderr: str
+) -> None:
+    # Every shape here is an ordinary concurrent write. Treating any of them as
+    # an archive failure kills the trial, and because the error text is stripped
+    # for display the message looks identical to the handled case.
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, "", stderr), LocalExecResult(1, "", stderr)],
+    )
+    (workspace / "out").mkdir()
+    (workspace / "out" / "x.log").write_text("busy", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    assert environment.archive_attempts == 2
+    assert "./out/x.log" in checkpoint.unstable_paths
+
+
+@pytest.mark.parametrize(
+    ("label", "stderr"),
+    [
+        ("unrelated error", "tar: ./out/x.log: Cannot open: Permission denied"),
+        (
+            "mixed with a real error",
+            "tar: ./out/x.log: file changed as we read it\n"
+            "tar: ./out/y.log: Cannot open: Permission denied\n",
+        ),
+        ("empty path", "tar: : file changed as we read it"),
+        ("whitespace path", "tar:    : file changed as we read it"),
+    ],
+)
+async def test_an_unrecognised_tar_line_still_fails_the_checkpoint(
+    tmp_path: Path, label: str, stderr: str
+) -> None:
+    workspace, store, _environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, "", stderr), LocalExecResult(1, "", stderr)],
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="create remote archive failed"):
+        await store.create({}, step=0)
