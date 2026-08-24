@@ -698,7 +698,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 judge_provider=args.judge_provider,
                 retain_checkpoints=args.retain_checkpoints,
             )
-            config_path = args.config.expanduser().resolve()
+            config_arg = args.config or Path(f"driftlock-job-{args.job_name}.json")
+            config_path = config_arg.expanduser().resolve()
             config_path.parent.mkdir(parents=True, exist_ok=True)
             config_path.write_text(
                 json.dumps(config, indent=2) + "\n", encoding="utf-8"
@@ -706,6 +707,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"wrote {config_path}")
             if args.command == "prepare":
                 return 0
+            # Re-read what Harbor is actually about to run. An explicit --config
+            # shared between concurrent arms, or any other writer, would otherwise
+            # hand this process someone else's arm without a word.
+            written = json.loads(config_path.read_text(encoding="utf-8"))
+            if written != config:
+                raise SystemExit(
+                    f"{config_path} changed after it was written; another job is "
+                    "using the same --config path. Give each concurrent run its "
+                    "own --config, or omit --config to get a per-job default."
+                )
             harbor_command = _pinned_harbor_command()
             child_env = os.environ.copy()
             child_env.pop("HB_PROCESS_REWARD", None)
@@ -794,7 +805,11 @@ def _parser() -> argparse.ArgumentParser:
         command = sub.add_parser(name, help=f"{name} an exact Harbor job")
         command.add_argument("--lhtb-dir", type=Path, default=Path.cwd())
         command.add_argument("--jobs-dir", type=Path, default=Path("jobs"))
-        command.add_argument("--config", type=Path, default=Path("driftlock-job.json"))
+        # Defaults to a per-job filename. A fixed shared path silently merges
+        # concurrent arms: on 2026-08-24 four arms launched together each wrote
+        # driftlock-job.json and then all four ran the file the last writer left,
+        # so every arm executed as driftlock into one job directory.
+        command.add_argument("--config", type=Path, default=None)
         command.add_argument("--job-name", required=True)
         command.add_argument("--arm", choices=RUNNABLE_ARMS, required=True)
         command.add_argument("--tasks", nargs="+", required=True)

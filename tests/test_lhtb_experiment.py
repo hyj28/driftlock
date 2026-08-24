@@ -633,6 +633,101 @@ def test_run_uses_current_python_harbor_and_pins_continuation_environment(
     assert "HB_PROCESS_REWARD" not in child_env
 
 
+def test_two_jobs_do_not_share_a_config_path_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Concurrent arms each write a config and then hand its path to Harbor. A
+    # shared default path means the last writer decides what every arm runs.
+    root = _lhtb_tree(tmp_path, "task-a")
+    monkeypatch.setattr(experiment, "preflight", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        experiment, "_pinned_harbor_command", lambda: ["/pinned/bin/harbor"]
+    )
+    configs: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        configs.append(command[command.index("-c") + 1])
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(experiment.subprocess, "run", fake_run)
+    monkeypatch.chdir(tmp_path)
+
+    for arm, job in (("stock", "round-stock"), ("driftlock", "round-driftlock")):
+        arguments = [
+            "run",
+            "--lhtb-dir",
+            str(root),
+            "--jobs-dir",
+            str(tmp_path / "jobs"),
+            "--job-name",
+            job,
+            "--arm",
+            arm,
+            "--tasks",
+            "task-a",
+        ]
+        if arm == "stock":
+            arguments.append("--ack-unbounded-stock-tokens")
+        assert main(arguments) == 0
+
+    assert len(set(configs)) == 2
+    for path, job in zip(configs, ("round-stock", "round-driftlock"), strict=True):
+        assert json.loads(Path(path).read_text())["job_name"] == job
+
+
+def test_run_refuses_a_config_another_writer_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    shared = tmp_path / "shared.json"
+    monkeypatch.setattr(experiment, "preflight", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        experiment, "_pinned_harbor_command", lambda: ["/pinned/bin/harbor"]
+    )
+    started: list[list[str]] = []
+    monkeypatch.setattr(
+        experiment.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            started.append(command) or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    original_write = Path.write_text
+
+    def racing_write(self: Path, *args: object, **kwargs: object) -> int:
+        written = original_write(self, *args, **kwargs)
+        if self == shared.resolve():
+            # Another arm wins the race between our write and Harbor's read.
+            original_write(
+                self, json.dumps({"job_name": "someone-else"}), encoding="utf-8"
+            )
+        return written
+
+    monkeypatch.setattr(Path, "write_text", racing_write)
+
+    with pytest.raises(SystemExit, match="another job is using the same --config"):
+        main(
+            [
+                "run",
+                "--lhtb-dir",
+                str(root),
+                "--jobs-dir",
+                str(tmp_path / "jobs"),
+                "--config",
+                str(shared),
+                "--job-name",
+                "mine",
+                "--arm",
+                "driftlock",
+                "--tasks",
+                "task-a",
+            ]
+        )
+
+    assert started == []
+
+
 def test_checkout_validation_rejects_task_and_non_patch_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
