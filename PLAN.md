@@ -262,6 +262,39 @@ existed, the 2026-08-24 round would have refused to start at 00:34 instead of
 discovering the same fact three hours and four dead arms later. `preflight`
 itself is unchanged and still spends nothing.
 
+### 3.2.1b What the build fingerprint guards, and what it does not
+
+Every trial records a hash of the driftlock source that produced it. The guard
+that matters is **agreement**: two trials being compared must carry the same
+hash, or the comparison is between different programs. That is now checked
+across arms, which it previously was not — each lock was only matched against
+whatever build happened to be installed at analysis time, so the cross-arm
+question was never actually asked.
+
+Matching the *installed* build was the wrong test, and it failed in the obvious
+way. The hash covered the whole package including `lhtb_analysis.py`, which
+never executes inside a trial, so fixing a reporting bug changed the hash and
+locked the analyzer out of the very run that exposed the bug. The producing
+build was the only build permitted to read a run, and that build could not read
+it. Analysis was also non-portable: a second machine could never read the first
+machine's results.
+
+So: runs now record `lhtb_runtime_fingerprint()`, which covers everything that
+can execute inside a trial and excludes `lhtb_analysis.py` alone. Agreement
+across arms is a hard error. Whether the reader is the producing build is a
+recorded fact — `analyzed_by_producing_build` in the report — not a refusal.
+
+The exclusion is only sound while nothing on the runtime path depends on the
+excluded module, so `task_directory_sha256` moved to `lhtb.py` (it verifies a
+checkout during `oracle-prepare`, so it was never analysis), and a test walks
+the package asserting no runtime module imports the analyzer.
+
+**This change is also what made the round-4 data readable at all**, which is a
+reason to be suspicious of it. The check it replaces is strictly weaker at
+detecting mixed builds than the one now in place; what was given up is the
+requirement that the reader be the writer, which protected nothing the
+agreement check does not.
+
 ### 3.2.2 Why the arms now run concurrently
 
 Round 1 and round 2 ran the four arms one after another, so `stock` executed

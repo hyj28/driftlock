@@ -18,8 +18,9 @@ from uuid import UUID
 from driftlock.heuristics import HeuristicConfig
 from driftlock.lhtb import (
     LHTB_REPOSITORY_REVISION,
-    lhtb_experiment_fingerprint,
+    lhtb_runtime_fingerprint,
     openrouter_provider_from_call_kwargs,
+    task_directory_sha256,
 )
 from driftlock.oracle import (
     OracleCheckpointError,
@@ -60,6 +61,35 @@ _DRIFTLOCK_DETECTOR_FIELDS = (
     "driftlock_reward_epsilon",
     "driftlock_corroborating_signals",
 )
+
+
+_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _recorded_fingerprint(environment: Any, context: str) -> str:
+    """Read a trial's recorded build fingerprint without assuming which build.
+
+    This deliberately does not compare against the installed build. Comparability
+    is a property of the *data*: every trial in a comparison must carry the same
+    fingerprint, which `_require_one_build` enforces globally. Requiring the
+    reader to be the writer as well made an analyzer bug permanently unfixable
+    for the run it affected, and blocked analysis on any other machine, without
+    protecting anything the global check does not already cover.
+    """
+    value = environment.get("DRIFTLOCK_EXPERIMENT_FINGERPRINT") if environment else None
+    if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
+        raise ValueError(f"missing or malformed build fingerprint in {context}")
+    return value
+
+
+def _require_one_build(fingerprints: set[str], *, context: str) -> str:
+    if len(fingerprints) != 1:
+        raise ValueError(
+            f"{context} mix driftlock builds: "
+            + ", ".join(sorted(fingerprints))
+            + " -- trials produced by different code are not comparable"
+        )
+    return next(iter(fingerprints))
 
 
 def goal_drift_actions(
@@ -200,12 +230,29 @@ def analyze_jobs(
     matrix = _validate_matrix(
         trials_by_arm, require_complete_matrix=require_complete_matrix
     )
+    # The guard that actually matters: every trial being compared must have been
+    # produced by one build. Previously this was only implied by each lock being
+    # matched against the *installed* build, so it disappeared entirely whenever
+    # the analyzer itself changed -- and it never covered cross-arm agreement.
+    # Checked before the lock signature, which subsumes it but reports it as a
+    # generic settings difference.
+    build = _require_one_build(
+        {
+            summary["driftlock_experiment_fingerprint"]
+            for summary in job_summaries.values()
+        },
+        context="experiment arms",
+    )
     lock_signatures = {
         summary["lock_signature_sha256"] for summary in job_summaries.values()
     }
     if len(lock_signatures) != 1:
         raise ValueError("experiment arms use different Harbor job-level settings")
     matrix["job_lock_signature_sha256"] = next(iter(lock_signatures))
+    analyzer = lhtb_runtime_fingerprint()
+    matrix["driftlock_build_fingerprint"] = build
+    matrix["analyzer_build_fingerprint"] = analyzer
+    matrix["analyzed_by_producing_build"] = build == analyzer
     arm_reports = {
         arm: _aggregate_arm(trials, solve_threshold=solve_threshold)
         for arm, trials in trials_by_arm.items()
@@ -368,7 +415,7 @@ def _load_job_lock(
     trials = data.get("trials")
     if not isinstance(trials, list) or len(trials) != n_total:
         raise ValueError(f"Harbor lock trial count mismatch in {lock_file}")
-    fingerprint = lhtb_experiment_fingerprint()
+    lock_fingerprints: set[str] = set()
     basename_index = {path.name: name for name, path in task_index.items()}
     task_counts: dict[str, int] = defaultdict(int)
     trial_signatures: list[str] = []
@@ -386,9 +433,11 @@ def _load_job_lock(
             or not isinstance(digest, str)
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
             or not isinstance(environment, dict)
-            or environment.get("DRIFTLOCK_EXPERIMENT_FINGERPRINT") != fingerprint
         ):
             raise ValueError(f"invalid trial provenance in Harbor lock: {lock_file}")
+        lock_fingerprints.add(
+            _recorded_fingerprint(environment, f"Harbor lock {lock_file}")
+        )
         canonical_name = name if name in task_index else basename_index.get(name)
         if canonical_name is None:
             raise ValueError(f"unknown task in Harbor lock: {name}")
@@ -414,6 +463,9 @@ def _load_job_lock(
             f"arm {arm!r} Harbor lock uses different judge providers: "
             + ", ".join(sorted(judge_providers))
         )
+    fingerprint = _require_one_build(
+        lock_fingerprints, context=f"trials in Harbor lock {lock_file}"
+    )
     signature_payload = {
         "schema_version": 1,
         "harbor": harbor,
@@ -732,7 +784,9 @@ def _validate_arm_identity(
     if arm == "stock":
         expected_environment = {
             "HB_CONTINUE_MODE": "fresh",
-            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": _recorded_fingerprint(
+                environment, f"arm {arm!r} config in {result_file}"
+            ),
         }
         valid = (
             info_name == "terminus-2"
@@ -780,7 +834,9 @@ def _validate_arm_identity(
         and environment
         == {
             "HB_CONTINUE_MODE": "same_conversation",
-            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": _recorded_fingerprint(
+                environment, f"arm {arm!r} config in {result_file}"
+            ),
         }
         and kwargs.get("enable_summarize") is False
         and set(llm_kwargs) == {"temperature", "max_tokens", "timeout", "extra_body"}
@@ -929,7 +985,9 @@ def _validate_oracle_identity(
         or environment
         != {
             "HB_CONTINUE_MODE": "same_conversation",
-            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+            "DRIFTLOCK_EXPERIMENT_FINGERPRINT": _recorded_fingerprint(
+                environment, f"oracle config in {result_file}"
+            ),
         }
         or kwargs.get("driftlock_oracle_mode") != "isolated-checkpoint-replay"
         or set(kwargs) != expected_keys
@@ -1317,43 +1375,7 @@ def _task_metadata(directory: Path, task: str) -> dict[str, Any]:
     }
 
 
-def task_directory_sha256(directory: Path) -> str:
-    """Match Harbor's default ``dirhash(directory, "sha256")`` protocol.
-
-    LHTB's pinned task tree contains ordinary files and directories. Symlinks and
-    special files are rejected here rather than applying subtly different traversal
-    semantics from Harbor's external ``dirhash`` dependency.
-    """
-
-    def hash_directory(path: Path) -> str | None:
-        descriptors: list[str] = []
-        for entry in path.iterdir():
-            if entry.is_symlink():
-                raise ValueError(
-                    f"cannot verify Harbor checksum for symlinked task entry: {entry}"
-                )
-            if entry.is_dir():
-                child_hash = hash_directory(entry)
-                if child_hash is not None:
-                    descriptors.append(f"dirhash:{child_hash}\0name:{entry.name}")
-            elif entry.is_file():
-                descriptors.append(f"data:{_file_sha256(entry)}\0name:{entry.name}")
-            else:
-                raise ValueError(
-                    f"cannot verify Harbor checksum for special task entry: {entry}"
-                )
-        if not descriptors:
-            return None
-        descriptor = "\0\0".join(sorted(descriptors))
-        return hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
-
-    result = hash_directory(directory)
-    if result is None:
-        raise ValueError(f"cannot hash empty task directory: {directory}")
-    return result
-
-
-_task_directory_sha256 = task_directory_sha256
+_task_directory_sha256 = task_directory_sha256  # historical alias
 
 
 def _duration_seconds(data: dict[str, Any], result_file: Path) -> float | None:
@@ -1473,6 +1495,10 @@ def _validate_matrix(
     }
     if len(controlled_budgets) > 1:
         raise ValueError("controlled arms do not share one total-token budget")
+    # The guard that actually matters: every trial being compared must have been
+    # produced by one build. Previously this was only implied by each lock being
+    # matched against the installed build, so it silently disappeared whenever the
+    # analyzer itself changed.
     reference_arm = "stock"
     reference = task_counts[reference_arm]
     mismatched_arms = [

@@ -108,10 +108,40 @@ class LHTBRuntimeCompatibilityError(RuntimeError):
     """Raised when the installed Harbor fork is not the pinned integration."""
 
 
+# Modules that cannot execute inside a trial. Excluding them from the runtime
+# fingerprint is what lets a reporting bug be fixed without invalidating every
+# measurement already taken -- under the old whole-package hash, the build that
+# produced a run was the only build allowed to read it, so an analyzer bug made
+# the affected run permanently unreadable. `test_lhtb.py` pins the membership of
+# this set and asserts nothing on the runtime path imports them.
+_ANALYSIS_ONLY_MODULES = frozenset({"lhtb_analysis.py"})
+
+
+def lhtb_runtime_fingerprint() -> str:
+    """Hash everything that can run inside a trial.
+
+    This is what a run records and what the analyzer compares against, so two
+    trials agree exactly when the code that produced them agreed.
+    """
+    return _source_fingerprint(exclude=_ANALYSIS_ONLY_MODULES)
+
+
 def lhtb_experiment_fingerprint() -> str:
-    """Hash the installed driftlock source and packaged Harbor companion patch."""
+    """Hash the whole installed driftlock source and the companion patch.
+
+    Recorded for provenance. Use :func:`lhtb_runtime_fingerprint` for anything
+    that decides whether two measurements are comparable.
+    """
+    return _source_fingerprint(exclude=frozenset())
+
+
+def _source_fingerprint(*, exclude: frozenset[str]) -> str:
     package_root = Path(__file__).resolve().parent
-    sources = sorted(package_root.rglob("*.py"))
+    sources = [
+        source
+        for source in sorted(package_root.rglob("*.py"))
+        if source.relative_to(package_root).as_posix() not in exclude
+    ]
     patch = lhtb_harbor_patch_path().resolve()
     sources.append(patch)
     digest = hashlib.sha256()
@@ -124,6 +154,50 @@ def lhtb_experiment_fingerprint() -> str:
                 digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def task_directory_sha256(directory: Path) -> str:
+    """Match Harbor's default ``dirhash(directory, "sha256")`` protocol.
+
+    LHTB's pinned task tree contains ordinary files and directories. Symlinks and
+    special files are rejected here rather than applying subtly different traversal
+    semantics from Harbor's external ``dirhash`` dependency.
+    """
+
+    def hash_directory(path: Path) -> str | None:
+        descriptors: list[str] = []
+        for entry in path.iterdir():
+            if entry.is_symlink():
+                raise ValueError(
+                    f"cannot verify Harbor checksum for symlinked task entry: {entry}"
+                )
+            if entry.is_dir():
+                child_hash = hash_directory(entry)
+                if child_hash is not None:
+                    descriptors.append(f"dirhash:{child_hash}\0name:{entry.name}")
+            elif entry.is_file():
+                descriptors.append(f"data:{_file_sha256(entry)}\0name:{entry.name}")
+            else:
+                raise ValueError(
+                    f"cannot verify Harbor checksum for special task entry: {entry}"
+                )
+        if not descriptors:
+            return None
+        descriptor = "\0\0".join(sorted(descriptors))
+        return hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
+
+    result = hash_directory(directory)
+    if result is None:
+        raise ValueError(f"cannot hash empty task directory: {directory}")
+    return result
 
 
 @dataclass(frozen=True, slots=True)

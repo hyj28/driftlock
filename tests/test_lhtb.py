@@ -961,3 +961,72 @@ async def test_an_exhausted_rate_limit_retry_propagates(
 
     assert len(llm.calls) == 3
     assert runtime.rate_limited_call_count == 2
+
+
+def test_the_runtime_fingerprint_excludes_only_analysis_only_modules() -> None:
+    # The exclusion is what makes an analyzer fix survivable. It is only sound
+    # while nothing that runs inside a trial imports these modules.
+    assert set(lhtb._ANALYSIS_ONLY_MODULES) == {"lhtb_analysis.py"}
+
+
+def test_nothing_on_the_runtime_path_imports_an_analysis_only_module() -> None:
+    package = Path(lhtb.__file__).resolve().parent
+    excluded = {name.removesuffix(".py") for name in lhtb._ANALYSIS_ONLY_MODULES}
+    # Two files may name it, and neither can carry its behaviour into a trial:
+    #   __init__.py       re-exports its symbols for the public API, calls none
+    #   lhtb_experiment.py the CLI, which uses it only for the `analyze` command
+    # Both are themselves inside the runtime fingerprint, so edits to them are
+    # caught regardless.
+    allowed_importers = {"__init__.py", "lhtb_experiment.py"} | set(
+        lhtb._ANALYSIS_ONLY_MODULES
+    )
+    offenders = []
+    for source in sorted(package.rglob("*.py")):
+        relative = source.relative_to(package).as_posix()
+        if relative in allowed_importers:
+            continue
+        text = source.read_text(encoding="utf-8")
+        if any(f"driftlock.{name}" in text for name in excluded):
+            offenders.append(relative)
+
+    assert offenders == []
+
+
+def test_the_runtime_fingerprint_changes_when_a_runtime_module_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Excluding one module must not make the hash indifferent to the others.
+    baseline = lhtb.lhtb_runtime_fingerprint()
+    full_baseline = lhtb.lhtb_experiment_fingerprint()
+    runner = Path(lhtb.__file__).resolve().parent / "runner.py"
+    original = runner.read_bytes()
+    try:
+        runner.write_bytes(original + b"\n# fingerprint probe\n")
+        assert lhtb.lhtb_runtime_fingerprint() != baseline
+        assert lhtb.lhtb_experiment_fingerprint() != full_baseline
+    finally:
+        runner.write_bytes(original)
+    assert lhtb.lhtb_runtime_fingerprint() == baseline
+
+
+def test_editing_an_analysis_only_module_moves_only_the_full_fingerprint() -> None:
+    runtime_baseline = lhtb.lhtb_runtime_fingerprint()
+    full_baseline = lhtb.lhtb_experiment_fingerprint()
+    analysis = Path(lhtb.__file__).resolve().parent / "lhtb_analysis.py"
+    original = analysis.read_bytes()
+    try:
+        analysis.write_bytes(original + b"\n# fingerprint probe\n")
+        assert lhtb.lhtb_runtime_fingerprint() == runtime_baseline
+        assert lhtb.lhtb_experiment_fingerprint() != full_baseline
+    finally:
+        analysis.write_bytes(original)
+
+
+def test_the_public_reexport_of_the_analyzer_calls_nothing() -> None:
+    # __init__.py is allowed to name lhtb_analysis only because it re-exports.
+    # A call there would put analysis code on the import path of every trial.
+    text = (Path(lhtb.__file__).resolve().parent / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    body = text.split("from driftlock.lhtb_analysis import (", 1)[1].split(")", 1)[1]
+    assert "lhtb_analysis" not in body
