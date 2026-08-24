@@ -20,6 +20,7 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
+from driftlock.judges import DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
 from driftlock.lhtb import (
     DRIFTLOCK_HARBOR_PATCH_VERSION,
     LHTB_LITELLM_VERSION,
@@ -229,7 +230,9 @@ def build_job_config(
                 {
                     "driftlock_judge_model": DEFAULT_JUDGE_MODEL,
                     "driftlock_judge_api_base": judge_api_base or api_base,
-                    "driftlock_judge_max_output_tokens": 512,
+                    "driftlock_judge_max_output_tokens": (
+                        DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
+                    ),
                     "driftlock_judge_llm_call_kwargs": (
                         openrouter_provider_call_kwargs(judge_provider)
                     ),

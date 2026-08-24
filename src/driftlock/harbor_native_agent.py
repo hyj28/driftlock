@@ -14,6 +14,7 @@ from harbor.llms.lite_llm import LiteLLM
 
 from driftlock.harbor_agent import _LHTBFineJudge, _LHTBJudgeClient
 from driftlock.heuristics import HeuristicConfig
+from driftlock.judges import DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
 from driftlock.lhtb import (
     HarborWorkspaceDeltaObserver,
     LHTBRuntimeCompatibilityError,
@@ -135,7 +136,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
-        driftlock_judge_max_output_tokens: int = 512,
+        driftlock_judge_max_output_tokens: int = DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
         driftlock_judge_timeout_sec: float = 120.0,
         driftlock_judge_llm_call_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -299,6 +300,9 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         record = {
             "phase": len(self._native_phases),
             "status": result.status.value,
+            "judge_reliability": result.judge_reliability.value,
+            "judge_attempts": result.judge_attempts,
+            "judge_failures": result.judge_failures,
             "steps": len(result.steps),
             "rollbacks": len(result.rollbacks),
             "tokens_used": result.tokens_used,

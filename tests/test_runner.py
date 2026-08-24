@@ -6,18 +6,21 @@ import pytest
 
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
+from driftlock.judges import JudgeTokenBudgetExhausted
 from driftlock.models import (
     DriftContext,
     DriftSignal,
     DriftTriggerOutcome,
     DriftTriggerRecord,
     FineJudgeStatus,
+    JudgeReliabilityStatus,
     JudgeVerdict,
     RunStatus,
     StepContext,
     StepOutcome,
     StepTokenBudgetExhausted,
     Verdict,
+    classify_judge_reliability,
 )
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
@@ -33,6 +36,11 @@ class SequencedJudge:
 
     async def judge(self, context: DriftContext) -> JudgeVerdict:
         return self.verdicts.pop(0)
+
+
+class RaisingJudge:
+    async def judge(self, context: DriftContext) -> JudgeVerdict:
+        raise TimeoutError("judge provider unavailable")
 
 
 def _store(tmp_path: Path) -> tuple[Path, DirectoryCheckpointStore]:
@@ -122,7 +130,13 @@ async def test_runner_rolls_back_workspace_and_state_then_retries(
         "reason": None,
     }
     assert result.signal_counts == {
-        "no_file_change": {"upheld": 1, "vetoed": 0, "suppressed": 0}
+        "no_file_change": {
+            "upheld": 1,
+            "vetoed": 0,
+            "suppressed": 0,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 0,
+        }
     }
 
 
@@ -163,8 +177,312 @@ async def test_fine_judge_can_veto_a_coarse_signal(tmp_path: Path) -> None:
         }
     ]
     assert result.signal_counts == {
-        "no_file_change": {"upheld": 0, "vetoed": 1, "suppressed": 0}
+        "no_file_change": {
+            "upheld": 0,
+            "vetoed": 1,
+            "suppressed": 0,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 0,
+        }
     }
+
+
+async def test_all_failed_small_sample_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"think {context.logical_step}",
+            state={"turn": context.logical_step},
+            completed=context.logical_step == 3,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=RaisingJudge(),
+        config=RunnerConfig(max_steps=3, checkpoint_interval=10),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.judge_reliability is JudgeReliabilityStatus.INCONCLUSIVE
+    assert len(result.steps) == 3
+    assert result.state == {"turn": 3}
+    assert result.rollbacks == ()
+    assert [trigger.judge_status for trigger in result.coarse_triggers] == [
+        FineJudgeStatus.FAILED,
+    ]
+    assert [trigger.outcome for trigger in result.coarse_triggers] == [
+        DriftTriggerOutcome.JUDGE_FAILED,
+    ]
+    assert result.coarse_triggers[0].to_dict()["judge"] == {
+        "status": "failed",
+        "verdict": None,
+        "reason": "fine judge raised unexpectedly: judge provider unavailable",
+    }
+    assert result.signal_counts == {
+        "no_file_change": {
+            "upheld": 0,
+            "vetoed": 0,
+            "suppressed": 0,
+            "judge_failed": 1,
+            "judge_budget_exhausted": 0,
+        }
+    }
+
+
+async def test_one_judge_failure_does_not_invalidate_a_later_adjudication(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    class IntermittentJudge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def judge(self, context: DriftContext) -> JudgeVerdict:
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("one bad call")
+            return JudgeVerdict(Verdict.UNCERTAIN, "model found mixed evidence")
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"think {context.logical_step}",
+            state={"turn": context.logical_step},
+            completed=context.logical_step == 4,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=IntermittentJudge(),
+        config=RunnerConfig(
+            max_steps=4,
+            checkpoint_interval=10,
+            rollback_on_uncertain=False,
+        ),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.judge_reliability is JudgeReliabilityStatus.RELIABLE
+    assert result.rollbacks == ()
+    assert [trigger.judge_status for trigger in result.coarse_triggers] == [
+        FineJudgeStatus.FAILED,
+        FineJudgeStatus.VERDICT,
+    ]
+    assert result.coarse_triggers[1].judge_verdict is Verdict.UNCERTAIN
+    assert [trigger.outcome for trigger in result.coarse_triggers] == [
+        DriftTriggerOutcome.JUDGE_FAILED,
+        DriftTriggerOutcome.VETOED,
+    ]
+    assert result.signal_counts == {
+        "no_file_change": {
+            "upheld": 0,
+            "vetoed": 1,
+            "suppressed": 0,
+            "judge_failed": 1,
+            "judge_budget_exhausted": 0,
+        }
+    }
+
+
+async def test_uncertain_verdict_rolls_back_when_configured(tmp_path: Path) -> None:
+    _workspace, store = _store(tmp_path)
+    judge = SequencedJudge(JudgeVerdict(Verdict.UNCERTAIN, "evidence is mixed"))
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        if context.attempt == 1:
+            return StepOutcome(
+                action=f"think {context.logical_step}",
+                state={"attempt": 1},
+            )
+        return StepOutcome(
+            action="finish after conservative rollback",
+            state={"done": True},
+            changed_paths=("answer.txt",),
+            completed=True,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=judge,
+        config=RunnerConfig(
+            max_steps=3,
+            max_rollbacks=1,
+            checkpoint_interval=10,
+            rollback_on_uncertain=True,
+        ),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.judge_reliability is JudgeReliabilityStatus.RELIABLE
+    assert len(result.rollbacks) == 1
+    assert result.coarse_triggers[0].judge_verdict is Verdict.UNCERTAIN
+    assert result.coarse_triggers[0].outcome is DriftTriggerOutcome.ROLLED_BACK
+
+
+async def test_token_limit_preserves_failed_judge_reliability(tmp_path: Path) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"think {context.logical_step}",
+            state={"turn": context.logical_step},
+            tokens=1,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=RaisingJudge(),
+        config=RunnerConfig(max_steps=10, max_tokens=6, checkpoint_interval=100),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.TOKEN_LIMIT
+    assert result.tokens_used == 6
+    assert result.judge_attempts == 4
+    assert result.judge_failures == 4
+    assert result.judge_reliability is JudgeReliabilityStatus.FAILED
+
+
+async def test_judge_budget_exhaustion_has_its_own_trigger_and_count(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    class BudgetExhaustedJudge:
+        async def judge(self, context: DriftContext) -> JudgeVerdict:
+            raise JudgeTokenBudgetExhausted("prompt consumes the remaining budget")
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"think {context.logical_step}",
+            state={"turn": context.logical_step},
+            completed=context.logical_step == 3,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=BudgetExhaustedJudge(),
+        config=RunnerConfig(max_steps=3, checkpoint_interval=10),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.judge_reliability is JudgeReliabilityStatus.INCONCLUSIVE
+    assert result.coarse_triggers[0].judge_status is FineJudgeStatus.BUDGET_EXHAUSTED
+    assert result.coarse_triggers[0].judge_verdict is None
+    assert (
+        result.coarse_triggers[0].outcome is DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED
+    )
+    assert result.signal_counts == {
+        "no_file_change": {
+            "upheld": 0,
+            "vetoed": 0,
+            "suppressed": 0,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 1,
+        }
+    }
+
+
+async def test_repeated_all_failed_calls_reject_the_measurement(tmp_path: Path) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"think {context.logical_step}",
+            state={"turn": context.logical_step},
+            completed=context.logical_step == 6,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=RaisingJudge(),
+        config=RunnerConfig(max_steps=6, checkpoint_interval=100),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.judge_reliability is JudgeReliabilityStatus.FAILED
+    assert len(result.coarse_triggers) == 4
+    assert all(
+        trigger.judge_status is FineJudgeStatus.FAILED
+        for trigger in result.coarse_triggers
+    )
+
+
+async def test_real_34_call_shape_with_33_failures_rejects_the_measurement(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+    failed = JudgeVerdict(
+        None,
+        "invalid response",
+        confidence=0.0,
+        status=FineJudgeStatus.FAILED,
+    )
+    judge = SequencedJudge(
+        *([failed] * 33),
+        JudgeVerdict(Verdict.HEALTHY, "one response parsed"),
+    )
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"think {context.logical_step}",
+            state={"turn": context.logical_step},
+            completed=context.logical_step == 36,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        fine_judge=judge,
+        config=RunnerConfig(max_steps=36, checkpoint_interval=100),
+    ).run(goal="reason first", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.judge_reliability is JudgeReliabilityStatus.FAILED
+    assert len(result.coarse_triggers) == 34
+    assert (
+        sum(
+            trigger.judge_status is FineJudgeStatus.FAILED
+            for trigger in result.coarse_triggers
+        )
+        == 33
+    )
+    assert (
+        sum(
+            trigger.judge_status is FineJudgeStatus.VERDICT
+            for trigger in result.coarse_triggers
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("attempts", "failures", "expected"),
+    [
+        (0, 0, JudgeReliabilityStatus.NOT_ASSESSED),
+        (1, 1, JudgeReliabilityStatus.INCONCLUSIVE),
+        (2, 1, JudgeReliabilityStatus.RELIABLE),
+        (3, 3, JudgeReliabilityStatus.INCONCLUSIVE),
+        (3, 2, JudgeReliabilityStatus.RELIABLE),
+        (4, 1, JudgeReliabilityStatus.RELIABLE),
+        (4, 2, JudgeReliabilityStatus.RELIABLE),
+        (4, 3, JudgeReliabilityStatus.FAILED),
+        (34, 33, JudgeReliabilityStatus.FAILED),
+        (137, 117, JudgeReliabilityStatus.FAILED),
+    ],
+)
+def test_judge_failure_policy_boundaries(
+    attempts: int, failures: int, expected: JudgeReliabilityStatus
+) -> None:
+    assert classify_judge_reliability(attempts=attempts, failures=failures) is expected
 
 
 async def test_fine_judge_upheld_trigger_records_verdict_and_rollback_target(
@@ -249,7 +567,13 @@ async def test_rollback_limit_records_refused_trigger_without_a_rollback(
     assert trigger.rollback_checkpoint_id is None
     assert trigger.rollback_checkpoint_step is None
     assert result.signal_counts == {
-        "no_file_change": {"upheld": 1, "vetoed": 0, "suppressed": 0}
+        "no_file_change": {
+            "upheld": 1,
+            "vetoed": 0,
+            "suppressed": 0,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 0,
+        }
     }
 
 
@@ -278,7 +602,13 @@ async def test_signal_counts_split_upheld_and_vetoed_triggers(tmp_path: Path) ->
         "rolled_back",
     ]
     assert result.signal_counts == {
-        "no_file_change": {"upheld": 1, "vetoed": 1, "suppressed": 0}
+        "no_file_change": {
+            "upheld": 1,
+            "vetoed": 1,
+            "suppressed": 0,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 0,
+        }
     }
 
 
@@ -604,7 +934,13 @@ async def test_corroborating_only_trigger_is_recorded_without_calling_the_judge(
         "reason": None,
     }
     assert result.signal_counts == {
-        "no_file_change": {"upheld": 0, "vetoed": 0, "suppressed": 1}
+        "no_file_change": {
+            "upheld": 0,
+            "vetoed": 0,
+            "suppressed": 1,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 0,
+        }
     }
 
 
@@ -649,6 +985,8 @@ async def test_a_second_signal_lifts_the_same_trajectory_to_the_judge(
         "upheld": 1,
         "vetoed": 0,
         "suppressed": 0,
+        "judge_failed": 0,
+        "judge_budget_exhausted": 0,
     }
 
 
@@ -691,4 +1029,32 @@ def test_an_unasked_judge_cannot_be_recorded_as_a_veto() -> None:
             judge_verdict=None,
             judge_reason=None,
             outcome=DriftTriggerOutcome.VETOED,
+        )
+
+
+def test_a_failed_judge_cannot_carry_a_model_verdict() -> None:
+    signal = DriftSignal("no_file_change", "no files changed in the last 2 steps", 2)
+    with pytest.raises(ValueError, match="reason but no verdict"):
+        DriftTriggerRecord(
+            sequence=2,
+            logical_step=2,
+            signals=(signal,),
+            judge_status=FineJudgeStatus.FAILED,
+            judge_verdict=Verdict.UNCERTAIN,
+            judge_reason="provider failed",
+            outcome=DriftTriggerOutcome.JUDGE_FAILED,
+        )
+
+
+def test_a_failed_judge_requires_its_matching_trigger_outcome() -> None:
+    signal = DriftSignal("no_file_change", "no files changed in the last 2 steps", 2)
+    with pytest.raises(ValueError, match="matching trigger outcome"):
+        DriftTriggerRecord(
+            sequence=2,
+            logical_step=2,
+            signals=(signal,),
+            judge_status=FineJudgeStatus.BUDGET_EXHAUSTED,
+            judge_verdict=None,
+            judge_reason="no output room",
+            outcome=DriftTriggerOutcome.JUDGE_FAILED,
         )

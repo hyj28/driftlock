@@ -21,7 +21,13 @@ from driftlock.agent import (
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import FineJudge
 from driftlock.lhtb import WorkspaceDeltaObserver
-from driftlock.models import RunResult, RunStatus, StepOutcome, StepTokenBudgetExhausted
+from driftlock.models import (
+    RunResult,
+    RunStatus,
+    StepOutcome,
+    StepTokenBudgetExhausted,
+    aggregate_run_summary,
+)
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteEnvironment
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
@@ -484,17 +490,18 @@ def set_native_result_metadata(
 ) -> None:
     """Publish one successful native phase's terminal metadata."""
     metadata = dict(context.metadata or {})
-    metadata["driftlock"] = {
-        "status": result.status.value,
-        "steps": len(result.steps),
-        "rollbacks": len(result.rollbacks),
-        "tokens_used": result.tokens_used,
-        "agent_tokens_used": result.agent_tokens_used,
-        "judge_tokens_used": result.judge_tokens_used,
-        "signal_counts": result.signal_counts,
-        "trial_tokens_used": runtime.tokens_consumed,
-        "trial_token_budget": trial_token_budget,
-    }
+    previous = metadata.get("driftlock")
+    summary = aggregate_run_summary(
+        previous if isinstance(previous, dict) else None,
+        result,
+    )
+    summary.update(
+        {
+            "trial_tokens_used": runtime.tokens_consumed,
+            "trial_token_budget": trial_token_budget,
+        }
+    )
+    metadata["driftlock"] = summary
     metadata["termination_reason"] = (
         "confirmed_task_complete"
         if result.status is RunStatus.COMPLETED
@@ -509,11 +516,17 @@ def set_native_token_limit_metadata(
     """Publish native trial budget exhaustion metadata."""
     metadata = dict(context.metadata or {})
     metadata["termination_reason"] = "driftlock_token_limit"
-    metadata["driftlock"] = {
-        "status": RunStatus.TOKEN_LIMIT.value,
-        "tokens_used": runtime.tokens_consumed,
-        "trial_token_budget": trial_token_budget,
-    }
+    previous = metadata.get("driftlock")
+    summary = dict(previous) if isinstance(previous, dict) else {}
+    summary.update(
+        {
+            "status": RunStatus.TOKEN_LIMIT.value,
+            "tokens_used": runtime.tokens_consumed,
+            "trial_tokens_used": runtime.tokens_consumed,
+            "trial_token_budget": trial_token_budget,
+        }
+    )
+    metadata["driftlock"] = summary
     context.metadata = metadata
 
 

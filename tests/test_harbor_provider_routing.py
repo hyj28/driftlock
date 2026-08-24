@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 import pytest
 
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
+from driftlock.judges import JudgeTokenBudgetExhausted
 from driftlock.lhtb import openrouter_provider_from_call_kwargs
 from driftlock.lhtb_experiment import build_job_config
 from driftlock.models import (
@@ -19,6 +20,7 @@ from driftlock.models import (
     DriftTriggerOutcome,
     DriftTriggerRecord,
     FineJudgeStatus,
+    JudgeReliabilityStatus,
     RollbackRecord,
     RunResult,
     RunStatus,
@@ -317,7 +319,7 @@ def test_judge_binds_routing_and_audited_prices_in_litellm_construction(
     client = harbor_agent._LHTBJudgeClient(
         model="openrouter/deepseek/deepseek-v4-pro-0813",
         api_base="https://openrouter.ai/api/v1",
-        max_output_tokens=512,
+        max_output_tokens=8192,
         timeout_sec=120,
         llm_call_kwargs=_judge_call_kwargs(),
     )
@@ -344,10 +346,33 @@ def test_judge_provider_without_matching_prices_fails_loudly(
         harbor_agent._LHTBJudgeClient(
             model="openrouter/deepseek/deepseek-v4-pro-0813",
             api_base="https://openrouter.ai/api/v1",
-            max_output_tokens=512,
+            max_output_tokens=8192,
             timeout_sec=120,
             llm_call_kwargs=_judge_call_kwargs("baidu/fp8"),
         )
+
+
+async def test_judge_client_reports_preflight_output_budget_exhaustion(
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+    client = harbor_agent._LHTBJudgeClient(
+        model="openrouter/deepseek/deepseek-v4-pro-0813",
+        api_base="https://openrouter.ai/api/v1",
+        max_output_tokens=8192,
+        timeout_sec=120,
+        llm_call_kwargs=_judge_call_kwargs(),
+    )
+
+    with pytest.raises(
+        JudgeTokenBudgetExhausted,
+        match="258 tokens remain but the judge prompt reserves 258 input tokens",
+    ):
+        await client.complete("é", tokens_remaining=258)
+
+    assert client.request_times_msec == []
+    assert client.n_input_tokens == 0
+    assert client.n_output_tokens == 0
 
 
 def test_native_agent_forwards_only_audited_call_kwargs_to_litellm(
@@ -581,6 +606,15 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
                 judge_reason="rollback budget exhausted",
                 outcome=DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED,
             ),
+            DriftTriggerRecord(
+                sequence=5,
+                logical_step=3,
+                signals=(action_loop,),
+                judge_status=FineJudgeStatus.FAILED,
+                judge_verdict=None,
+                judge_reason="fine judge returned invalid JSON",
+                outcome=DriftTriggerOutcome.JUDGE_FAILED,
+            ),
         ),
     )
     agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
@@ -600,6 +634,9 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     assert phase["checkpoint_dir"] == str(phase_store)
     assert phase["checkpoints_retained"] is False
     assert phase["status"] == "rollback_limit"
+    assert phase["judge_reliability"] == "reliable"
+    assert phase["judge_attempts"] == 4
+    assert phase["judge_failures"] == 1
     assert phase["steps"] == 0
     assert phase["rollbacks"] == 1
     assert phase["tokens_used"] == 19
@@ -673,14 +710,48 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
             "outcome": "rollback_limit_refused",
             "rollback_checkpoint": None,
         },
+        {
+            "sequence": 5,
+            "logical_step": 3,
+            "signals": [
+                {
+                    "kind": "action_loop",
+                    "detail": "the same action appeared 2 times in the last 2 steps",
+                    "lookback": 2,
+                }
+            ],
+            "judge": {
+                "status": "failed",
+                "verdict": None,
+                "reason": "fine judge returned invalid JSON",
+            },
+            "outcome": "judge_failed",
+            "rollback_checkpoint": None,
+        },
     ]
     expected_counts = {
-        "action_loop": {"upheld": 2, "vetoed": 0, "suppressed": 0},
-        "no_file_change": {"upheld": 2, "vetoed": 1, "suppressed": 0},
+        "action_loop": {
+            "upheld": 2,
+            "vetoed": 0,
+            "suppressed": 0,
+            "judge_failed": 1,
+            "judge_budget_exhausted": 0,
+        },
+        "no_file_change": {
+            "upheld": 2,
+            "vetoed": 1,
+            "suppressed": 0,
+            "judge_failed": 0,
+            "judge_budget_exhausted": 0,
+        },
     }
     assert phase["signal_counts"] == expected_counts
     assert context.metadata["preserved"] == "yes"
     assert context.metadata["driftlock"]["signal_counts"] == expected_counts
+    assert context.metadata["driftlock"]["judge_reliability"] == "reliable"
+    assert context.metadata["driftlock"]["judge_attempts"] == 4
+    assert context.metadata["driftlock"]["judge_failures"] == 1
+    assert context.metadata["termination_reason"] == "driftlock_rollback_limit"
 
     native = object.__new__(native_agent.LHTBNativeDriftlockAgent)
     native.logs_dir = tmp_path
@@ -692,6 +763,9 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     native_phase = native_payload["phases"][0]
     assert native_phase["phase"] == 0
     assert native_phase["status"] == "rollback_limit"
+    assert native_phase["judge_reliability"] == "reliable"
+    assert native_phase["judge_attempts"] == 4
+    assert native_phase["judge_failures"] == 1
     assert native_phase["coarse_triggers"] == phase["coarse_triggers"]
     assert native_phase["signal_counts"] == expected_counts
     assert native_phase["unstable_checkpoint_count"] == 0
@@ -713,6 +787,170 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     assert empty_phase["coarse_triggers"] == []
     assert empty_phase["signal_counts"] == {}
     assert empty_phase["unstable_checkpoint_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("failure_count", "expected_reliability"),
+    [
+        (1, JudgeReliabilityStatus.INCONCLUSIVE),
+        (4, JudgeReliabilityStatus.FAILED),
+    ],
+)
+def test_harbor_metadata_keeps_terminal_status_and_judge_reliability_separate(
+    failure_count: int,
+    expected_reliability: JudgeReliabilityStatus,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    signal = DriftSignal("no_file_change", "stalled")
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+        coarse_triggers=tuple(
+            DriftTriggerRecord(
+                sequence=index,
+                logical_step=index,
+                signals=(signal,),
+                judge_status=FineJudgeStatus.FAILED,
+                judge_verdict=None,
+                judge_reason="invalid response",
+                outcome=DriftTriggerOutcome.JUDGE_FAILED,
+            )
+            for index in range(1, failure_count + 1)
+        ),
+    )
+
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent._driftlock_runtime = None
+    agent._driftlock_tokens_consumed = 0
+    agent._driftlock_runner_config = RunnerConfig(max_tokens=100)
+    harbor_context = SimpleNamespace(metadata={})
+    agent._set_result_metadata(harbor_context, result)
+
+    native_context = SimpleNamespace(metadata={})
+    native_agent.set_native_result_metadata(
+        native_context,
+        result=result,
+        runtime=SimpleNamespace(tokens_consumed=0),
+        trial_token_budget=100,
+    )
+
+    assert harbor_context.metadata["termination_reason"] == "confirmed_task_complete"
+    assert native_context.metadata["termination_reason"] == "confirmed_task_complete"
+    for metadata in (harbor_context.metadata, native_context.metadata):
+        assert metadata["driftlock"]["status"] == "completed"
+        assert metadata["driftlock"]["judge_reliability"] == expected_reliability.value
+
+
+def test_trial_metadata_accumulates_judge_evidence_across_phases(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    signal = DriftSignal("no_file_change", "stalled")
+
+    def trigger(index: int, status: FineJudgeStatus) -> DriftTriggerRecord:
+        failed = status is FineJudgeStatus.FAILED
+        return DriftTriggerRecord(
+            sequence=index,
+            logical_step=index,
+            signals=(signal,),
+            judge_status=status,
+            judge_verdict=None if failed else Verdict.HEALTHY,
+            judge_reason="invalid response" if failed else "healthy",
+            outcome=(
+                DriftTriggerOutcome.JUDGE_FAILED
+                if failed
+                else DriftTriggerOutcome.VETOED
+            ),
+        )
+
+    phase_zero = RunResult(
+        status=RunStatus.TOKEN_LIMIT,
+        state={},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+        coarse_triggers=tuple(
+            trigger(index, FineJudgeStatus.FAILED) for index in range(1, 13)
+        ),
+    )
+    phase_one = RunResult(
+        status=RunStatus.COMPLETED,
+        state={},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+        coarse_triggers=(trigger(1, FineJudgeStatus.VERDICT),),
+    )
+
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+    agent._driftlock_runtime = None
+    agent._driftlock_tokens_consumed = 0
+    agent._driftlock_runner_config = RunnerConfig(max_tokens=100)
+    harbor_context = SimpleNamespace(metadata={})
+    native_context = SimpleNamespace(metadata={})
+    agent._write_phase_record(
+        phase_zero,
+        tmp_path / "phase-0",
+        retained=False,
+    )
+    phase_record = json.loads(
+        (tmp_path / "driftlock-result.json").read_text(encoding="utf-8")
+    )["phases"][0]
+    assert phase_record["status"] == "token_limit"
+    assert phase_record["judge_reliability"] == "failed"
+    assert phase_record["judge_attempts"] == 12
+    assert phase_record["judge_failures"] == 12
+
+    agent._set_result_metadata(harbor_context, phase_zero)
+    native_agent.set_native_result_metadata(
+        native_context,
+        result=phase_zero,
+        runtime=SimpleNamespace(tokens_consumed=0),
+        trial_token_budget=100,
+    )
+    for metadata in (harbor_context.metadata, native_context.metadata):
+        assert metadata["driftlock"]["status"] == "token_limit"
+        assert metadata["driftlock"]["judge_reliability"] == "failed"
+        assert metadata["termination_reason"] == "driftlock_token_limit"
+
+    agent._set_result_metadata(harbor_context, phase_one)
+    native_agent.set_native_result_metadata(
+        native_context,
+        result=phase_one,
+        runtime=SimpleNamespace(tokens_consumed=0),
+        trial_token_budget=100,
+    )
+
+    for metadata in (harbor_context.metadata, native_context.metadata):
+        assert metadata["driftlock"]["status"] == "completed"
+        assert metadata["driftlock"]["judge_reliability"] == "failed"
+        assert metadata["driftlock"]["judge_attempts"] == 13
+        assert metadata["driftlock"]["judge_failures"] == 12
+        assert metadata["driftlock"]["signal_counts"] == {
+            "no_file_change": {
+                "upheld": 0,
+                "vetoed": 1,
+                "suppressed": 0,
+                "judge_failed": 12,
+                "judge_budget_exhausted": 0,
+            }
+        }
 
 
 def test_phase_record_counts_checkpoints_with_unstable_paths(

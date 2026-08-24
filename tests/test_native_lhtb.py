@@ -524,6 +524,9 @@ def test_native_metadata_writers_publish_literal_result_and_budget_fields() -> N
         "preserved": "yes",
         "driftlock": {
             "status": "completed",
+            "judge_reliability": "not_assessed",
+            "judge_attempts": 0,
+            "judge_failures": 0,
             "steps": 0,
             "rollbacks": 0,
             "tokens_used": 17,
@@ -544,7 +547,16 @@ def test_native_metadata_writers_publish_literal_result_and_budget_fields() -> N
     assert context.metadata["termination_reason"] == "driftlock_token_limit"
     assert context.metadata["driftlock"] == {
         "status": "token_limit",
+        "judge_reliability": "not_assessed",
+        "judge_attempts": 0,
+        "judge_failures": 0,
+        "steps": 0,
+        "rollbacks": 0,
         "tokens_used": 88,
+        "agent_tokens_used": 12,
+        "judge_tokens_used": 5,
+        "signal_counts": {},
+        "trial_tokens_used": 88,
         "trial_token_budget": 100,
     }
 

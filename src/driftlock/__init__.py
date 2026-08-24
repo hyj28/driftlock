@@ -14,7 +14,13 @@ from driftlock.agent import (
 )
 from driftlock.checkpoints import DirectoryCheckpointStore, SnapshotIntegrityError
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
-from driftlock.judges import CallableLLMJudge
+from driftlock.judges import (
+    DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
+    CallableLLMJudge,
+    JudgeTokenBudgetExhausted,
+    judge_input_token_bound,
+    judge_output_token_limit,
+)
 from driftlock.lhtb import (
     DRIFTLOCK_HARBOR_PATCH_VERSION,
     LHTB_LITELLM_VERSION,
@@ -46,6 +52,7 @@ from driftlock.models import (
     DriftTriggerRecord,
     FineJudgeStatus,
     JudgeCompletion,
+    JudgeReliabilityStatus,
     JudgeVerdict,
     RunResult,
     RunStatus,
@@ -53,6 +60,8 @@ from driftlock.models import (
     StepOutcome,
     StepTokenBudgetExhausted,
     Verdict,
+    classify_judge_reliability,
+    merge_signal_counts,
 )
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
 from driftlock.runner import DriftlockRunner, RunnerConfig
@@ -67,6 +76,7 @@ from driftlock.terminus import (
 )
 
 __all__ = [
+    "DEFAULT_JUDGE_MAX_OUTPUT_TOKENS",
     "DRIFTLOCK_HARBOR_PATCH_VERSION",
     "LHTB_LITELLM_VERSION",
     "LHTB_REPOSITORY_REVISION",
@@ -89,6 +99,8 @@ __all__ = [
     "HeuristicConfig",
     "HeuristicJudge",
     "JudgeCompletion",
+    "JudgeReliabilityStatus",
+    "JudgeTokenBudgetExhausted",
     "JudgeVerdict",
     "LHTBRuntimeCompatibilityError",
     "LHTBTerminusRuntime",
@@ -119,9 +131,13 @@ __all__ = [
     "WorkspaceDeltaObserver",
     "WorkspaceSnapshot",
     "analyze_jobs",
+    "classify_judge_reliability",
     "conservative_prefill_estimate",
     "goal_drift_actions",
     "goal_drift_inaction",
+    "judge_input_token_bound",
+    "judge_output_token_limit",
     "lhtb_experiment_fingerprint",
     "lhtb_harbor_patch_path",
+    "merge_signal_counts",
 ]
