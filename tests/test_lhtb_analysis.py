@@ -1134,7 +1134,15 @@ def test_analyze_accepts_graded_timeout_and_reconstructs_exact_usage(
     ("mutation", "message"),
     [
         ("missing", "missing trajectory needed to reconstruct agent usage"),
-        ("malformed", "cached_tokens"),
+        # A cache field that is present but unusable is still a hard error; only
+        # an entirely absent one is read as "no cache hit". See the test below.
+        ("bad-cache-type", "cached_tokens"),
+        ("negative-cache", "cached_tokens"),
+        # Every other field stays required: absence there is real information
+        # loss, not a provider reporting zero.
+        ("no-prompt", "prompt_tokens"),
+        ("no-completion", "completion_tokens"),
+        ("no-cost", "cost_usd"),
     ],
 )
 def test_analyze_rejects_unusable_trajectory_needed_for_timeout_usage(
@@ -1147,21 +1155,24 @@ def test_analyze_rejects_unusable_trajectory_needed_for_timeout_usage(
     if mutation == "missing":
         trajectory.unlink()
     else:
+        metrics: dict[str, object] = {
+            "prompt_tokens": 11,
+            "completion_tokens": 3,
+            "cached_tokens": 4,
+            "cost_usd": 0.125,
+        }
+        if mutation == "bad-cache-type":
+            metrics["cached_tokens"] = "4"
+        elif mutation == "negative-cache":
+            metrics["cached_tokens"] = -1
+        elif mutation == "no-prompt":
+            del metrics["prompt_tokens"]
+        elif mutation == "no-completion":
+            del metrics["completion_tokens"]
+        elif mutation == "no-cost":
+            del metrics["cost_usd"]
         trajectory.write_text(
-            json.dumps(
-                {
-                    "steps": [
-                        {
-                            "source": "agent",
-                            "metrics": {
-                                "prompt_tokens": 11,
-                                "completion_tokens": 3,
-                                "cost_usd": 0.125,
-                            },
-                        }
-                    ]
-                }
-            ),
+            json.dumps({"steps": [{"source": "agent", "metrics": metrics}]}),
             encoding="utf-8",
         )
     _job_summary(stock, 2, errors=1)
@@ -1171,6 +1182,62 @@ def test_analyze_rejects_unusable_trajectory_needed_for_timeout_usage(
             lhtb_dir=lhtb,
             arm_directories={"stock": stock, "driftlock": driftlock},
         )
+
+
+def test_a_step_that_reports_no_cache_read_is_counted_as_zero_cache(
+    tmp_path: Path,
+) -> None:
+    # A call that hits no cache may omit cached_tokens entirely; DeepInfra did
+    # this on 2026-08-24 and it rejected an otherwise clean four-arm round.
+    # Reading it as zero attributes the whole prompt to full-price input, so an
+    # omission can never make a billed call look cheaper than it was.
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    result_file = stock / "long-1" / "result.json"
+    _set_graded_timeout(result_file, reward=0.15)
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 20,
+                            "completion_tokens": 5,
+                            "cached_tokens": 12,
+                            "cost_usd": 0.25,
+                        },
+                    },
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 4,
+                            "completion_tokens": 3,
+                            "cost_usd": 0.125,
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _job_summary(stock, 2, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    trial = next(
+        trial
+        for trial in report["arms"]["stock"]["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert trial["usage_source"] == "trajectory"
+    assert trial["input_tokens"] == 24
+    assert trial["cache_tokens"] == 12
+    assert trial["output_tokens"] == 8
+    assert trial["cost_usd"] == 0.375
 
 
 def test_analyze_rejects_non_timeout_exception_by_type(tmp_path: Path) -> None:

@@ -1246,7 +1246,15 @@ def _trajectory_usage(result_file: Path) -> dict[str, int | float]:
             )
         for output_name, source_name in fields.items():
             raw = metrics.get(source_name)
-            if output_name == "cost_usd":
+            if raw is None and output_name == "cache_tokens":
+                # A call with no cache hit may omit the field entirely. Reading
+                # that as zero is the conservative direction: it attributes the
+                # whole prompt to full-price input rather than to cheap cache
+                # reads, so an omission can never make a billed call look
+                # cheaper than it was. Every other field stays required --
+                # a missing prompt, completion or cost is real information loss.
+                value: int | float = 0
+            elif output_name == "cost_usd":
                 value = _nonnegative_number(raw, f"{source_name} in {context}")
             else:
                 value = _nonnegative_integer(raw, f"{source_name} in {context}")
