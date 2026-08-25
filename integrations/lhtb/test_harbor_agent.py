@@ -14,12 +14,19 @@ import pytest
 from harbor.models.agent.context import AgentContext
 
 import driftlock.harbor_agent as plugin
+from driftlock.judges import JudgeTokenBudgetExhausted, judge_input_token_bound
 from driftlock.lhtb_experiment import (
     DEFAULT_JUDGE_PROVIDER,
     DEFAULT_PROVIDER,
     openrouter_provider_call_kwargs,
 )
-from driftlock.models import RunResult, RunStatus
+from driftlock.models import (
+    Checkpoint,
+    DriftContext,
+    FineJudgeStatus,
+    RunResult,
+    RunStatus,
+)
 from driftlock.terminus import TerminusConversationCodec, TerminusConversationState
 
 
@@ -581,9 +588,57 @@ async def test_judge_client_skips_request_when_budget_cannot_cover_prompt(
         llm_call_kwargs=_pinned_judge_call_kwargs(),
     )
 
-    completion = await client.complete("large enough prompt", tokens_remaining=10)
+    prompt = "large enough prompt"
+    input_bound = judge_input_token_bound(prompt)
 
-    assert completion.tokens == 0
+    with pytest.raises(JudgeTokenBudgetExhausted) as exc_info:
+        await client.complete(prompt, tokens_remaining=10)
+
+    assert "10 tokens remain" in str(exc_info.value)
+    assert f"reserves {input_bound} input tokens" in str(exc_info.value)
+    assert client.request_times_msec == []
+
+
+@pytest.mark.asyncio
+async def test_lhtb_fine_judge_classifies_preflight_budget_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLiteLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def call(self, prompt: str, **kwargs: Any) -> Any:
+            raise AssertionError("judge provider must not be called")
+
+    FakeLiteLLM.call.__wrapped__ = FakeLiteLLM.call  # type: ignore[attr-defined]
+    monkeypatch.setattr(plugin, "LiteLLM", FakeLiteLLM)
+    client = plugin._LHTBJudgeClient(
+        model=plugin.PINNED_LHTB_JUDGE_MODEL,
+        api_base=None,
+        max_output_tokens=50,
+        timeout_sec=10,
+        llm_call_kwargs=_pinned_judge_call_kwargs(),
+    )
+    context = DriftContext(
+        goal="fix the parser",
+        plan="add a regression test",
+        checkpoint=Checkpoint(
+            checkpoint_id="abc",
+            step=2,
+            created_at=datetime.now(UTC),
+            digest="digest",
+            path=Path("/tmp/checkpoint"),
+        ),
+        signals=(),
+        recent_steps=(),
+        diff="",
+        tokens_remaining=10,
+    )
+
+    verdict = await plugin._LHTBFineJudge(client).judge(context)
+
+    assert verdict.status is FineJudgeStatus.BUDGET_EXHAUSTED
+    assert verdict.verdict is None
     assert client.request_times_msec == []
 
 
