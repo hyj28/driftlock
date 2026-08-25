@@ -483,6 +483,75 @@ def _set_graded_timeout(result_file: Path, *, reward: float) -> None:
     )
 
 
+def _four_arm_jobs(tmp_path: Path, *, task_count: int) -> tuple[Path, dict[str, Path]]:
+    lhtb = tmp_path / "LHTB"
+    arms = {
+        "stock": tmp_path / "stock",
+        "retry": tmp_path / "retry",
+        "driftlock-heuristic": tmp_path / "driftlock-heuristic",
+        "driftlock": tmp_path / "driftlock",
+    }
+    reward_offsets = {
+        "stock": 0.0,
+        "retry": 0.1,
+        "driftlock-heuristic": 0.2,
+        "driftlock": 0.3,
+    }
+    for number in range(1, task_count + 1):
+        task = f"task-{number}"
+        _task(
+            lhtb,
+            task,
+            expert_minutes=number * 10,
+            category=f"category-{number}",
+        )
+        checksum = _task_directory_sha256(lhtb / "tasks" / task)
+        for arm, job in arms.items():
+            _result(
+                job,
+                f"{task}-1",
+                task,
+                number / 20 + reward_offsets[arm],
+                checksum=checksum,
+                arm=arm,
+            )
+    for job in arms.values():
+        _job_summary(job, task_count)
+    return lhtb, arms
+
+
+def _set_dead_trial(result_file: Path, exception_type: str) -> None:
+    payload = json.loads(result_file.read_text())
+    payload["agent_result"] = None
+    payload["verifier_result"] = None
+    payload["exception_info"] = {"exception_type": exception_type}
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir()
+    trajectory.write_text(
+        json.dumps(
+            {
+                "schema_version": "ATIF-v1.0",
+                "steps": [
+                    {"step_id": 1, "source": "user", "message": "task"},
+                    {
+                        "step_id": 2,
+                        "source": "agent",
+                        "message": "provider failed",
+                        "metrics": {
+                            "prompt_tokens": 15,
+                            "cached_tokens": 5,
+                            "completion_tokens": 5,
+                            "cost_usd": 0.05,
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_goal_drift_formulas_match_published_definitions() -> None:
     assert goal_drift_actions(0.7, 0.4) == pytest.approx(0.3)
     assert goal_drift_actions(0.4, 0.7) == 0
@@ -567,6 +636,342 @@ def test_analyze_complete_matrix_reports_curves_costs_and_provenance(
     trial = drift["trials"][0]
     assert Path(trial["result_file"]).is_absolute()
     assert len(trial["result_sha256"]) == 64
+
+
+def test_analyze_clean_round_reports_empty_task_exclusions(tmp_path: Path) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=4)
+
+    report = analyze_jobs(lhtb_dir=lhtb, arm_directories=arms)
+
+    assert report["task_exclusions"] == {
+        "excluded_task_count": 0,
+        "excluded_tasks": [],
+        "dead_trial_counts_by_arm": {
+            "stock": 0,
+            "retry": 0,
+            "driftlock-heuristic": 0,
+            "driftlock": 0,
+        },
+        "surviving_task_count": 4,
+    }
+    assert all(
+        "dead_exception_type" not in trial
+        for arm in report["arms"].values()
+        for trial in arm["trials"]
+    )
+
+
+def test_analyze_excludes_one_dead_task_from_every_arm_and_keeps_its_spend(
+    tmp_path: Path,
+) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=4)
+    _set_dead_trial(arms["driftlock"] / "task-2-1" / "result.json", "APIError")
+    _job_summary(arms["driftlock"], 4, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories=arms,
+        exclude_dead_tasks=True,
+    )
+
+    assert report["task_exclusions"] == {
+        "excluded_task_count": 1,
+        "excluded_tasks": [
+            {
+                "task": "long-horizon-terminal-bench/task-2",
+                "reason": "non_timeout_trial_exception",
+                "deaths": [{"arm": "driftlock", "exception_type": "APIError"}],
+            }
+        ],
+        "dead_trial_counts_by_arm": {
+            "stock": 0,
+            "retry": 0,
+            "driftlock-heuristic": 0,
+            "driftlock": 1,
+        },
+        "surviving_task_count": 3,
+    }
+    assert report["matrix"]["attempts_per_task"] == {
+        "stock": {
+            "long-horizon-terminal-bench/task-1": 1,
+            "long-horizon-terminal-bench/task-3": 1,
+            "long-horizon-terminal-bench/task-4": 1,
+        },
+        "retry": {
+            "long-horizon-terminal-bench/task-1": 1,
+            "long-horizon-terminal-bench/task-3": 1,
+            "long-horizon-terminal-bench/task-4": 1,
+        },
+        "driftlock-heuristic": {
+            "long-horizon-terminal-bench/task-1": 1,
+            "long-horizon-terminal-bench/task-3": 1,
+            "long-horizon-terminal-bench/task-4": 1,
+        },
+        "driftlock": {
+            "long-horizon-terminal-bench/task-1": 1,
+            "long-horizon-terminal-bench/task-3": 1,
+            "long-horizon-terminal-bench/task-4": 1,
+        },
+    }
+    expected_reported_usage = {
+        "stock": (400, 160, 80, 1.0),
+        "retry": (400, 160, 80, 1.0),
+        "driftlock-heuristic": (400, 160, 80, 1.0),
+        "driftlock": (315, 125, 65, 0.8),
+    }
+    expected_harbor_usage = {
+        "stock": (400, 160, 80, 1.0),
+        "retry": (400, 160, 80, 1.0),
+        "driftlock-heuristic": (400, 160, 80, 1.0),
+        "driftlock": (300, 120, 60, 0.75),
+    }
+    expected_rewards = {
+        "stock": 0.13333333333333333,
+        "retry": 0.23333333333333334,
+        "driftlock-heuristic": 0.3333333333333333,
+        "driftlock": 0.43333333333333335,
+    }
+    for arm in arms:
+        input_tokens, cache_tokens, output_tokens, cost_usd = expected_reported_usage[
+            arm
+        ]
+        harbor_input, harbor_cache, harbor_output, harbor_cost = expected_harbor_usage[
+            arm
+        ]
+        assert report["arms"][arm]["task_count"] == 3
+        assert report["arms"][arm]["trial_count"] == 4
+        assert report["arms"][arm]["billed_trial_count"] == 4
+        assert report["arms"][arm]["analyzed_trial_count"] == 3
+        assert report["arms"][arm]["usage_totals_population"] == ("all_billed_trials")
+        assert report["arms"][arm]["mean_reward"] == pytest.approx(
+            expected_rewards[arm]
+        )
+        assert report["arms"][arm]["input_tokens"] == input_tokens
+        assert report["arms"][arm]["cache_tokens"] == cache_tokens
+        assert report["arms"][arm]["output_tokens"] == output_tokens
+        assert report["arms"][arm]["cost_usd"] == cost_usd
+        assert report["job_summaries"][arm]["usage"] == {
+            "input_tokens": harbor_input,
+            "cache_tokens": harbor_cache,
+            "output_tokens": harbor_output,
+            "cost_usd": harbor_cost,
+        }
+        assert report["arms"][arm]["mean_total_tokens_per_analyzed_trial"] == 120
+        assert report["arms"][arm]["mean_cost_usd_per_analyzed_trial"] == 0.25
+    assert report["arms"]["stock"]["mean_total_tokens_per_billed_trial"] == 120
+    assert report["arms"]["stock"]["mean_cost_usd_per_billed_trial"] == 0.25
+    assert report["arms"]["driftlock"]["mean_total_tokens_per_billed_trial"] == 95
+    assert report["arms"]["driftlock"]["mean_cost_usd_per_billed_trial"] == 0.2
+    assert report["arms"]["driftlock"]["trajectory_reconstructed_usage"] == {
+        "input_tokens": 15,
+        "cache_tokens": 5,
+        "output_tokens": 5,
+        "cost_usd": 0.05,
+    }
+    expected_reward_deltas = {
+        "retry": 0.1,
+        "driftlock-heuristic": 0.2,
+        "driftlock": 0.3,
+    }
+    for arm, comparison in report["paired_vs_stock"].items():
+        assert comparison["shared_task_count"] == 3
+        assert comparison["mean_task_reward_delta"] == pytest.approx(
+            expected_reward_deltas[arm]
+        )
+        assert [item["task"] for item in comparison["tasks"]] == [
+            "long-horizon-terminal-bench/task-1",
+            "long-horizon-terminal-bench/task-3",
+            "long-horizon-terminal-bench/task-4",
+        ]
+        assert comparison["aggregate_workload_comparable"] is True
+        assert comparison["aggregate_delta_status"] == (
+            "complete_surviving_task_attempt_matrix"
+        )
+        assert comparison["workload_population"] == "reward_analysis_trials"
+        assert comparison["mean_total_tokens_per_trial_delta"] == 0
+        assert comparison["mean_cost_usd_per_trial_delta"] == 0
+        assert comparison["mean_total_tokens_per_surviving_trial_delta"] == 0
+        assert comparison["mean_cost_usd_per_surviving_trial_delta"] == 0
+
+
+def test_excluded_round_workload_matches_round_where_task_was_never_run(
+    tmp_path: Path,
+) -> None:
+    excluded_lhtb, excluded_arms = _four_arm_jobs(tmp_path / "excluded", task_count=4)
+    _set_dead_trial(excluded_arms["driftlock"] / "task-2-1" / "result.json", "APIError")
+    _job_summary(excluded_arms["driftlock"], 4, errors=1)
+    excluded_report = analyze_jobs(
+        lhtb_dir=excluded_lhtb,
+        arm_directories=excluded_arms,
+        exclude_dead_tasks=True,
+    )
+
+    never_run_lhtb, never_run_arms = _four_arm_jobs(
+        tmp_path / "never-run", task_count=4
+    )
+    for job in never_run_arms.values():
+        (job / "task-2-1" / "result.json").unlink()
+        _job_summary(job, 3)
+    never_run_report = analyze_jobs(
+        lhtb_dir=never_run_lhtb,
+        arm_directories=never_run_arms,
+    )
+
+    excluded = excluded_report["paired_vs_stock"]["driftlock"]
+    never_run = never_run_report["paired_vs_stock"]["driftlock"]
+    assert excluded["aggregate_workload_comparable"] is True
+    assert excluded["mean_total_tokens_per_trial_delta"] == 0
+    assert excluded["mean_cost_usd_per_trial_delta"] == 0
+    assert never_run["aggregate_workload_comparable"] is True
+    assert never_run["mean_total_tokens_per_trial_delta"] == 0
+    assert never_run["mean_cost_usd_per_trial_delta"] == 0
+    assert (
+        excluded["mean_total_tokens_per_trial_delta"]
+        == never_run["mean_total_tokens_per_trial_delta"]
+    )
+    assert (
+        excluded["mean_cost_usd_per_trial_delta"]
+        == never_run["mean_cost_usd_per_trial_delta"]
+    )
+
+
+def test_dead_task_exclusion_preserves_raw_incomplete_matrix(tmp_path: Path) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=5)
+    checksum = _task_directory_sha256(lhtb / "tasks" / "task-5")
+    extra = _result(
+        arms["driftlock"],
+        "task-5-2",
+        "task-5",
+        0.9,
+        checksum=checksum,
+        arm="driftlock",
+    )
+    _set_dead_trial(extra, "APIError")
+    _job_summary(arms["driftlock"], 6, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories=arms,
+        require_complete_matrix=False,
+        exclude_dead_tasks=True,
+    )
+
+    matrix = report["matrix"]
+    assert matrix["pre_exclusion_complete"] is False
+    assert matrix["post_exclusion_complete"] is True
+    assert matrix["complete"] is False
+    assert (
+        matrix["pre_exclusion_attempts_per_task"]["stock"][
+            "long-horizon-terminal-bench/task-5"
+        ]
+        == 1
+    )
+    assert (
+        matrix["pre_exclusion_attempts_per_task"]["driftlock"][
+            "long-horizon-terminal-bench/task-5"
+        ]
+        == 2
+    )
+    assert (
+        "long-horizon-terminal-bench/task-5"
+        not in matrix["attempts_per_task"]["driftlock"]
+    )
+    comparison = report["paired_vs_stock"]["driftlock"]
+    assert comparison["aggregate_workload_comparable"] is False
+    assert comparison["aggregate_delta_status"] == (
+        "unavailable_for_incomplete_task_attempt_matrix"
+    )
+    assert comparison["mean_total_tokens_per_trial_delta"] is None
+    assert comparison["mean_cost_usd_per_trial_delta"] is None
+
+
+@pytest.mark.parametrize(
+    ("deaths", "expected_counts", "offender"),
+    [
+        (
+            {
+                "driftlock-heuristic": ("task-1", "task-2"),
+                "driftlock": ("task-3",),
+            },
+            "stock=0, retry=0, driftlock-heuristic=2, driftlock=1",
+            "driftlock-heuristic=2",
+        ),
+        (
+            {
+                "retry": ("task-1", "task-2", "task-3"),
+                "driftlock": ("task-4", "task-5", "task-6", "task-7", "task-8"),
+            },
+            "stock=0, retry=3, driftlock-heuristic=0, driftlock=5",
+            "driftlock=5",
+        ),
+    ],
+)
+def test_analyze_rejects_real_concentrated_dead_trial_shapes(
+    tmp_path: Path,
+    deaths: dict[str, tuple[str, ...]],
+    expected_counts: str,
+    offender: str,
+) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=8)
+    for arm, tasks in deaths.items():
+        for task in tasks:
+            _set_dead_trial(arms[arm] / f"{task}-1" / "result.json", "APIError")
+        _job_summary(arms[arm], 8, errors=len(tasks))
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories=arms,
+            exclude_dead_tasks=True,
+        )
+
+    message = str(caught.value)
+    assert expected_counts in message
+    assert offender in message
+    assert "possible arm defect" in message
+
+
+def test_analyze_accepts_one_dead_trial_per_arm(tmp_path: Path) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=8)
+    for number, (_arm, job) in enumerate(arms.items(), start=1):
+        _set_dead_trial(job / f"task-{number}-1" / "result.json", "APIError")
+        _job_summary(job, 8, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories=arms,
+        exclude_dead_tasks=True,
+    )
+
+    assert report["task_exclusions"]["dead_trial_counts_by_arm"] == {
+        "stock": 1,
+        "retry": 1,
+        "driftlock-heuristic": 1,
+        "driftlock": 1,
+    }
+    assert report["task_exclusions"]["excluded_task_count"] == 4
+    assert report["task_exclusions"]["surviving_task_count"] == 4
+    assert all(
+        comparison["shared_task_count"] == 4
+        for comparison in report["paired_vs_stock"].values()
+    )
+
+
+def test_analyze_rejects_too_few_tasks_after_spread_deaths(tmp_path: Path) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=4)
+    for number, arm in enumerate(("stock", "retry", "driftlock-heuristic"), start=1):
+        _set_dead_trial(arms[arm] / f"task-{number}-1" / "result.json", "APIError")
+        _job_summary(arms[arm], 4, errors=1)
+
+    with pytest.raises(
+        ValueError,
+        match="dead-task exclusion leaves 1 surviving tasks; at least 3 are required",
+    ):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories=arms,
+            exclude_dead_tasks=True,
+        )
 
 
 def test_planned_arm_coverage_includes_native_arm_present_in_report(
@@ -1632,3 +2037,40 @@ def test_analyze_cli_writes_report(tmp_path: Path) -> None:
         == 0
     )
     assert json.loads(output.read_text())["schema_version"] == 1
+
+
+def test_analyze_cli_explicitly_enables_dead_task_exclusion(tmp_path: Path) -> None:
+    lhtb, arms = _four_arm_jobs(tmp_path, task_count=4)
+    _set_dead_trial(arms["retry"] / "task-1-1" / "result.json", "APIError")
+    _job_summary(arms["retry"], 4, errors=1)
+    output = tmp_path / "analysis.json"
+    arguments = [
+        "analyze",
+        "--lhtb-dir",
+        str(lhtb),
+        "--exclude-dead-tasks",
+        "--output",
+        str(output),
+    ]
+    for arm, job in arms.items():
+        arguments.extend(("--arm-dir", f"{arm}={job}"))
+
+    assert main(arguments) == 0
+
+    assert json.loads(output.read_text())["task_exclusions"] == {
+        "excluded_task_count": 1,
+        "excluded_tasks": [
+            {
+                "task": "long-horizon-terminal-bench/task-1",
+                "reason": "non_timeout_trial_exception",
+                "deaths": [{"arm": "retry", "exception_type": "APIError"}],
+            }
+        ],
+        "dead_trial_counts_by_arm": {
+            "stock": 0,
+            "retry": 1,
+            "driftlock-heuristic": 0,
+            "driftlock": 0,
+        },
+        "surviving_task_count": 3,
+    }

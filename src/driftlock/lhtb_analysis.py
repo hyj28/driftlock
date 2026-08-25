@@ -71,6 +71,20 @@ _DRIFTLOCK_DETECTOR_FIELDS = (
 
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
+# The archive contains 99 trials; removing the single 32-trial provider outage
+# leaves 2 external deaths in 67 trials.  At that rate, an eight-trial arm has a
+# 2.2% binomial chance of two or more external deaths, and a four-arm round has
+# an 8.6% chance that any arm does: 1 - (1 - 0.02213)^4.  One death is therefore
+# admitted as provider noise, but a second death in the same arm is treated as
+# evidence of an arm-specific defect.  This rejects both observed project-bug
+# shapes (2/1 and 5/3 deaths in their affected arms) while admitting one death
+# per arm.
+_MAX_DEAD_TRIALS_PER_ARM = 1
+# There is already only one attempt per task and no error bar.  Two surviving
+# tasks would make the reported slope a line fixed by exactly two observations,
+# not a useful result; three is the smallest non-degenerate analysis.
+_MIN_SURVIVING_TASKS_AFTER_EXCLUSION = 3
+
 
 def _recorded_fingerprint(environment: Any, context: str) -> str:
     """Read a trial's recorded build fingerprint without assuming which build.
@@ -146,6 +160,7 @@ def analyze_jobs(
     arm_directories: Mapping[str, Path],
     solve_threshold: float = SOLVE_THRESHOLD,
     require_complete_matrix: bool = True,
+    exclude_dead_tasks: bool = False,
 ) -> dict[str, Any]:
     """Build an auditable multi-arm report from Harbor ``result.json`` files.
 
@@ -203,18 +218,26 @@ def analyze_jobs(
                 solve_threshold=solve_threshold,
                 expected_provider=job_summaries[arm]["agent_provider"],
                 expected_judge_provider=job_summaries[arm]["judge_provider"],
+                exclude_dead_tasks=exclude_dead_tasks,
             )
             if trial["trial_id"] in seen_trial_ids:
                 raise ValueError(f"duplicate Harbor trial id: {trial['trial_id']}")
             seen_trial_ids.add(trial["trial_id"])
             trials.append(trial)
         graded_at_time_cap_count = sum(trial["graded_at_time_cap"] for trial in trials)
-        if graded_at_time_cap_count != job_summaries[arm]["n_errored_trials"]:
+        dead_trial_count = sum(
+            trial["dead_exception_type"] is not None for trial in trials
+        )
+        if (
+            graded_at_time_cap_count + dead_trial_count
+            != job_summaries[arm]["n_errored_trials"]
+        ):
             raise ValueError(
                 f"arm {arm!r} Harbor job summary declares "
                 f"{job_summaries[arm]['n_errored_trials']} errored trials but "
                 f"trial results contain {graded_at_time_cap_count} graded "
-                "AgentTimeoutError trials"
+                f"AgentTimeoutError trials and {dead_trial_count} non-timeout "
+                "dead trials"
             )
         actual_task_counts: dict[str, int] = defaultdict(int)
         for trial in trials:
@@ -233,9 +256,46 @@ def analyze_jobs(
             )
         trials_by_arm[arm] = trials
 
-    matrix = _validate_matrix(
+    full_matrix = _validate_matrix(
         trials_by_arm, require_complete_matrix=require_complete_matrix
     )
+    exclusions = _task_exclusions(trials_by_arm)
+    analysis_trials_by_arm = trials_by_arm
+    if exclusions["excluded_tasks"]:
+        _validate_dead_trial_distribution(exclusions["dead_trial_counts_by_arm"])
+        excluded_tasks = {item["task"] for item in exclusions["excluded_tasks"]}
+        analysis_trials_by_arm = {
+            arm: [trial for trial in trials if trial["task"] not in excluded_tasks]
+            for arm, trials in trials_by_arm.items()
+        }
+        surviving_tasks = set.intersection(
+            *(
+                {trial["task"] for trial in trials}
+                for trials in analysis_trials_by_arm.values()
+            )
+        )
+        exclusions["surviving_task_count"] = len(surviving_tasks)
+        if len(surviving_tasks) < _MIN_SURVIVING_TASKS_AFTER_EXCLUSION:
+            raise ValueError(
+                "dead-task exclusion leaves "
+                f"{len(surviving_tasks)} surviving tasks; at least "
+                f"{_MIN_SURVIVING_TASKS_AFTER_EXCLUSION} are required"
+            )
+        # Reuse the ordinary matrix validator after removing each dead task from
+        # every arm.  The full matrix was validated above first, so exclusion
+        # cannot hide an existing provenance or task-presence rejection.
+        matrix = _validate_matrix(
+            analysis_trials_by_arm,
+            require_complete_matrix=require_complete_matrix,
+        )
+        matrix["pre_exclusion_complete"] = full_matrix["complete"]
+        matrix["pre_exclusion_attempts_per_task"] = full_matrix["attempts_per_task"]
+        matrix["post_exclusion_complete"] = matrix["complete"]
+        # Exclusion may remove the exact task that exposed an attempt imbalance.
+        # Keep the raw refusal visible instead of upgrading an incomplete matrix.
+        matrix["complete"] = full_matrix["complete"] and matrix["complete"]
+    else:
+        matrix = full_matrix
     # The guard that actually matters: every trial being compared must have been
     # produced by one build. Previously this was only implied by each lock being
     # matched against the *installed* build, so it disappeared entirely whenever
@@ -259,24 +319,49 @@ def analyze_jobs(
     matrix["driftlock_build_fingerprint"] = build
     matrix["analyzer_build_fingerprint"] = analyzer
     matrix["analyzed_by_producing_build"] = build == analyzer
-    arm_reports = {
+    analysis_arm_reports = {
         arm: _aggregate_arm(trials, solve_threshold=solve_threshold)
+        for arm, trials in analysis_trials_by_arm.items()
+    }
+    arm_reports = {
+        arm: _aggregate_arm(
+            analysis_trials_by_arm[arm],
+            solve_threshold=solve_threshold,
+            billed_trials=trials,
+        )
         for arm, trials in trials_by_arm.items()
     }
     for arm, report in arm_reports.items():
         _validate_job_usage(arm, job_summaries[arm], report)
-    stock = arm_reports["stock"]
-    comparisons = {
-        arm: _compare_to_stock(
-            stock,
-            report,
-            comparable=(
-                matrix["attempts_per_task"][arm] == matrix["attempts_per_task"]["stock"]
-            ),
+    stock = analysis_arm_reports["stock"]
+    comparisons = {}
+    for arm in arm_reports:
+        if arm == "stock":
+            continue
+        post_exclusion_comparable = (
+            matrix["attempts_per_task"][arm] == matrix["attempts_per_task"]["stock"]
         )
-        for arm, report in arm_reports.items()
-        if arm != "stock"
-    }
+        pre_exclusion_comparable = (
+            full_matrix["attempts_per_task"][arm]
+            == full_matrix["attempts_per_task"]["stock"]
+        )
+        matrix_comparable = post_exclusion_comparable and pre_exclusion_comparable
+        # The comparison reports were aggregated from analysis_trials_by_arm, so
+        # their workload means cover exactly the survivor population used for
+        # rewards.  Arm-level billed totals remain separate for reconciliation.
+        workload_comparable = matrix_comparable
+        if not matrix_comparable:
+            aggregate_delta_status = "unavailable_for_incomplete_task_attempt_matrix"
+        elif exclusions["excluded_tasks"]:
+            aggregate_delta_status = "complete_surviving_task_attempt_matrix"
+        else:
+            aggregate_delta_status = "complete_task_attempt_matrix"
+        comparisons[arm] = _compare_to_stock(
+            stock,
+            analysis_arm_reports[arm],
+            comparable=workload_comparable,
+            aggregate_delta_status=aggregate_delta_status,
+        )
     return {
         "schema_version": 1,
         "solve_threshold": solve_threshold,
@@ -285,6 +370,7 @@ def analyze_jobs(
             for arm, path in arm_directories.items()
         },
         "job_summaries": job_summaries,
+        "task_exclusions": exclusions,
         "matrix": matrix,
         "arms": arm_reports,
         "paired_vs_stock": comparisons,
@@ -518,6 +604,62 @@ def _validate_job_usage(
         )
 
 
+def _task_exclusions(
+    trials_by_arm: Mapping[str, Sequence[dict[str, Any]]],
+) -> dict[str, Any]:
+    deaths_by_task: dict[str, list[dict[str, str]]] = defaultdict(list)
+    counts_by_arm: dict[str, int] = {}
+    tasks_by_arm: list[set[str]] = []
+    for arm, trials in trials_by_arm.items():
+        tasks_by_arm.append({trial["task"] for trial in trials})
+        dead_trials = [
+            trial for trial in trials if trial["dead_exception_type"] is not None
+        ]
+        counts_by_arm[arm] = len(dead_trials)
+        for trial in dead_trials:
+            deaths_by_task[trial["task"]].append(
+                {
+                    "arm": arm,
+                    "exception_type": trial["dead_exception_type"],
+                }
+            )
+    excluded_tasks = [
+        {
+            "task": task,
+            "reason": "non_timeout_trial_exception",
+            "deaths": sorted(
+                deaths, key=lambda death: (death["arm"], death["exception_type"])
+            ),
+        }
+        for task, deaths in sorted(deaths_by_task.items())
+    ]
+    common_tasks = set.intersection(*tasks_by_arm)
+    return {
+        "excluded_task_count": len(excluded_tasks),
+        "excluded_tasks": excluded_tasks,
+        "dead_trial_counts_by_arm": counts_by_arm,
+        "surviving_task_count": len(common_tasks)
+        - len(set(deaths_by_task) & common_tasks),
+    }
+
+
+def _validate_dead_trial_distribution(counts_by_arm: Mapping[str, int]) -> None:
+    concentrated = {
+        arm: count
+        for arm, count in counts_by_arm.items()
+        if count > _MAX_DEAD_TRIALS_PER_ARM
+    }
+    if not concentrated:
+        return
+    counts = ", ".join(f"{arm}={count}" for arm, count in counts_by_arm.items())
+    offenders = ", ".join(f"{arm}={count}" for arm, count in concentrated.items())
+    raise ValueError(
+        "dead trials are concentrated in one or more arms "
+        f"({counts}); refusing possible arm defect because {offenders} exceeds "
+        f"the per-arm limit of {_MAX_DEAD_TRIALS_PER_ARM}"
+    )
+
+
 def _load_trial(
     *,
     result_file: Path,
@@ -528,6 +670,7 @@ def _load_trial(
     solve_threshold: float,
     expected_provider: str | None,
     expected_judge_provider: str | None,
+    exclude_dead_tasks: bool,
 ) -> dict[str, Any]:
     try:
         data = json.loads(result_file.read_text(encoding="utf-8"))
@@ -540,8 +683,18 @@ def _load_trial(
     task = data.get("task_name")
     if not isinstance(task, str) or task not in task_index:
         raise ValueError(f"invalid task_name in {result_file}")
-    graded_at_time_cap = _graded_at_time_cap(data, result_file)
-    reward = _reward(data, result_file)
+    graded_at_time_cap = _graded_at_time_cap(
+        data,
+        result_file,
+        allow_non_timeout_exception=exclude_dead_tasks,
+    )
+    exception = data.get("exception_info")
+    dead_exception_type = (
+        _exception_name(exception)
+        if exception is not None and not graded_at_time_cap
+        else None
+    )
+    reward = None if dead_exception_type is not None else _reward(data, result_file)
     checksum = data.get("task_checksum")
     if not isinstance(checksum, str) or not checksum:
         raise ValueError(f"missing task_checksum in {result_file}")
@@ -573,8 +726,9 @@ def _load_trial(
         "trial_id": trial_id,
         "task": task,
         "reward": reward,
-        "solved": reward >= solve_threshold,
+        "solved": reward >= solve_threshold if reward is not None else None,
         "graded_at_time_cap": graded_at_time_cap,
+        "dead_exception_type": dead_exception_type,
         "task_checksum": checksum,
         "model": model,
         "provider": provider,
@@ -1278,12 +1432,24 @@ def _reward(data: dict[str, Any], result_file: Path) -> float:
     return _unit_interval(raw, f"reward in {result_file}")
 
 
-def _graded_at_time_cap(data: dict[str, Any], result_file: Path) -> bool:
+def _graded_at_time_cap(
+    data: dict[str, Any],
+    result_file: Path,
+    *,
+    allow_non_timeout_exception: bool = False,
+) -> bool:
     exception = data.get("exception_info")
     if exception is None:
         return False
     exception_type = _exception_name(exception)
     if exception_type != "AgentTimeoutError":
+        if (
+            allow_non_timeout_exception
+            and isinstance(exception, dict)
+            and isinstance(exception.get("exception_type"), str)
+            and exception["exception_type"]
+        ):
+            return False
         raise ValueError(
             f"trial raised {exception_type} instead of reaching the accepted "
             f"agent time cap in {result_file}"
@@ -1637,8 +1803,12 @@ def _validate_matrix(
 
 
 def _aggregate_arm(
-    trials: Sequence[dict[str, Any]], *, solve_threshold: float
+    trials: Sequence[dict[str, Any]],
+    *,
+    solve_threshold: float,
+    billed_trials: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    billed = trials if billed_trials is None else billed_trials
     task_trials: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trial in trials:
         task_trials[trial["task"]].append(trial)
@@ -1659,13 +1829,17 @@ def _aggregate_arm(
             }
         )
     task_curve.sort(key=lambda item: (item["expert_time_estimate_min"], item["task"]))
-    input_tokens = sum(trial["input_tokens"] for trial in trials)
-    cache_tokens = sum(trial["cache_tokens"] for trial in trials)
-    output_tokens = sum(trial["output_tokens"] for trial in trials)
+    input_tokens = sum(trial["input_tokens"] for trial in billed)
+    cache_tokens = sum(trial["cache_tokens"] for trial in billed)
+    output_tokens = sum(trial["output_tokens"] for trial in billed)
     total_tokens = input_tokens + output_tokens
-    cost = sum(trial["cost_usd"] for trial in trials)
+    cost = sum(trial["cost_usd"] for trial in billed)
+    analyzed_total_tokens = sum(
+        trial["input_tokens"] + trial["output_tokens"] for trial in trials
+    )
+    analyzed_cost = sum(trial["cost_usd"] for trial in trials)
     reconstructed_trials = [
-        trial for trial in trials if trial["usage_source"] == "trajectory"
+        trial for trial in billed if trial["usage_source"] == "trajectory"
     ]
     reconstructed_usage = {
         "input_tokens": sum(trial["input_tokens"] for trial in reconstructed_trials),
@@ -1674,12 +1848,14 @@ def _aggregate_arm(
         "cost_usd": sum(trial["cost_usd"] for trial in reconstructed_trials),
     }
     durations = [
-        trial["duration_sec"] for trial in trials if trial["duration_sec"] is not None
+        trial["duration_sec"] for trial in billed if trial["duration_sec"] is not None
     ]
     return {
-        "trial_count": len(trials),
+        "trial_count": len(billed),
+        "billed_trial_count": len(billed),
+        "analyzed_trial_count": len(trials),
         "graded_at_time_cap_count": sum(
-            trial["graded_at_time_cap"] for trial in trials
+            trial["graded_at_time_cap"] for trial in billed
         ),
         "task_count": len(task_trials),
         "mean_reward": _mean([trial["reward"] for trial in trials]),
@@ -1688,10 +1864,13 @@ def _aggregate_arm(
         "cache_tokens": cache_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
-        "mean_total_tokens_per_trial": total_tokens / len(trials),
+        "usage_totals_population": "all_billed_trials",
+        "mean_total_tokens_per_billed_trial": total_tokens / len(billed),
+        "mean_total_tokens_per_analyzed_trial": analyzed_total_tokens / len(trials),
         "cache_hit_rate": cache_tokens / input_tokens if input_tokens else None,
         "cost_usd": cost,
-        "mean_cost_usd_per_trial": cost / len(trials),
+        "mean_cost_usd_per_billed_trial": cost / len(billed),
+        "mean_cost_usd_per_analyzed_trial": analyzed_cost / len(trials),
         "trajectory_reconstructed_usage": reconstructed_usage,
         "mean_duration_sec": _mean(durations) if durations else None,
         "duration_observation_count": len(durations),
@@ -1700,12 +1879,19 @@ def _aggregate_arm(
             [item["failure_rate"] for item in task_curve],
         ),
         "task_curve": task_curve,
-        "trials": list(trials),
+        "trials": [
+            {key: value for key, value in trial.items() if key != "dead_exception_type"}
+            for trial in billed
+        ],
     }
 
 
 def _compare_to_stock(
-    stock: dict[str, Any], arm: dict[str, Any], *, comparable: bool
+    stock: dict[str, Any],
+    arm: dict[str, Any],
+    *,
+    comparable: bool,
+    aggregate_delta_status: str,
 ) -> dict[str, Any]:
     stock_tasks = {item["task"]: item for item in stock["task_curve"]}
     arm_tasks = {item["task"]: item for item in arm["task_curve"]}
@@ -1720,6 +1906,18 @@ def _compare_to_stock(
         }
         for task in shared
     ]
+    total_tokens_delta = (
+        arm["mean_total_tokens_per_analyzed_trial"]
+        - stock["mean_total_tokens_per_analyzed_trial"]
+        if comparable
+        else None
+    )
+    cost_delta = (
+        arm["mean_cost_usd_per_analyzed_trial"]
+        - stock["mean_cost_usd_per_analyzed_trial"]
+        if comparable
+        else None
+    )
     return {
         "shared_task_count": len(shared),
         "mean_task_reward_delta": _mean_or_none(
@@ -1729,21 +1927,12 @@ def _compare_to_stock(
             [item["failure_rate_delta"] for item in task_deltas]
         ),
         "aggregate_workload_comparable": comparable,
-        "aggregate_delta_status": (
-            "complete_task_attempt_matrix"
-            if comparable
-            else "unavailable_for_incomplete_task_attempt_matrix"
-        ),
-        "mean_total_tokens_per_trial_delta": (
-            arm["mean_total_tokens_per_trial"] - stock["mean_total_tokens_per_trial"]
-            if comparable
-            else None
-        ),
-        "mean_cost_usd_per_trial_delta": (
-            arm["mean_cost_usd_per_trial"] - stock["mean_cost_usd_per_trial"]
-            if comparable
-            else None
-        ),
+        "aggregate_delta_status": aggregate_delta_status,
+        "workload_population": "reward_analysis_trials",
+        "mean_total_tokens_per_trial_delta": total_tokens_delta,
+        "mean_cost_usd_per_trial_delta": cost_delta,
+        "mean_total_tokens_per_surviving_trial_delta": total_tokens_delta,
+        "mean_cost_usd_per_surviving_trial_delta": cost_delta,
         "failure_slope_delta": (
             _optional_delta(
                 arm["failure_slope_per_task_length_doubling"],

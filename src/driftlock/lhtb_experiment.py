@@ -853,6 +853,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arm_directories=parse_arm_directories(args.arm_dirs),
                 solve_threshold=args.solve_threshold,
                 require_complete_matrix=not args.allow_incomplete_matrix,
+                exclude_dead_tasks=args.exclude_dead_tasks,
             )
             serialized = json.dumps(report, indent=2) + "\n"
             output = args.output.expanduser().resolve()
@@ -924,6 +925,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--solve-threshold", type=float, default=0.95)
     analyze.add_argument("--allow-incomplete-matrix", action="store_true")
+    analyze.add_argument(
+        "--exclude-dead-tasks",
+        action="store_true",
+        help=(
+            "exclude every arm's result for a task with a non-timeout dead trial; "
+            "refuse concentrated deaths or fewer than three surviving tasks"
+        ),
+    )
     analyze.add_argument("--output", type=Path, default=Path("analysis.json"))
     return parser
 

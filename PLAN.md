@@ -295,6 +295,59 @@ detecting mixed builds than the one now in place; what was given up is the
 requirement that the reader be the writer, which protected nothing the
 agreement check does not.
 
+### 3.2.1c A dead trial costs its task, unless the deaths point at an arm
+
+The original analyzer admitted a graded `AgentTimeoutError` but rejected a whole
+round for every other trial exception. That turns independent provider weather
+into a round-level failure. The archive has 99 trials total; removing the entire
+32-trial round lost to one continuous outage leaves 67 trials, of which 2 died
+from provider 429/5xx responses. At that 3% per-trial rate, a 32-trial round has
+only a 37.9% chance of no external death, so the old rule discarded a paid round
+62.1% of the time in expectation.
+
+Analysis can now explicitly opt into `--exclude-dead-tasks`. A non-timeout dead
+trial removes its task from every arm before the ordinary matrix validator and
+paired comparison run again. The report records the task, arm and exception,
+plus the number of common tasks left. Reward deltas use those surviving tasks.
+Cross-arm per-trial workload and cost deltas use the same survivor population,
+so compute matching remains measurable after an exclusion. Arm totals still
+cover every billed trial and reconcile with Harbor's job summary. The report
+makes the populations explicit: arm means are named either `per_billed_trial` or
+`per_analyzed_trial`, while paired workload deltas declare
+`workload_population=reward_analysis_trials`. A dead trial that stopped early
+can therefore lower the billed mean without masquerading as efficiency on the
+reward population. `AgentTimeoutError` is unchanged: it remains a kept, graded
+result. The report also retains the pre-exclusion matrix state, so removing the
+task that exposed an attempt imbalance cannot upgrade an incomplete matrix to
+complete or restore its aggregate deltas.
+
+This is not an exception-type blame classifier. Both earlier
+`RemoteCheckpointError` episodes were our defects, despite the name also being
+compatible with real infrastructure failure. The observable safeguard is the
+distribution. After excluding the outage, the measured external rate is 2/67.
+In an eight-task arm the binomial probability of two or more such deaths is
+2.2%; across four arms, the probability that any arm reaches that threshold is
+`1 - (1 - 0.02213)^4 = 8.6%`. That round-level false-refusal cost is accepted in
+exchange for refusing the known differential-failure signature. One death in an
+arm is admissible, while two is treated as concentration and refuses the round.
+This rejects both observed defect shapes: round 1 (`stock=0, retry=3,
+heuristic=0, driftlock=5`) and round 4 (`stock=0, retry=0, heuristic=2,
+driftlock=1`). One death in each of four arms is spread and remains admissible.
+
+The exclusion is only recoverable when the dead trial has auditable usage. The
+realistic isolated provider `APIError` in round 4 has both an agent result and a
+trajectory, and trajectory-reconstructed usage is reconciled in the same way as
+a graded timeout. Of the archive's 39 dead trials, all 24 with neither source
+came from the concentrated round-2 outage and are refused anyway. A trial that
+dies before its first recorded step has no per-trial evidence to reconcile and
+is not rescuable by this flag.
+
+Exclusion also refuses to manufacture a result from scraps. With one attempt per
+task and no error bars, two surviving tasks would make the length slope a line
+fixed by exactly two observations. At least three common tasks must remain.
+The mode is off by default so a caller must make both the exclusion and its cost
+explicit.
+
 ### 3.2.2 Why the arms now run concurrently
 
 Round 1 and round 2 ran the four arms one after another, so `stock` executed
