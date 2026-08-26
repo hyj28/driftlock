@@ -1,6 +1,6 @@
 # driftlock — Project Plan
 
-> A self-evolving long-horizon coding agent whose learning signal is its own rollbacks.
+> A self-evolving long-horizon coding agent that learns from its own scored checkpoints.
 > This is the working plan and gets updated as the project moves. For the
 > public-facing introduction, see `README.md`.
 
@@ -10,8 +10,11 @@
 
 The project started as a checkpoint-and-rollback middleware wrapped around Harbor's
 stock Terminus-2 agent. As of 2026-08-20 the scope changed: **driftlock is now the
-agent itself**, and rollback events became the supervision signal for skill
-distillation. The rewrite keeps roughly three quarters of the existing code.
+agent itself**. Rollback events were to be the supervision signal for skill
+distillation; as of 2026-08-26 they are not, because they almost never occur — see
+§2.3a. The supervision signal is now the scored timeline the same checkpoints make
+possible, and the rollback layer is a completed, measured component rather than the
+project's central claim.
 
 - **Built and unit-tested (survives the rewrite, ~7,700 lines).** Provider-neutral
   async runner; atomic workspace + agent-state checkpoints with integrity
@@ -39,15 +42,21 @@ distillation. The rewrite keeps roughly three quarters of the existing code.
 
 ## 1. The claims, in two sentences
 
-**Drift.** Same model, same compute budget — add checkpointing and progress-aware
-rollback and long-horizon terminal task success goes from X% to Y%, with a clear
-account of where the ceiling is.
+**Drift — measured, and the answer is small.** Same model, same compute budget, plus
+checkpointing and progress-aware rollback. Round five gives `stock` 0.261 and
+`driftlock` 0.481 mean reward over seven tasks, but the treatment never fired: the
+fine judge escalated nine times and vetoed all nine, so that arm performed zero
+rollbacks and the gap is one task's worth of n=1 variance. The ceiling itself was
+then measured directly (§2.3a): on six tasks, exactly one had an earlier state
+better than its final one, worth 9 points. The honest claim is a bounded negative
+result, not an improvement.
 
-**Transfer.** Skills distilled from *rollback events* — a checkpoint-localized failure
-region plus the judge's verdict on it — beat skills distilled from *whole failed
-trajectories* by Z points on held-out tasks, closing W% of the gap between automatic
-methods and human-curated skills that EvoAgentBench reports as the field's standing
-deficit.
+**Transfer.** Skills distilled from a *checkpoint-localized* failure region beat skills
+distilled from *whole failed trajectories* by Z points on held-out tasks, closing W% of
+the gap between automatic methods and human-curated skills that EvoAgentBench reports as
+the field's standing deficit. The localizer was originally the rollback event and its
+judge verdict; it is now the scored timeline (§2.3a), because that signal exists at every
+checkpoint while rollback events turned out not to.
 
 (X / Y / Z / W are placeholders. They stay unfilled until measured. This rule is not
 decoration: an unfilled placeholder in a public repo is a stronger signal than a
@@ -105,13 +114,85 @@ recent results:
 
 So the field knows failure trajectories are the necessary ingredient, but feeds the
 model the *whole* trajectory and lets it guess where things went wrong. **driftlock
-already localizes the failure**: the checkpoint delta bounds it to the region between
-checkpoint *k* and *k+n*, with a diff and a judge verdict attached. Nobody else has
-that, because nobody else built the rollback infrastructure first.
+localizes the failure**: the checkpoint delta bounds it to the region between
+checkpoint *k* and *k+n*, with a diff attached. Nobody else has that, because nobody
+else built the rollback infrastructure first.
 
-That is the contribution: **rollback-grounded skill distillation.** It is not "another
-skill synthesis method"; it is a claim about the *supervision signal*, and it is
-testable against the exact baseline the field already uses.
+That is the contribution: **checkpoint-localized skill distillation.** It is not
+"another skill synthesis method"; it is a claim about the *supervision signal*, and it
+is testable against the exact baseline the field already uses.
+
+The original form of that claim keyed the region on a rollback event and its judge
+verdict. Round five retired that version: the `driftlock` arm performed zero rollbacks
+in eight trials and `driftlock-heuristic` four, so the signal is nearly empty in
+practice. What replaces it is stronger, and §2.3a is the measurement that produced it.
+
+### 2.3a What round five measured, and what replaced the rollback signal
+
+Rollback can only help if the agent passes through a workspace state better than the one
+it ends in. That premise had never been tested, and everything above depended on it, so
+it was tested directly.
+
+The checkpoint scorer (`driftlock-lhtb score-checkpoints`) restores each retained
+checkpoint into a fresh task environment and lets the task's own hidden verifier score
+it. It calls no model, so the whole measurement is free. Forty-four replays across six
+tasks, from round five's `driftlock` arm:
+
+| task | best checkpoint | final | difference |
+| --- | --- | --- | --- |
+| `2048` | 0.000 | 0.712 | −0.712 |
+| `alp-paper-reproduction` | 0.300 | 0.300 | 0.000 |
+| `epidemic-inverse-control-audit` | 0.027 | 0.027 | 0.000 |
+| `spice-ephemeris-regression` | **0.848** (step 10) | 0.758 | **+0.091** |
+| `sudoku-recovery` | 0.000 | 0.286 | −0.286 |
+| `riscv-core-debug` | 0.880 | trial died | — |
+
+One task in six had a better earlier state, worth nine points.
+
+`riscv-core-debug` is the clearest curve, thirteen checkpoints over eighty-four steps:
+
+```
+0.280 0.280 0.389 0.389 0.389 0.607 0.716 0.771 0.825 0.825 0.880 0.880 0.880
+```
+
+Monotonically non-decreasing. That agent never damaged its own work.
+
+**Three independent observations agree.** The fine judge escalated nine times in the
+`driftlock` arm and vetoed all nine, and its reasons are substantively right — one reads
+*"the workspace contains a partially repaired engine that is further ahead than the
+checkpoint"*, on the task that went on to score 0.980. `driftlock-heuristic`, which has
+no judge and rolled back four times, scored 0.380 — identical to `retry`, which never
+rolls back. And `stock`, which never checkpoints, never once hit the archive failure that
+killed the checkpoint-carrying arms on `riscv-core-debug` in three consecutive rounds.
+
+The failure mode of these agents is running out of capability, not losing the plot. They
+climb slowly and exhaust the ninety-minute cap; they do not walk into a dead end.
+
+**Boundaries, stated rather than buried.** The replays cover phase 0 only — everything
+before the first verifier rejection — because that is what round five retained. `2048`
+and `sudoku-recovery` score a replayed move log or a final state, so an intermediate
+snapshot scores zero by construction and cannot be compared against a final; they are not
+evidence in either direction. That leaves four informative tasks, of which one shows
+headroom. Each checkpoint was scored once. This is a result about this model, these
+tasks, and this scale. It is not a claim that rollback does not work.
+
+**What this is.** The rollback layer was specified, built, instrumented and measured, and
+the measurement returned a small effect with a well-understood reason. That is a
+completed component with a negative result, and saying so plainly is the deliverable. The
+failure available here was to claim an effect the data does not support, or to drop the
+section and hope nobody asked.
+
+**What replaces the signal.** Two of the three ingredients in §2.3 survive: checkpoints
+and diffs are still produced every few steps. The judge verdict as a *trigger* does not.
+The scorer supplies a better one. Scoring every checkpoint turns a trajectory into a
+timeline, and a flat or declining segment is a stretch of steps that produced nothing
+measurable — localization from the benchmark's own scoring, with no dependence on a judge
+being right, available at every checkpoint rather than only where a judge happened to
+fire.
+
+The contribution claim survives and arguably strengthens. Scoring an intermediate state
+requires having saved it, and nobody else saved it, because nobody else built the
+rollback infrastructure first. What changed is which signal reads the checkpoints.
 
 ### 2.4 Rollback is the missing fifth context-engineering lever
 
@@ -123,6 +204,13 @@ tool; a 100-turn eval cut token consumption by **84%**.
 
 Every one of those four levers assumes the agent keeps moving forward. **None of them
 is undo.** Rollback is the fifth lever, and it is the one this project owns.
+
+The framing is unchanged by §2.3a; its expected value is. Undo is genuinely absent from
+the vocabulary, and building it is what made the rest of this project possible. But on
+this benchmark at this model scale the agents rarely produce anything to undo, so the
+lever is real and its measured payoff is small. Both halves of that belong in the write-up
+together — the second without the first is a dropped claim, the first without the second
+is a claim the data does not support.
 
 ### 2.5 The three recognized long-horizon failure modes
 
@@ -441,6 +529,11 @@ not a convenience: if the two arms used different formats, the comparison would 
 confounded by format rather than by grounding. The arms differ in exactly one thing —
 the evidence handed to the distiller.
 
+That evidence is now the scored timeline (§2.3a): the localized arm sees the checkpoint
+segment where the verifier score stopped improving, with its diff; the baseline arm sees
+the whole trajectory, as the field does. Rollback events were the original localizer and
+are not used, because §2.3a found them nearly absent.
+
 Structured markdown following the [ProcMEM](https://arxiv.org/pdf/2606.23127) /
 [Memento-Skills](https://arxiv.org/pdf/2603.18743) convention:
 
@@ -451,8 +544,8 @@ Structured markdown following the [ProcMEM](https://arxiv.org/pdf/2606.23127) /
 Content is **preventative** ("when X appears, do not do Y; do Z instead").
 [ReasoningBank](https://research.google/blog/reasoningbank-enabling-agents-to-learn-from-experience/)
 observed that curated checklists spontaneously evolve toward compositional,
-preventative logic; rollback events produce that form natively, so we start where they
-ended up.
+preventative logic. A flat scored segment produces that form natively — it names a
+stretch of work that provably bought nothing — so we start where they ended up.
 
 Retrieval uses a local sentence-transformers model on the cloud box: **zero API cost**,
 outside the token budget.
@@ -469,7 +562,9 @@ requires splitting the training side three ways (see §4.3).
 
 The field's own pass rate, **14.2%**, becomes a second independent piece of evidence:
 if checkpoint localization genuinely makes distillation sharper, our candidate pass
-rate should sit visibly above it.
+rate should sit visibly above it. That is now the project's central bet: §2.3a settled
+what rollback is worth, and nothing yet shows a scored segment distils better than a
+whole trajectory.
 
 ### 3.5 The two questions this has to survive
 
@@ -481,8 +576,8 @@ precise rollback to the last healthy point, not a blind restart. Which means the
 judge's quality is the project's quality, and which is why the compute-matched control
 arm is non-negotiable.
 
-> *"How is rollback-grounded distillation different from just showing the model the
-> failed trajectory?"*
+> *"How is checkpoint-localized distillation different from just showing the model
+> the failed trajectory?"*
 
 **Localization.** The whole-trajectory arm exists precisely to answer this, and if it
 wins, that gets published as the result.
@@ -542,7 +637,7 @@ GEPA / Anchor Skill numbers are directly citable as reference points.
 
 | Split | Tasks | Use |
 | --- | --- | --- |
-| Train | 20 | Run, collect rollback events, distill candidate skills |
+| Train | 20 | Run, score every checkpoint, distill candidate skills from flat segments |
 | Validation | 10 | Measure each candidate; only measured improvements enter the library |
 | Held-out test | 20 | Final four-arm comparison; never seen during evolution |
 
@@ -650,8 +745,9 @@ Ten weeks from 2026-08-20, targeting a complete release at the end of October.
 | --- | --- | --- |
 | **Week 1** | Cloud box; end-to-end smoke on 2 stock LHTB tasks; screen ~20 tasks and pick the 8-task subset by **measured partial credit**. This validates the surviving code against reality for the first time. | V4-Pro scores near zero on everything → floor effect; switch to a stronger model or easier tasks |
 | **Weeks 2–3** | Write the agent: tool-calling loop, context compression, read-only subagent layer. Wire it into Harbor as a plugin. Delete the ~2,750 lines of Terminus-2 coupling. | Our agent scores far below stock Terminus-2 on the screened subset → fix the loop before anything else |
-| **Week 4** | Skill layer: ProcMEM schema, both distillation prompts, embedding retrieval + activation router, validation-set admission | — |
-| **Week 5** | LHTB four-arm round | driftlock doesn't beat compute-matched retry → fix the judge immediately, don't keep running |
+| **Weeks 2–3, actual** | Five four-arm rounds, each killed by a different silent accounting defect; each fixed with a test built from the shape the boundary actually emits (§3.2.1d). Round five is the first that the analyzer reads end to end. Rollback measured and closed (§2.3a); checkpoint scoring built as its replacement signal. | — |
+| **Week 4** | Skill layer: ProcMEM schema, both distillation prompts, embedding retrieval + activation router, validation-set admission. Localizer is the scored timeline, not the rollback event. | — |
+| **Week 5** | ~~LHTB four-arm round~~ **done, five times.** Instead: score every checkpoint on the training split and confirm flat segments are identifiable before distilling from them | No identifiable flat segments → the localizer has nothing to point at; say so and fall back to the whole-trajectory baseline for both arms |
 | **Week 6** | SWE-bench Verified environment; commit the 20/10/20 split | — |
 | **Weeks 7–8** | Evolution rounds: 2 distillation arms × 3 rounds | Candidate pass rate not visibly above 14.2% → localization isn't helping; report that honestly rather than tuning until it does |
 | **Week 9** | Held-out four-arm eval; hand-author the curated-skill arm; ablations (heuristics-only / LLM-only / two-tier) | — |
@@ -681,15 +777,19 @@ the results section stays empty, per §1.
 | 11 | **OpenRouter provider drift** — one model slug is served by numerically different provider builds | Arm comparison void | Mitigated: strict no-fallback routing on every paid call; provider recorded in lock/trials, checked within each arm and across arms; judge rates keyed to its pin. **Resilience is bought back inside the step, not by relaxing the pin.** The pinned provider is served from a *shared* upstream pool: on 2026-08-23 it returned `tpm_rate_limit_exceeded` continuously for at least 11 minutes and took 28 of that round's 32 trials with it, including three whole arms that never ran a single step. A 429 is refused before the model runs, so it generates and bills nothing — which is what lets a step retry the *same* provider without weakening the one-billable-call-per-step rule. Refused attempts are counted, excluded from that rule, and reported per phase as `rate_limited_calls`, so a run that only survived by hammering a saturated provider does not look clean. `max_retries` stays 0 at the Harbor level and the analyzer keeps rejecting trial-level retries, which would re-spend tokens the final `result.json` never records |
 | 12 | **The corroborating gate is fitted on 3 tasks** — `no_file_change` was demoted on one diagnostic run: 109 solo firings, 109 rejected, 2 rollbacks total (§3.2). The tasks were chosen for their spread on the week-1 screen, not sampled, and a task where the agent genuinely stalls *without* looping would now be missed | Missed intervention; a knob fitted on the data it is judged by | The miss is in the safe direction — a gated detector makes the driftlock arm behave more like the no-intervention arm, which can only understate the effect. Suppressed triggers keep being recorded, so the held-out week-9 run re-measures the gate on tasks it was not fitted on: if solo `no_file_change` ever precedes a genuine stall there, the demotion is wrong and the record shows it |
 | 13 | **Output-ceiling truncation** — the checkpoint boundary constraint roughly doubles median response length, so the driftlock arms hit the 8,192-token ceiling on 5–6% of calls where stock never does (§3.2.1) | Wasted steps; a confound in `stock` vs `driftlock` | A truncated batch is no longer fatal (patch v11) — it returns to the model as feedback and costs one step. The confound is structural, not fixable: `retry` is the arm that isolates rollback from the constraint |
+| 14 | **The scored timeline may not distil better than a whole trajectory** — §2.3a retired the rollback signal and replaced it with checkpoint scoring, and that substitution is now the project's central bet. It is argued, not measured: a flat segment provably bought nothing, but nothing yet shows a distiller does more with that than with the full trajectory the field already feeds it | The transfer claim fails and the project has no positive result | The two distillation arms differ in exactly this and nothing else (§3.3), so the comparison isolates it. Scoring checkpoints is free, so the signal can be produced for every training task rather than sampled. If it does not beat the baseline, that is the second honest negative result and the write-up carries both |
+| 15 | **Checkpoint scoring covers phase 0 only** — round five retained checkpoints only for the first phase, so every §2.3a number describes behaviour before the first verifier rejection. A distiller trained on phase-0 segments may miss the failures that matter later | Skills fitted to the easy half of a trial | Retention is a per-run flag; set it for the training split so later phases are covered too. The cost is disk, not tokens |
 
 ---
 
 ## 8. Deliverables
 
-1. **Open-source agent + library** — a terminal coding agent with checkpoint,
-   rollback, and rollback-grounded skill distillation, pip-installable, documented,
-   with a one-command reproduction script. The rollback layer stays usable
-   standalone around someone else's loop.
+1. **Open-source agent + library** — a terminal coding agent with checkpointing,
+   free checkpoint scoring, progress-aware rollback, and checkpoint-localized skill
+   distillation, pip-installable, documented, with a one-command reproduction script.
+   The rollback and scoring layers stay usable standalone around someone else's loop;
+   scoring in particular is useful to anyone who wants to know what an agent's work was
+   worth at each point rather than only at the end.
 2. **Technical blog post** — the drift curves, the transfer results, the candidate
    pass rate against 14.2%, failure-case analysis, and the design tradeoffs behind
    the judge.

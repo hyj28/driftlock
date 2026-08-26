@@ -1,12 +1,18 @@
 # driftlock
 
-**A self-evolving long-horizon coding agent whose learning signal is its own rollbacks.**
+**A self-evolving long-horizon coding agent that learns from its own scored checkpoints.**
 
-> 🚧 **Status: experimental. No benchmark results yet.** The checkpoint, rollback,
-> judge, and experiment-analysis layers are implemented and unit-tested. The agent
-> loop, subagent layer, and skill layer are not yet written; the Terminus-2 driver
-> documented below is being replaced by driftlock's own agent (see `PLAN.md` §3.1).
-> Credentialed amd64 screening has not run, so nothing here is a result claim.
+> 🚧 **Status: experimental.** The checkpoint, rollback, judge, checkpoint-scoring and
+> experiment-analysis layers are implemented and unit-tested, and five four-arm rounds
+> have run on LHTB. The skill layer is not yet written.
+>
+> **One result so far, and it is negative.** Rollback can only help if an agent passes
+> through a state better than the one it ends in. Replaying every retained checkpoint
+> through the benchmark's own verifier — 44 replays, six tasks, zero token cost — found
+> that on one task in six, worth 9 points. See `PLAN.md` §2.3a for the numbers and the
+> boundaries. The rollback layer is a completed, measured component; it is not a claimed
+> improvement. What it left behind — the ability to score any intermediate state — is
+> the supervision signal the skill layer now uses.
 
 ---
 
@@ -61,7 +67,7 @@ The judge is two-tier by design:
 The coarse tier keeps the cost near zero; the fine tier catches what rules can't
 express — *"the agent is now working on the wrong thing."*
 
-## Learning from rollbacks
+## Learning from scored checkpoints
 
 Recent work found that self-evolving agents improve through *validation-filtered
 search*, not accumulation: only **55 of 388** candidate skills produced a real
@@ -70,9 +76,16 @@ trajectory — success-only feedback never produced one. Separately, automatic e
 methods measurably trail human curation (+0.4 to +5.7 versus +7.5 to +10.5).
 
 The field feeds the model a *whole* failed trajectory and asks it to work out what
-went wrong. driftlock already knows: the checkpoint delta bounds the failure to the
-region between checkpoint *k* and *k+n*, with a diff and a judge verdict attached.
-That localized evidence is the supervision signal for skill distillation.
+went wrong. driftlock narrows it: because every checkpoint can be scored by the task's
+own verifier for free, a trajectory becomes a timeline, and a flat segment is a stretch
+of steps that provably bought nothing. The checkpoint delta bounds the failure to that
+region, with a diff attached, and that localized evidence is the supervision signal for
+skill distillation.
+
+The original design keyed this on rollback events and the judge's verdict. Measurement
+retired that version — the judged arm rolled back zero times in eight trials — so the
+localizer is now the score curve, which exists at every checkpoint and depends on the
+benchmark's scoring rather than on a judge being right.
 
 Skills use the ProcMEM `activation` / `execution` / `termination` schema and carry
 preventative content ("when X appears, do not do Y; do Z instead"). A candidate only
@@ -147,9 +160,9 @@ field measures at a 14.2% candidate pass rate.
 
 ## Planned deliverables
 
-1. This project — a terminal coding agent with checkpointing, progress-aware rollback,
-   and rollback-grounded skill distillation. The rollback layer stays usable
-   standalone around someone else's agent loop.
+1. This project — a terminal coding agent with checkpointing, free checkpoint scoring,
+   progress-aware rollback, and checkpoint-localized skill distillation. The rollback and
+   scoring layers stay usable standalone around someone else's agent loop.
 2. A technical writeup: the drift curves, the transfer results, the candidate pass
    rate against the 14.2% reference, failure-case analysis, and the judge design
    tradeoffs
