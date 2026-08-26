@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,7 +12,9 @@ from typing import Any
 from uuid import UUID
 
 from driftlock.checkpoints import SnapshotIntegrityError
+from driftlock.lhtb import openrouter_provider_from_call_kwargs
 from driftlock.models import Checkpoint
+from driftlock.usage import ReplayUsage, UsageAccountingError, load_trial_usage
 
 _HEX_32 = re.compile(r"[0-9a-f]{32}")
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
@@ -31,55 +32,6 @@ _OPTIONAL_MANIFEST_FIELDS = {"unstable_paths"}
 
 class OracleCheckpointError(SnapshotIntegrityError):
     """Raised when a retained checkpoint is unsafe or lacks audit provenance."""
-
-
-@dataclass(frozen=True, slots=True)
-class ReplayUsage:
-    """Conservative source-trial usage attached to every replay candidate."""
-
-    input_tokens: int
-    cache_tokens: int
-    output_tokens: int
-    cost_usd: float
-
-    def __post_init__(self) -> None:
-        for name in ("input_tokens", "cache_tokens", "output_tokens"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{name} must be a nonnegative integer")
-        if self.cache_tokens > self.input_tokens:
-            raise ValueError("cache_tokens cannot exceed input_tokens")
-        if (
-            isinstance(self.cost_usd, bool)
-            or not isinstance(self.cost_usd, (int, float))
-            or not math.isfinite(float(self.cost_usd))
-            or self.cost_usd < 0
-        ):
-            raise ValueError("cost_usd must be finite and nonnegative")
-
-    @classmethod
-    def from_mapping(cls, value: object) -> ReplayUsage:
-        if not isinstance(value, dict) or set(value) != {
-            "input_tokens",
-            "cache_tokens",
-            "output_tokens",
-            "cost_usd",
-        }:
-            raise ValueError("source usage has unexpected fields")
-        return cls(
-            input_tokens=value["input_tokens"],
-            cache_tokens=value["cache_tokens"],
-            output_tokens=value["output_tokens"],
-            cost_usd=value["cost_usd"],
-        )
-
-    def as_dict(self) -> dict[str, int | float]:
-        return {
-            "input_tokens": self.input_tokens,
-            "cache_tokens": self.cache_tokens,
-            "output_tokens": self.output_tokens,
-            "cost_usd": float(self.cost_usd),
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +53,7 @@ class SourceTrialProvenance:
     task_name: str
     model_name: str
     usage: ReplayUsage
+    usage_source: str
     result_path: Path
     result_sha256: str
     data: dict[str, Any]
@@ -150,11 +103,10 @@ def load_source_trial_provenance(
     if (
         not isinstance(kwargs, dict)
         or agent.get("import_path") != "driftlock.harbor_agent:LHTBDriftlockAgent"
-        or kwargs.get("driftlock_retain_checkpoints") is not True
         or not isinstance(model_name, str)
         or not model_name
     ):
-        raise OracleCheckpointError("source result is not a retained driftlock trial")
+        raise OracleCheckpointError("source result is not a driftlock trial")
     info = data.get("agent_info")
     model_info = info.get("model_info") if isinstance(info, dict) else None
     provider, separator, name = model_name.partition("/")
@@ -167,11 +119,20 @@ def load_source_trial_provenance(
         or model_info != {"provider": provider, "name": name}
     ):
         raise OracleCheckpointError("source agent identity is inconsistent")
+    try:
+        trial_usage = load_trial_usage(
+            data,
+            path,
+            provider=lambda: _source_agent_provider(agent, path),
+        )
+    except UsageAccountingError as error:
+        raise OracleCheckpointError(str(error)) from error
     return SourceTrialProvenance(
         trial_id=trial_id,
         task_name=task_name,
         model_name=model_name,
-        usage=_source_usage(data),
+        usage=trial_usage.usage,
+        usage_source=trial_usage.source,
         result_path=path,
         result_sha256=digest,
         data=data,
@@ -378,50 +339,16 @@ def _archive_hashes(path: Path) -> tuple[str, Any]:
     return plain.hexdigest(), combined
 
 
-def _source_usage(data: dict[str, Any]) -> ReplayUsage:
-    direct = data.get("agent_result")
-    if isinstance(direct, dict):
-        contexts = [direct]
-    else:
-        steps = data.get("step_results")
-        contexts = (
-            [
-                step["agent_result"]
-                for step in steps
-                if isinstance(step, dict) and isinstance(step.get("agent_result"), dict)
-            ]
-            if isinstance(steps, list)
-            else []
+def _source_agent_provider(agent: dict[str, Any], path: Path) -> str:
+    kwargs = agent.get("kwargs")
+    call_kwargs = kwargs.get("llm_call_kwargs") if isinstance(kwargs, dict) else None
+    if not isinstance(call_kwargs, dict):
+        raise UsageAccountingError(
+            f"source trajectory reconstruction lacks llm_call_kwargs: {path}"
         )
-    if not contexts:
-        raise OracleCheckpointError("source trial lacks usage accounting")
-    totals: dict[str, int | float] = {
-        "input_tokens": 0,
-        "cache_tokens": 0,
-        "output_tokens": 0,
-        "cost_usd": 0.0,
-    }
-    fields = {
-        "n_input_tokens": "input_tokens",
-        "n_cache_tokens": "cache_tokens",
-        "n_output_tokens": "output_tokens",
-        "cost_usd": "cost_usd",
-    }
-    for context in contexts:
-        for source_name, target_name in fields.items():
-            value = context.get(source_name)
-            if value is None:
-                raise OracleCheckpointError("source usage accounting is incomplete")
-            if target_name != "cost_usd" and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ):
-                raise OracleCheckpointError("source token usage is invalid")
-            if target_name == "cost_usd" and (
-                isinstance(value, bool) or not isinstance(value, (int, float))
-            ):
-                raise OracleCheckpointError("source cost usage is invalid")
-            totals[target_name] += value
     try:
-        return ReplayUsage.from_mapping(totals)
+        return openrouter_provider_from_call_kwargs(
+            call_kwargs, source=f"llm_call_kwargs in {path}"
+        )
     except ValueError as error:
-        raise OracleCheckpointError("source usage accounting is invalid") from error
+        raise UsageAccountingError(str(error)) from error

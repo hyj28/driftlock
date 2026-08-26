@@ -348,6 +348,46 @@ fixed by exactly two observations. At least three common tasks must remain.
 The mode is off by default so a caller must make both the exclusion and its cost
 explicit.
 
+### 3.2.1d Checks must observe the representation the boundary actually emits
+
+Round 5 exposed three accounting checks that reasoned correctly about inputs
+they did not actually receive. First, Harbor's Docker exec merges stderr into
+stdout, while the tar concurrent-write discriminator inspected stderr alone.
+Its parser therefore never saw a real warning: `riscv-core-debug` killed the
+checkpoint-carrying arms in rounds 1, 4 and 5 even though the formatted error
+message displayed the warning from stdout. Exec results now explicitly admit
+merged streams, and classification reads stderr when split or stdout when
+merged. The parser still fails closed on any non-warning line or empty path.
+
+Second, DeepInfra omitted per-step `cost_usd` on 46 of 2,699 round-5 agent
+steps, 44 of them in stock. The prompt and completion counts remain present, so
+these omissions are recovered only through rates audited under the exact
+`deepinfra/fp8` slug: $0.08/M input and cache-read tokens, $0.18/M output. A new
+slug without an audited entry refuses rather than inheriting those rates. Each
+arm reports both the number of imputed steps and the imputed dollars; absent
+token counts and present-but-invalid values remain fatal. Reconstructed timed-out
+usage remains outside the Harbor job-summary population and the existing
+reconciliation subtracts it exactly as before.
+
+Third, Terminus can summarize into a new trajectory segment while retaining all
+provider-call `episode-*` directories. Round 5 contained an otherwise safe real
+example with 11 agent steps for 46 episode directories; its direct agent result
+prevented reconstruction from the truncated file. Reconstruction now checks the
+independent directory count and refuses coverage below 90%. Complete round-5
+files clustered at 98--100%, so the guard tolerates an interrupted final record
+without accepting a segment that would under-report a run several-fold.
+
+The first complete offline read then exposed two more representation mistakes.
+The analyzer treated driftlock's runner status and Harbor's termination reason as
+one vocabulary. In reality `completed` is consistent with the runner's
+`confirmed_task_complete`, Terminus's `max_turns`, or the adapter's
+`driftlock_output_length_boundary`; runner limits retain their corresponding
+`driftlock_*` reasons. Those pairs are now an explicit allow-list, and failures
+name both values. Finally, Harbor materializes its retry exception sets as JSON
+lists whose order varied across all four round-5 locks. Lock comparison now sorts
+only the set-valued include/exclude fields: a different exception member remains
+a hard job-settings mismatch.
+
 ### 3.2.2 Why the arms now run concurrently
 
 Round 1 and round 2 ran the four arms one after another, so `stock` executed

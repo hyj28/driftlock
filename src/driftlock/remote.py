@@ -22,6 +22,8 @@ class RemoteCheckpointError(RuntimeError):
 
 
 class ExecResultLike(Protocol):
+    """Command result, including environments that merge stderr into stdout."""
+
     return_code: int
     stdout: str | None
     stderr: str | None
@@ -528,12 +530,15 @@ def _parse_file_changed_warnings(result: ExecResultLike) -> tuple[str, ...] | No
     display, the resulting message looked exactly like the case that is handled.
     That cost one trial in round 1 and two more in round 4.
     """
-    if result.return_code != 1 or not result.stderr:
+    if result.return_code != 1:
+        return None
+    diagnostic = _diagnostic_output(result)
+    if not diagnostic:
         return None
     prefix = "tar: "
     suffix = ": file changed as we read it"
     paths: list[str] = []
-    for raw_line in result.stderr.splitlines():
+    for raw_line in diagnostic.splitlines():
         line = raw_line.strip()
         if not line or line in _BENIGN_TAR_LINES:
             continue
@@ -547,9 +552,23 @@ def _parse_file_changed_warnings(result: ExecResultLike) -> tuple[str, ...] | No
     return tuple(paths) if paths else None
 
 
+def _diagnostic_output(result: ExecResultLike) -> str:
+    """Return the stream carrying diagnostics for split or merged subprocesses.
+
+    Harbor's Docker environment redirects stderr to stdout, so its result has
+    ``stderr=None`` even when tar emitted an error. Local and other remote
+    environments retain split streams. Prefer a non-empty stderr when present,
+    then fall back to stdout for the merged-stream contract.
+    """
+    for output in (result.stderr, result.stdout):
+        if output is not None and output.strip():
+            return output
+    return ""
+
+
 def _require_success(result: ExecResultLike, *, operation: str) -> None:
     if result.return_code != 0:
-        detail = (result.stderr or result.stdout or "no output").strip()
+        detail = _diagnostic_output(result).strip() or "no output"
         raise RemoteCheckpointError(
             f"{operation} failed with exit code {result.return_code}: {detail}"
         )

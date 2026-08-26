@@ -21,6 +21,8 @@ from driftlock.lhtb import (
     LHTB_REPOSITORY_REVISION,
     lhtb_runtime_fingerprint,
     openrouter_provider_from_call_kwargs,
+    recorded_lhtb_fingerprint,
+    require_one_lhtb_fingerprint,
     task_directory_sha256,
 )
 from driftlock.models import (
@@ -30,10 +32,14 @@ from driftlock.models import (
 )
 from driftlock.oracle import (
     OracleCheckpointError,
-    ReplayUsage,
     load_remote_checkpoint_bundle,
     load_source_trial_provenance,
     validate_checkpoint_source_audit,
+)
+from driftlock.usage import (
+    ReplayUsage,
+    load_trial_usage,
+    reconstruct_trajectory_usage,
 )
 
 ANALYSIS_ARMS = (
@@ -68,8 +74,24 @@ _DRIFTLOCK_DETECTOR_FIELDS = (
     "driftlock_corroborating_signals",
 )
 
+# The runner status and Harbor/Terminus termination reason describe different
+# layers. Most runner limits write a single namespaced reason. A completed phase
+# can also retain Terminus's own stop reason (or driftlock's output-boundary
+# reason) in the final Harbor context. Keep the cross-check as an explicit pair
+# allow-list so new vocabulary cannot silently enter an analysis.
+_DRIFTLOCK_STATUS_TERMINATIONS = {
+    RunStatus.COMPLETED.value: frozenset(
+        {
+            "confirmed_task_complete",
+            "max_turns",
+            "driftlock_output_length_boundary",
+        }
+    ),
+    RunStatus.STEP_LIMIT.value: frozenset({"driftlock_step_limit"}),
+    RunStatus.TOKEN_LIMIT.value: frozenset({"driftlock_token_limit"}),
+    RunStatus.ROLLBACK_LIMIT.value: frozenset({"driftlock_rollback_limit"}),
+}
 
-_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # The archive contains 99 trials; removing the single 32-trial provider outage
 # leaves 2 external deaths in 67 trials.  At that rate, an eight-trial arm has a
@@ -96,20 +118,11 @@ def _recorded_fingerprint(environment: Any, context: str) -> str:
     for the run it affected, and blocked analysis on any other machine, without
     protecting anything the global check does not already cover.
     """
-    value = environment.get("DRIFTLOCK_EXPERIMENT_FINGERPRINT") if environment else None
-    if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
-        raise ValueError(f"missing or malformed build fingerprint in {context}")
-    return value
+    return recorded_lhtb_fingerprint(environment, context)
 
 
 def _require_one_build(fingerprints: set[str], *, context: str) -> str:
-    if len(fingerprints) != 1:
-        raise ValueError(
-            f"{context} mix driftlock builds: "
-            + ", ".join(sorted(fingerprints))
-            + " -- trials produced by different code are not comparable"
-        )
-    return next(iter(fingerprints))
+    return require_one_lhtb_fingerprint(fingerprints, context=context)
 
 
 def goal_drift_actions(
@@ -562,7 +575,7 @@ def _load_job_lock(
         "schema_version": 1,
         "harbor": harbor,
         "n_concurrent_trials": concurrency,
-        "retry": retry,
+        "retry": _canonical_retry_settings(retry, source=lock_file),
         "driftlock_experiment_fingerprint": fingerprint,
     }
     signature = hashlib.sha256(
@@ -581,6 +594,23 @@ def _load_job_lock(
         "agent_provider": (next(iter(agent_providers)) if agent_providers else None),
         "judge_provider": (next(iter(judge_providers)) if judge_providers else None),
     }
+
+
+def _canonical_retry_settings(retry: dict[str, Any], *, source: Path) -> dict[str, Any]:
+    """Canonicalize Harbor's set-valued retry fields for lock comparison."""
+    canonical = dict(retry)
+    for name in ("include_exceptions", "exclude_exceptions"):
+        if name not in canonical:
+            continue
+        values = canonical[name]
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(f"invalid retry {name} in {source}")
+        if len(set(values)) != len(values):
+            raise ValueError(f"duplicate retry {name} in {source}")
+        canonical[name] = sorted(values)
+    return canonical
 
 
 def _validate_job_usage(
@@ -708,7 +738,7 @@ def _load_trial(
         expected_judge_provider=expected_judge_provider,
     )
     provider, judge_provider = _trial_providers(data, arm, result_file)
-    usage, usage_source = _usage(data, result_file)
+    usage, usage_source = _usage(data, result_file, provider=provider)
     driftlock_run_statuses, judge_reliability = _driftlock_run_metadata(
         data, arm, result_file
     )
@@ -747,7 +777,18 @@ def _load_trial(
         "output_tokens": usage["output_tokens"],
         "total_tokens": usage["input_tokens"] + usage["output_tokens"],
         "cost_usd": usage["cost_usd"],
+        "imputed_cost_steps": usage["imputed_cost_steps"],
+        "imputed_cost_usd": usage["imputed_cost_usd"],
         "usage_source": usage_source,
+        **(
+            {
+                "source_usage_source": data["config"]["agent"]["kwargs"][
+                    "driftlock_source_usage_source"
+                ]
+            }
+            if arm == "oracle"
+            else {}
+        ),
         "driftlock_run_statuses": driftlock_run_statuses,
         "judge_reliability": judge_reliability,
         "duration_sec": duration,
@@ -775,14 +816,6 @@ def _driftlock_run_metadata(
     else:
         contexts = []
 
-    # This is intentionally an allow-list. A newly added RunStatus must be
-    # classified here before analysis can treat it as a valid measurement.
-    measurable = {
-        RunStatus.COMPLETED.value,
-        RunStatus.STEP_LIMIT.value,
-        RunStatus.TOKEN_LIMIT.value,
-        RunStatus.ROLLBACK_LIMIT.value,
-    }
     statuses: list[str] = []
     reliabilities: list[str] = []
     for context in contexts:
@@ -795,18 +828,17 @@ def _driftlock_run_metadata(
         ):
             raise ValueError(f"invalid driftlock run status in {result_file}")
         status = driftlock["status"]
-        if status not in measurable:
+        termination_reason = metadata.get("termination_reason")
+        allowed_terminations = _DRIFTLOCK_STATUS_TERMINATIONS.get(status)
+        if allowed_terminations is None:
             raise ValueError(
-                f"non-measurable driftlock run status {status!r} in {result_file}"
+                f"non-measurable driftlock run status {status!r} with termination "
+                f"reason {termination_reason!r} in {result_file}"
             )
-        expected_termination = (
-            "confirmed_task_complete"
-            if status == RunStatus.COMPLETED.value
-            else f"driftlock_{status}"
-        )
-        if metadata.get("termination_reason") != expected_termination:
+        if termination_reason not in allowed_terminations:
             raise ValueError(
-                f"driftlock termination reason disagrees with status in {result_file}"
+                f"driftlock status {status!r} is inconsistent with termination "
+                f"reason {termination_reason!r} in {result_file}"
             )
         statuses.append(status)
         reliability = driftlock.get("judge_reliability")
@@ -1232,6 +1264,8 @@ def _validate_oracle_identity(
         "driftlock_source_audit",
         "driftlock_source_audit_sha256",
         "driftlock_source_usage",
+        "driftlock_source_usage_source",
+        "driftlock_checkpoint_coverage",
     }
     info = data.get("agent_info")
     if (
@@ -1288,6 +1322,7 @@ def _validate_oracle_identity(
         or source.model_name != agent.get("model_name")
         or source.model_name != model
         or source.usage != usage
+        or source.usage_source != kwargs["driftlock_source_usage_source"]
     ):
         raise ValueError(f"oracle replay differs from source trial: {result_file}")
     direct = data.get("agent_result")
@@ -1472,127 +1507,16 @@ def _model_identity(data: dict[str, Any], result_file: Path) -> str:
 
 
 def _usage(
-    data: dict[str, Any], result_file: Path
+    data: dict[str, Any], result_file: Path, *, provider: str
 ) -> tuple[dict[str, int | float], str]:
-    direct = data.get("agent_result")
-    step_results = data.get("step_results")
-    if isinstance(direct, dict) and isinstance(step_results, list) and step_results:
-        raise ValueError(
-            f"result has both direct and step agent contexts: {result_file}"
-        )
-    if isinstance(direct, dict):
-        contexts = [direct]
-    elif isinstance(step_results, list):
-        contexts = [
-            step.get("agent_result")
-            for step in step_results
-            if isinstance(step, dict) and isinstance(step.get("agent_result"), dict)
-        ]
-    else:
-        contexts = []
-    if not contexts:
-        return _trajectory_usage(result_file), "trajectory"
-    totals: dict[str, int | float] = {
-        "input_tokens": 0,
-        "cache_tokens": 0,
-        "output_tokens": 0,
-        "cost_usd": 0.0,
-    }
-    fields = {
-        "input_tokens": "n_input_tokens",
-        "cache_tokens": "n_cache_tokens",
-        "output_tokens": "n_output_tokens",
-        "cost_usd": "cost_usd",
-    }
-    for context in contexts:
-        assert isinstance(context, dict)
-        for output_name, source_name in fields.items():
-            raw = context.get(source_name)
-            if output_name == "cost_usd":
-                value = _nonnegative_number(raw, f"{source_name} in {result_file}")
-            else:
-                value = _nonnegative_integer(raw, f"{source_name} in {result_file}")
-            totals[output_name] += value
-    if totals["cache_tokens"] > totals["input_tokens"]:
-        raise ValueError(f"cache tokens exceed input tokens in {result_file}")
-    return totals, "agent_result" if isinstance(direct, dict) else "step_results"
+    usage = load_trial_usage(data, result_file, provider=provider)
+    return usage.as_analysis_dict(), usage.source
 
 
-def _trajectory_usage(result_file: Path) -> dict[str, int | float]:
-    trajectory_file = result_file.parent / "agent" / "trajectory.json"
-    try:
-        data = json.loads(trajectory_file.read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
-        raise ValueError(
-            f"missing trajectory needed to reconstruct agent usage: {trajectory_file}"
-        ) from error
-    except (OSError, UnicodeDecodeError) as error:
-        raise ValueError(
-            f"unreadable trajectory needed to reconstruct agent usage: "
-            f"{trajectory_file}: {error}"
-        ) from error
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"invalid JSON in trajectory needed to reconstruct agent usage: "
-            f"{trajectory_file}: {error}"
-        ) from error
-    if not isinstance(data, dict) or not isinstance(data.get("steps"), list):
-        raise ValueError(
-            f"malformed trajectory needed to reconstruct agent usage: "
-            f"{trajectory_file} must contain a steps array"
-        )
-    steps = data["steps"]
-    if not steps:
-        raise ValueError(
-            f"malformed trajectory needed to reconstruct agent usage: "
-            f"{trajectory_file} has no steps"
-        )
-    totals: dict[str, int | float] = {
-        "input_tokens": 0,
-        "cache_tokens": 0,
-        "output_tokens": 0,
-        "cost_usd": 0.0,
-    }
-    fields = {
-        "input_tokens": "prompt_tokens",
-        "cache_tokens": "cached_tokens",
-        "output_tokens": "completion_tokens",
-        "cost_usd": "cost_usd",
-    }
-    for index, step in enumerate(steps):
-        context = f"step {index} metrics in {trajectory_file}"
-        if not isinstance(step, dict):
-            raise ValueError(f"malformed trajectory {context}: step must be an object")
-        metrics = step.get("metrics")
-        if metrics is None and (
-            step.get("source") in {"system", "user"}
-            or (step.get("source") == "agent" and step.get("llm_call_count") == 0)
-        ):
-            continue
-        if not isinstance(metrics, dict):
-            raise ValueError(
-                f"malformed trajectory {context}: metrics must be an object"
-            )
-        for output_name, source_name in fields.items():
-            raw = metrics.get(source_name)
-            if raw is None and output_name == "cache_tokens":
-                # A call with no cache hit may omit the field entirely. Reading
-                # that as zero is the conservative direction: it attributes the
-                # whole prompt to full-price input rather than to cheap cache
-                # reads, so an omission can never make a billed call look
-                # cheaper than it was. Every other field stays required --
-                # a missing prompt, completion or cost is real information loss.
-                value: int | float = 0
-            elif output_name == "cost_usd":
-                value = _nonnegative_number(raw, f"{source_name} in {context}")
-            else:
-                value = _nonnegative_integer(raw, f"{source_name} in {context}")
-            totals[output_name] += value
-    if totals["cache_tokens"] > totals["input_tokens"]:
-        raise ValueError(
-            f"trajectory cache tokens exceed input tokens in {trajectory_file}"
-        )
-    return totals
+def _trajectory_usage(result_file: Path, *, provider: str) -> dict[str, int | float]:
+    return reconstruct_trajectory_usage(
+        result_file, provider=provider
+    ).as_analysis_dict()
 
 
 def _task_index(task_root: Path) -> dict[str, Path]:
@@ -1847,6 +1771,10 @@ def _aggregate_arm(
         "output_tokens": sum(trial["output_tokens"] for trial in reconstructed_trials),
         "cost_usd": sum(trial["cost_usd"] for trial in reconstructed_trials),
     }
+    trajectory_cost_imputation = {
+        "step_count": sum(trial["imputed_cost_steps"] for trial in billed),
+        "cost_usd": sum(trial["imputed_cost_usd"] for trial in billed),
+    }
     durations = [
         trial["duration_sec"] for trial in billed if trial["duration_sec"] is not None
     ]
@@ -1872,6 +1800,7 @@ def _aggregate_arm(
         "mean_cost_usd_per_billed_trial": cost / len(billed),
         "mean_cost_usd_per_analyzed_trial": analyzed_cost / len(trials),
         "trajectory_reconstructed_usage": reconstructed_usage,
+        "trajectory_cost_imputation": trajectory_cost_imputation,
         "mean_duration_sec": _mean(durations) if durations else None,
         "duration_observation_count": len(durations),
         "failure_slope_per_task_length_doubling": _slope(
@@ -1880,7 +1809,16 @@ def _aggregate_arm(
         ),
         "task_curve": task_curve,
         "trials": [
-            {key: value for key, value in trial.items() if key != "dead_exception_type"}
+            {
+                key: value
+                for key, value in trial.items()
+                if key
+                not in {
+                    "dead_exception_type",
+                    "imputed_cost_steps",
+                    "imputed_cost_usd",
+                }
+            }
             for trial in billed
         ],
     }

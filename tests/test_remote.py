@@ -365,6 +365,26 @@ async def test_persistent_file_changed_warning_records_path_and_restores(
     assert affected.read_text(encoding="utf-8") == "checkpoint"
 
 
+async def test_harbor_merged_stream_file_changed_warning_records_path(
+    tmp_path: Path,
+) -> None:
+    warning = "tar: ./output/live.log: file changed as we read it"
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, warning, None), LocalExecResult(1, warning, None)],
+    )
+    affected = workspace / "output" / "live.log"
+    affected.parent.mkdir(parents=True)
+    affected.write_text("busy", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    manifest = json.loads((checkpoint.path / "manifest.json").read_text())
+    assert environment.archive_attempts == 2
+    assert checkpoint.unstable_paths == ("./output/live.log",)
+    assert manifest["unstable_paths"] == ["./output/live.log"]
+
+
 async def test_persistent_file_changed_warnings_record_every_path(
     tmp_path: Path,
 ) -> None:
@@ -409,6 +429,32 @@ async def test_unrelated_exit_one_archive_warning_still_raises(
         "create remote archive failed with exit code 1: "
         "tar: ./ignored.sock: socket ignored"
     )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "tar: ./out/x.log: Cannot open: Permission denied",
+        (
+            "tar: ./out/x.log: file changed as we read it\n"
+            "tar: ./out/y.log: Cannot open: Permission denied"
+        ),
+        "tar: : file changed as we read it",
+        "tar:    : file changed as we read it",
+    ],
+)
+async def test_harbor_merged_stream_archive_errors_remain_fatal(
+    tmp_path: Path, output: str
+) -> None:
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path, [LocalExecResult(1, output, None)]
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    with pytest.raises(RemoteCheckpointError, match="create remote archive failed"):
+        await store.create({}, step=0)
+
+    assert environment.archive_attempts == 1
 
 
 async def test_fatal_archive_exit_still_raises_without_retry(tmp_path: Path) -> None:
