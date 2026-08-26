@@ -20,6 +20,11 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
+from driftlock.checkpoint_localization import (
+    LOCALIZATION_REPORT_NAME,
+    load_and_localize_score_report,
+    write_localization_report,
+)
 from driftlock.checkpoint_scoring import (
     SCORE_REPORT_NAME,
     assemble_scored_timelines,
@@ -1058,6 +1063,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             print(f"wrote {report_path}")
             return 1 if failed else 0
+        if args.command == "localize-checkpoints":
+            report = load_and_localize_score_report(args.score_report)
+            output = args.output.expanduser().resolve()
+            write_localization_report(output, report)
+            print(
+                f"usable {report['usable_task_count']}/{report['task_count']} "
+                f"tasks ({report['coverage']:.1%}); "
+                f"refused {report['refused_task_count']}"
+            )
+            for task in report["tasks"]:
+                if task["status"] == "refused":
+                    refusal = task["refusal"]
+                    print(
+                        f"  {task['task_name']}: refused "
+                        f"({refusal['reason']}): {refusal['detail']}"
+                    )
+                    continue
+                print(
+                    f"  {task['task_name']}: {len(task['segments'])} "
+                    "non-improving segment(s)"
+                )
+                for segment in task["segments"]:
+                    start = segment["start"]
+                    end = segment["end"]
+                    print(
+                        f"    {segment['type']}: phase {start['phase']} step "
+                        f"{start['step']} -> phase {end['phase']} step "
+                        f"{end['step']} ({segment['reward_change']:+.6g})"
+                    )
+            print(f"wrote {output}")
+            return 0
         if args.command == "select":
             report = select_tasks(
                 args.job_dirs,
@@ -1138,6 +1174,14 @@ def _parser() -> argparse.ArgumentParser:
     scoring.add_argument("--output-dir", type=Path, required=True)
     scoring.add_argument("--timeout-sec", type=int, default=900)
     scoring.add_argument("--dry-run", action="store_true")
+    localization = sub.add_parser(
+        "localize-checkpoints",
+        help="find non-improving segments in a checkpoint score report",
+    )
+    localization.add_argument("score_report", type=Path)
+    localization.add_argument(
+        "--output", type=Path, default=Path(LOCALIZATION_REPORT_NAME)
+    )
     choose = sub.add_parser("select", help="select tasks by measured partial credit")
     choose.add_argument("job_dirs", nargs="+", type=Path)
     choose.add_argument("--limit", type=int, default=12)
