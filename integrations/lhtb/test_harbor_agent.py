@@ -292,6 +292,61 @@ async def test_oracle_restores_one_verified_checkpoint_without_model_access(
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_scoring_restores_verified_bundle_with_zero_provider_usage(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "agent"
+    logs.mkdir()
+    checkpoint_id = "e" * 32
+    checkpoint = (
+        tmp_path / ".driftlock-checkpoints" / "phase-2" / "checkpoints" / checkpoint_id
+    )
+    checkpoint.mkdir(parents=True)
+    archive = b"scoring archive"
+    state_text = "{}"
+    digest = hashlib.sha256(archive)
+    digest.update(b"\0state\0")
+    digest.update(state_text.encode())
+    (checkpoint / "workspace.tar.gz").write_bytes(archive)
+    (checkpoint / "state.json").write_text(state_text, encoding="utf-8")
+    (checkpoint / "manifest.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_id": checkpoint_id,
+                "step": 25,
+                "created_at": datetime.now(UTC).isoformat(),
+                "digest": digest.hexdigest(),
+                "parent_id": None,
+                "label": "step-25",
+                "remote_workspace": "/app",
+            }
+        ),
+        encoding="utf-8",
+    )
+    agent = plugin.LHTBCheckpointScoringAgent(
+        logs_dir=logs,
+        model_name="openrouter/source-model",
+        driftlock_scoring_checkpoint_dir=str(checkpoint),
+        driftlock_scoring_checkpoint_digest=digest.hexdigest(),
+        driftlock_scoring_expected_workspace="/app",
+    )
+    context = AgentContext()
+    environment = SimpleNamespace(
+        default_user="root", task_env_config=SimpleNamespace(workdir="/app")
+    )
+
+    await agent.run("hidden task instruction", environment, context)
+
+    assert [item.checkpoint_id for item in FakeStore.restores] == [checkpoint_id]
+    assert context.n_input_tokens == 0
+    assert context.n_cache_tokens == 0
+    assert context.n_output_tokens == 0
+    assert context.cost_usd == 0.0
+    assert context.metadata["termination_reason"] == "checkpoint_scoring_replay"
+    assert context.metadata["checkpoint_scoring"]["provider_tokens"] == 0
+
+
+@pytest.mark.asyncio
 async def test_fresh_harbor_phases_report_incremental_accounting(
     tmp_path: Path,
 ) -> None:

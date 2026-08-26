@@ -209,6 +209,79 @@ class LHTBCheckpointReplayOracle(BaseAgent):
         raise RuntimeError("oracle replay is a single terminal phase")
 
 
+class LHTBCheckpointScoringAgent(BaseAgent):
+    """Restore one integrity-checked checkpoint without calling a model.
+
+    Unlike :class:`LHTBCheckpointReplayOracle`, this measuring agent is not an
+    analysis arm and deliberately does not require source-trial provenance.  The
+    checkpoint's digest and expected workspace remain mandatory.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        driftlock_scoring_checkpoint_dir: str,
+        driftlock_scoring_checkpoint_digest: str,
+        driftlock_scoring_expected_workspace: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._scoring_checkpoint_dir = Path(driftlock_scoring_checkpoint_dir)
+        self._scoring_checkpoint_digest = driftlock_scoring_checkpoint_digest
+        self._scoring_expected_workspace = driftlock_scoring_expected_workspace
+
+    @staticmethod
+    def name() -> str:
+        return "driftlock-checkpoint-scoring"
+
+    def version(self) -> str | None:
+        return version("driftlock")
+
+    async def setup(self, environment: Any) -> None:
+        del environment
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        del instruction
+        bundle = load_remote_checkpoint_bundle(
+            self._scoring_checkpoint_dir,
+            expected_digest=self._scoring_checkpoint_digest,
+            expected_workspace=self._scoring_expected_workspace,
+        )
+        task_config = getattr(environment, "task_env_config", None)
+        workspace = str(getattr(task_config, "workdir", None) or "/app")
+        if workspace != bundle.remote_workspace:
+            raise ValueError("fresh verifier workspace differs from checkpoint")
+
+        store = RemoteArchiveCheckpointStore(
+            environment,
+            remote_workspace=workspace,
+            store_dir=bundle.checkpoint.path.parent.parent,
+            user=environment.default_user,
+        )
+        await store.restore(bundle.checkpoint)
+
+        context.n_input_tokens = 0
+        context.n_cache_tokens = 0
+        context.n_output_tokens = 0
+        context.cost_usd = 0.0
+        metadata = dict(context.metadata or {})
+        metadata["termination_reason"] = "checkpoint_scoring_replay"
+        metadata["checkpoint_scoring"] = {
+            "checkpoint_id": bundle.checkpoint.checkpoint_id,
+            "checkpoint_step": bundle.checkpoint.step,
+            "checkpoint_digest": bundle.checkpoint.digest,
+            "workspace": workspace,
+            "provider_tokens": 0,
+        }
+        context.metadata = metadata
+
+    async def resume_after_verifier_rejection(
+        self, user_prompt: str, context: Any
+    ) -> None:
+        del user_prompt, context
+        raise RuntimeError("checkpoint scoring replay is a single terminal phase")
+
+
 class LHTBDriftlockAgent(Terminus2):
     """Pinned Terminus-2 with checkpointed two-tier rollback.
 
