@@ -14,6 +14,7 @@ import importlib.metadata
 import importlib.resources
 import inspect
 import json
+import re
 import shlex
 import time
 from collections.abc import Mapping
@@ -33,6 +34,7 @@ from driftlock.terminus import (
 LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
 LHTB_LITELLM_VERSION = "1.83.14"
 DRIFTLOCK_HARBOR_PATCH_VERSION = 11
+_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # On 2026-08-23 the pinned agent provider's *shared* upstream pool was saturated
 # for at least 11 minutes and every trial then in flight died. These defaults cover
@@ -133,6 +135,29 @@ def lhtb_experiment_fingerprint() -> str:
     that decides whether two measurements are comparable.
     """
     return _source_fingerprint(exclude=frozenset())
+
+
+def recorded_lhtb_fingerprint(environment: object, context: str) -> str:
+    """Read a recorded build fingerprint without comparing it to this build."""
+    value = (
+        environment.get("DRIFTLOCK_EXPERIMENT_FINGERPRINT")
+        if isinstance(environment, dict)
+        else None
+    )
+    if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
+        raise ValueError(f"missing or malformed build fingerprint in {context}")
+    return value
+
+
+def require_one_lhtb_fingerprint(fingerprints: set[str], *, context: str) -> str:
+    """Require internally compared records to have one producing build."""
+    if len(fingerprints) != 1:
+        raise ValueError(
+            f"{context} mix driftlock builds: "
+            + ", ".join(sorted(fingerprints))
+            + " -- trials produced by different code are not comparable"
+        )
+    return next(iter(fingerprints))
 
 
 def _source_fingerprint(*, exclude: frozenset[str]) -> str:

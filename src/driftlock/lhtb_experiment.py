@@ -27,6 +27,8 @@ from driftlock.lhtb import (
     LHTB_REPOSITORY_REVISION,
     lhtb_experiment_fingerprint,
     openrouter_provider_call_kwargs,
+    recorded_lhtb_fingerprint,
+    require_one_lhtb_fingerprint,
 )
 from driftlock.lhtb_analysis import (
     analyze_jobs,
@@ -34,6 +36,7 @@ from driftlock.lhtb_analysis import (
     task_directory_sha256,
 )
 from driftlock.oracle import (
+    OracleCheckpointError,
     ReplayUsage,
     file_sha256,
     load_remote_checkpoint_bundle,
@@ -277,6 +280,7 @@ def prepare_oracle_replays(
     candidates: list[dict[str, Any]] = []
     pending_configs: list[tuple[Path, dict[str, Any]]] = []
     seen_checkpoints: set[str] = set()
+    source_job_fingerprint: str | None = None
     for result_file in sorted(source.glob("*/result.json")):
         if (
             result_file.parent.is_symlink()
@@ -305,13 +309,21 @@ def prepare_oracle_replays(
         if (
             not isinstance(kwargs, dict)
             or agent.get("import_path") != "driftlock.harbor_agent:LHTBDriftlockAgent"
-            or kwargs.get("driftlock_retain_checkpoints") is not True
         ):
             raise ValueError(
-                f"source trial was not configured to retain driftlock checkpoints: "
-                f"{result_file}"
+                f"source trial is not a supported driftlock trial: {result_file}"
             )
-        _validate_oracle_source_agent(result, agent, kwargs, result_file)
+        source_fingerprint = _validate_oracle_source_agent(
+            result, agent, kwargs, result_file
+        )
+        if source_job_fingerprint is None:
+            source_job_fingerprint = _source_job_recorded_fingerprint(source)
+        if source_fingerprint != source_job_fingerprint:
+            raise ValueError(
+                "source trial result fingerprint disagrees with Harbor lock audit: "
+                f"{result_file} records {source_fingerprint}, but "
+                f"{source / 'lock.json'} records {source_job_fingerprint}"
+            )
         model_name = provenance.model_name
         task_name = provenance.task_name
         task = _task_directory_name(root / "tasks", task_name)
@@ -322,21 +334,51 @@ def prepare_oracle_replays(
                 f"source task checksum differs from the pinned checkout: {result_file}"
             )
         usage = provenance.usage
+        usage_source = provenance.usage_source
         source_result_digest = provenance.result_sha256
         source_audit = result_file.parent / "agent" / "driftlock-result.json"
         source_audit_digest = file_sha256(source_audit)
         checkpoint_root = result_file.parent / ".driftlock-checkpoints"
         checkpoint_dirs = sorted(checkpoint_root.glob("phase-*/checkpoints/*"))
         if not checkpoint_dirs:
-            raise ValueError(f"source trial has no retained checkpoints: {result_file}")
+            raise ValueError(
+                "source trial has no loadable retained checkpoints; looked for "
+                f"{checkpoint_root / 'phase-*/checkpoints/*'}"
+            )
+        loaded_checkpoints = []
         for checkpoint_dir in checkpoint_dirs:
-            bundle = load_remote_checkpoint_bundle(checkpoint_dir)
-            validate_checkpoint_source_audit(
+            try:
+                bundle = load_remote_checkpoint_bundle(checkpoint_dir)
+            except OracleCheckpointError as error:
+                raise ValueError(
+                    "source trial has no loadable retained checkpoint at "
+                    f"{checkpoint_dir}; looked for manifest.json, state.json, and "
+                    f"workspace.tar.gz there: {error}"
+                ) from error
+            phase_audit = validate_checkpoint_source_audit(
                 bundle.checkpoint.path,
                 source_result=result_file,
                 source_audit=source_audit,
                 expected_audit_sha256=source_audit_digest,
             )
+            checkpoint_phase = int(
+                bundle.checkpoint.path.parent.parent.name.removeprefix("phase-")
+            )
+            if phase_audit.get("phase") != checkpoint_phase:
+                raise ValueError(
+                    f"source checkpoint audit has an invalid phase id: {source_audit}"
+                )
+            loaded_checkpoints.append((bundle, checkpoint_phase))
+        retained_phases = sorted(
+            {checkpoint_phase for _, checkpoint_phase in loaded_checkpoints}
+        )
+        whole_trial = kwargs.get("driftlock_retain_checkpoints") is True
+        checkpoint_coverage = {
+            "retained_phases": retained_phases,
+            "scope": "whole-trial" if whole_trial else "prefix",
+            "whole_trial": whole_trial,
+        }
+        for bundle, checkpoint_phase in loaded_checkpoints:
             if bundle.checkpoint.checkpoint_id in seen_checkpoints:
                 raise ValueError("checkpoint ids must be globally unique")
             seen_checkpoints.add(bundle.checkpoint.checkpoint_id)
@@ -361,6 +403,9 @@ def prepare_oracle_replays(
                 source_audit=source_audit.resolve(),
                 source_audit_sha256=source_audit_digest,
                 source_usage=usage,
+                source_usage_source=usage_source,
+                checkpoint_coverage=checkpoint_coverage,
+                source_fingerprint=source_fingerprint,
             )
             config_path = configs_dir / f"{candidate_id}.json"
             pending_configs.append((config_path, replay_config))
@@ -375,6 +420,7 @@ def prepare_oracle_replays(
                     "task_name": task_name,
                     "model_name": model_name,
                     "checkpoint_id": bundle.checkpoint.checkpoint_id,
+                    "checkpoint_phase": checkpoint_phase,
                     "checkpoint_step": bundle.checkpoint.step,
                     "checkpoint_digest": bundle.checkpoint.digest,
                     "checkpoint_dir": str(bundle.checkpoint.path),
@@ -382,6 +428,9 @@ def prepare_oracle_replays(
                     "state_sha256": bundle.state_sha256,
                     "workspace": bundle.remote_workspace,
                     "source_usage": usage.as_dict(),
+                    "source_usage_source": usage_source,
+                    "source_fingerprint": source_fingerprint,
+                    "checkpoint_coverage": checkpoint_coverage,
                     "usage_policy": "full-source-trial-conservative",
                     "config": str(config_path),
                     "job_name": job_name,
@@ -389,13 +438,14 @@ def prepare_oracle_replays(
             )
     if not candidates:
         raise ValueError(f"source job has no trial results: {source}")
+    assert source_job_fingerprint is not None
     manifest = {
         "schema_version": 1,
         "mode": "isolated-checkpoint-replay",
         "source_job_dir": str(source),
         "lhtb_revision": LHTB_REPOSITORY_REVISION,
         "harbor_patch": str(DRIFTLOCK_HARBOR_PATCH_VERSION),
-        "experiment_fingerprint": lhtb_experiment_fingerprint(),
+        "experiment_fingerprint": source_job_fingerprint,
         "usage_policy": "full-source-trial-conservative",
         "candidate_count": len(candidates),
         "candidates": candidates,
@@ -432,6 +482,9 @@ def _oracle_replay_job_config(
     source_audit: Path,
     source_audit_sha256: str,
     source_usage: ReplayUsage,
+    source_usage_source: str,
+    checkpoint_coverage: dict[str, Any],
+    source_fingerprint: str,
 ) -> dict[str, Any]:
     return {
         "job_name": job_name,
@@ -448,7 +501,7 @@ def _oracle_replay_job_config(
                 "override_timeout_sec": timeout_sec,
                 "env": {
                     "HB_CONTINUE_MODE": "same_conversation",
-                    "DRIFTLOCK_EXPERIMENT_FINGERPRINT": (lhtb_experiment_fingerprint()),
+                    "DRIFTLOCK_EXPERIMENT_FINGERPRINT": source_fingerprint,
                 },
                 "kwargs": {
                     "driftlock_oracle_mode": "isolated-checkpoint-replay",
@@ -462,6 +515,8 @@ def _oracle_replay_job_config(
                     "driftlock_source_audit": str(source_audit),
                     "driftlock_source_audit_sha256": source_audit_sha256,
                     "driftlock_source_usage": source_usage.as_dict(),
+                    "driftlock_source_usage_source": source_usage_source,
+                    "driftlock_checkpoint_coverage": checkpoint_coverage,
                 },
             }
         ],
@@ -474,10 +529,17 @@ def _validate_oracle_source_agent(
     agent: dict[str, Any],
     kwargs: dict[str, Any],
     path: Path,
-) -> None:
-    if agent.get("env") != {
-        "HB_CONTINUE_MODE": "same_conversation",
-        "DRIFTLOCK_EXPERIMENT_FINGERPRINT": lhtb_experiment_fingerprint(),
+) -> str:
+    environment = agent.get("env")
+    if (
+        not isinstance(environment, dict)
+        or environment.get("HB_CONTINUE_MODE") != "same_conversation"
+    ):
+        raise ValueError(f"source trial has the wrong experiment identity: {path}")
+    fingerprint = recorded_lhtb_fingerprint(environment, f"source trial result {path}")
+    if set(environment) != {
+        "HB_CONTINUE_MODE",
+        "DRIFTLOCK_EXPERIMENT_FINGERPRINT",
     }:
         raise ValueError(f"source trial has the wrong experiment identity: {path}")
     required = {
@@ -485,9 +547,11 @@ def _validate_oracle_source_agent(
         "driftlock_max_steps": 500,
         "driftlock_max_rollbacks": 3,
         "driftlock_checkpoint_interval": 5,
-        "driftlock_retain_checkpoints": True,
     }
     if any(kwargs.get(name) != expected for name, expected in required.items()):
+        raise ValueError(f"source trial has an unsupported driftlock config: {path}")
+    retain_checkpoints = kwargs.get("driftlock_retain_checkpoints", False)
+    if not isinstance(retain_checkpoints, bool):
         raise ValueError(f"source trial has an unsupported driftlock config: {path}")
     budget = kwargs.get("driftlock_max_tokens")
     if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
@@ -507,6 +571,37 @@ def _validate_oracle_source_agent(
         or model_info != {"provider": provider, "name": name}
     ):
         raise ValueError(f"source trial agent identity is inconsistent: {path}")
+    return fingerprint
+
+
+def _source_job_recorded_fingerprint(source: Path) -> str:
+    lock_file = source / "lock.json"
+    try:
+        lock = json.loads(lock_file.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"source job lacks its fingerprint audit record: {lock_file}"
+        ) from error
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"source fingerprint audit is unreadable: {lock_file}"
+        ) from error
+    trials = lock.get("trials") if isinstance(lock, dict) else None
+    if not isinstance(trials, list) or not trials:
+        raise ValueError(f"source fingerprint audit has no trials: {lock_file}")
+    fingerprints = set()
+    for index, trial in enumerate(trials):
+        agent = trial.get("agent") if isinstance(trial, dict) else None
+        environment = agent.get("env") if isinstance(agent, dict) else None
+        fingerprints.add(
+            recorded_lhtb_fingerprint(
+                environment,
+                f"source Harbor lock audit {lock_file} trial {index}",
+            )
+        )
+    return require_one_lhtb_fingerprint(
+        fingerprints, context=f"source Harbor lock audit {lock_file}"
+    )
 
 
 def preflight(

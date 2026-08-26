@@ -285,53 +285,70 @@ def test_native_checkpoint_retention_is_rejected_before_job_generation(
         )
 
 
-def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
+def _retained_source_trial(
+    root: Path,
+    job: Path,
+    *,
+    retain_checkpoints: bool = True,
+    checkpoints_by_phase: dict[int, int] | None = None,
+    fingerprint: str | None = None,
+) -> tuple[Path, str]:
     trial_id = str(uuid4())
     trial = job / "task-a.1-of-1.2026-01-01"
-    checkpoint_id = "c" * 32
-    checkpoint = (
-        trial / ".driftlock-checkpoints" / "phase-0" / "checkpoints" / checkpoint_id
-    )
-    checkpoint.mkdir(parents=True)
-    archive = b"checkpoint archive"
-    state_text = '{"conversation":[]}'
-    digest = hashlib.sha256(archive)
-    digest.update(b"\0state\0")
-    digest.update(state_text.encode())
-    (checkpoint / "workspace.tar.gz").write_bytes(archive)
-    (checkpoint / "state.json").write_text(state_text, encoding="utf-8")
-    (checkpoint / "manifest.json").write_text(
-        json.dumps(
-            {
-                "checkpoint_id": checkpoint_id,
-                "step": 5,
-                "created_at": datetime.now(UTC).isoformat(),
-                "digest": digest.hexdigest(),
-                "parent_id": None,
-                "label": "step-5",
-                "remote_workspace": "/app",
-            }
-        ),
-        encoding="utf-8",
-    )
-    audit_dir = trial / "agent"
-    audit_dir.mkdir()
-    (audit_dir / "driftlock-result.json").write_text(
-        json.dumps(
-            {
-                "phases": [
+    checkpoint_counts = {0: 1} if checkpoints_by_phase is None else checkpoints_by_phase
+    checkpoint_ids = iter(("c" * 32, "d" * 32, "e" * 32, "f" * 32))
+    phase_records = []
+    for phase, checkpoint_count in sorted(checkpoint_counts.items()):
+        checkpoints = (
+            trial / ".driftlock-checkpoints" / f"phase-{phase}" / "checkpoints"
+        )
+        checkpoints.mkdir(parents=True)
+        for index in range(checkpoint_count):
+            checkpoint_id = next(checkpoint_ids)
+            checkpoint = checkpoints / checkpoint_id
+            checkpoint.mkdir()
+            archive = f"checkpoint archive {phase} {index}".encode()
+            state_text = '{"conversation":[]}'
+            digest = hashlib.sha256(archive)
+            digest.update(b"\0state\0")
+            digest.update(state_text.encode())
+            step = phase * 10 + index * 5 + 5
+            (checkpoint / "workspace.tar.gz").write_bytes(archive)
+            (checkpoint / "state.json").write_text(state_text, encoding="utf-8")
+            (checkpoint / "manifest.json").write_text(
+                json.dumps(
                     {
-                        "phase": 0,
-                        "checkpoint_dir": str(checkpoint.parent.parent.resolve()),
-                        "checkpoints_retained": True,
-                        "status": "completed",
-                        "checkpoint_count": 1,
+                        "checkpoint_id": checkpoint_id,
+                        "step": step,
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "digest": digest.hexdigest(),
+                        "parent_id": None,
+                        "label": f"step-{step}",
+                        "remote_workspace": "/app",
                     }
-                ]
+                ),
+                encoding="utf-8",
+            )
+        phase_records.append(
+            {
+                "phase": phase,
+                "checkpoint_dir": str(checkpoints.parent.resolve()),
+                "checkpoints_retained": True,
+                "status": "completed",
+                "checkpoint_count": checkpoint_count,
             }
-        ),
+        )
+    audit_dir = trial / "agent"
+    audit_dir.mkdir(parents=True)
+    (audit_dir / "driftlock-result.json").write_text(
+        json.dumps({"phases": phase_records}),
         encoding="utf-8",
     )
+    source_fingerprint = fingerprint or experiment.lhtb_experiment_fingerprint()
+    source_environment = {
+        "HB_CONTINUE_MODE": "same_conversation",
+        "DRIFTLOCK_EXPERIMENT_FINGERPRINT": source_fingerprint,
+    }
     result = {
         "id": trial_id,
         "task_name": "long-horizon-terminal-bench/task-a",
@@ -348,19 +365,26 @@ def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
             "agent": {
                 "import_path": "driftlock.harbor_agent:LHTBDriftlockAgent",
                 "model_name": experiment.DEFAULT_MODEL,
-                "env": {
-                    "HB_CONTINUE_MODE": "same_conversation",
-                    "DRIFTLOCK_EXPERIMENT_FINGERPRINT": (
-                        experiment.lhtb_experiment_fingerprint()
-                    ),
-                },
+                "env": source_environment,
                 "kwargs": {
                     "enable_summarize": False,
                     "driftlock_max_tokens": 10_000,
                     "driftlock_max_steps": 500,
                     "driftlock_max_rollbacks": 3,
                     "driftlock_checkpoint_interval": 5,
-                    "driftlock_retain_checkpoints": True,
+                    "llm_call_kwargs": {
+                        "extra_body": {
+                            "provider": {
+                                "only": ["deepinfra/fp8"],
+                                "allow_fallbacks": False,
+                            }
+                        }
+                    },
+                    **(
+                        {"driftlock_retain_checkpoints": True}
+                        if retain_checkpoints
+                        else {}
+                    ),
                 },
             }
         },
@@ -373,7 +397,47 @@ def _retained_source_trial(root: Path, job: Path) -> tuple[Path, str]:
     }
     result_file = trial / "result.json"
     result_file.write_text(json.dumps(result), encoding="utf-8")
+    (job / "lock.json").write_text(
+        json.dumps({"trials": [{"agent": {"env": source_environment}}]}),
+        encoding="utf-8",
+    )
     return result_file, trial_id
+
+
+def _replace_source_usage_with_trajectory(result_file: Path) -> None:
+    payload = json.loads(result_file.read_text(encoding="utf-8"))
+    payload["agent_result"] = None
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+    agent_dir = result_file.parent / "agent"
+    for number in range(2):
+        (agent_dir / f"episode-{number}").mkdir()
+    (agent_dir / "trajectory.json").write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 11,
+                            "cached_tokens": 4,
+                            "completion_tokens": 3,
+                            "cost_usd": 0.125,
+                        },
+                    },
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 13,
+                            "cached_tokens": 5,
+                            "completion_tokens": 4,
+                            "cost_usd": 0.25,
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_prepare_oracle_replays_generates_one_isolated_job_per_checkpoint(
@@ -393,14 +457,242 @@ def test_prepare_oracle_replays_generates_one_isolated_job_per_checkpoint(
     candidate = manifest["candidates"][0]
     assert candidate["source_trial_id"] == trial_id
     assert candidate["usage_policy"] == "full-source-trial-conservative"
+    assert candidate["checkpoint_phase"] == 0
+    assert candidate["checkpoint_coverage"] == {
+        "retained_phases": [0],
+        "scope": "whole-trial",
+        "whole_trial": True,
+    }
     config = json.loads(Path(candidate["config"]).read_text())
     agent = config["agents"][0]
     assert agent["import_path"] == "driftlock.harbor_agent:LHTBCheckpointReplayOracle"
     assert agent["env"]["HB_CONTINUE_MODE"] == "same_conversation"
     assert agent["kwargs"]["driftlock_source_result"] == str(result_file.resolve())
     assert agent["kwargs"]["driftlock_source_usage"]["input_tokens"] == 100
+    assert agent["kwargs"]["driftlock_source_usage_source"] == "agent_result"
+    assert agent["kwargs"]["driftlock_checkpoint_coverage"] == {
+        "retained_phases": [0],
+        "scope": "whole-trial",
+        "whole_trial": True,
+    }
     assert config["n_concurrent_trials"] == 1
     assert config["retry"] == {"max_retries": 0}
+
+
+def test_prepare_oracle_replays_records_whole_trial_multiphase_coverage(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    _retained_source_trial(root, source, checkpoints_by_phase={0: 1, 1: 1})
+
+    manifest = prepare_oracle_replays(
+        lhtb_dir=root,
+        source_job_dir=source,
+        output_dir=tmp_path / "oracle",
+    )
+
+    assert manifest["candidate_count"] == 2
+    assert [item["checkpoint_phase"] for item in manifest["candidates"]] == [0, 1]
+    assert [item["checkpoint_coverage"] for item in manifest["candidates"]] == [
+        {
+            "retained_phases": [0, 1],
+            "scope": "whole-trial",
+            "whole_trial": True,
+        },
+        {
+            "retained_phases": [0, 1],
+            "scope": "whole-trial",
+            "whole_trial": True,
+        },
+    ]
+
+
+def test_prepare_oracle_replays_accepts_unflagged_phase_zero_checkpoints(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    _retained_source_trial(
+        root,
+        source,
+        retain_checkpoints=False,
+        checkpoints_by_phase={0: 2},
+    )
+
+    manifest = prepare_oracle_replays(
+        lhtb_dir=root,
+        source_job_dir=source,
+        output_dir=tmp_path / "oracle",
+    )
+
+    assert manifest["candidate_count"] == 2
+    assert [item["checkpoint_phase"] for item in manifest["candidates"]] == [0, 0]
+    assert [item["checkpoint_step"] for item in manifest["candidates"]] == [5, 10]
+    assert manifest["candidates"][0]["checkpoint_coverage"] == {
+        "retained_phases": [0],
+        "scope": "prefix",
+        "whole_trial": False,
+    }
+    first_config = json.loads(
+        Path(manifest["candidates"][0]["config"]).read_text(encoding="utf-8")
+    )
+    assert first_config["agents"][0]["kwargs"]["driftlock_checkpoint_coverage"] == {
+        "retained_phases": [0],
+        "scope": "prefix",
+        "whole_trial": False,
+    }
+
+
+@pytest.mark.parametrize("fingerprint", [None, "abc"])
+def test_prepare_oracle_replays_refuses_missing_or_malformed_source_fingerprint(
+    tmp_path: Path, fingerprint: str | None
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    result_file, _ = _retained_source_trial(root, source)
+    payload = json.loads(result_file.read_text(encoding="utf-8"))
+    environment = payload["config"]["agent"]["env"]
+    if fingerprint is None:
+        del environment["DRIFTLOCK_EXPERIMENT_FINGERPRINT"]
+    else:
+        environment["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = fingerprint
+    result_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing or malformed build fingerprint"):
+        prepare_oracle_replays(
+            lhtb_dir=root,
+            source_job_dir=source,
+            output_dir=tmp_path / "oracle",
+        )
+
+
+@pytest.mark.parametrize("fingerprint", [None, "abc"])
+def test_prepare_oracle_replays_refuses_missing_or_malformed_lock_fingerprint(
+    tmp_path: Path, fingerprint: str | None
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    _retained_source_trial(root, source)
+    lock_file = source / "lock.json"
+    lock = json.loads(lock_file.read_text(encoding="utf-8"))
+    environment = lock["trials"][0]["agent"]["env"]
+    if fingerprint is None:
+        del environment["DRIFTLOCK_EXPERIMENT_FINGERPRINT"]
+    else:
+        environment["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = fingerprint
+    lock_file.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="missing or malformed build fingerprint in source Harbor lock audit",
+    ):
+        prepare_oracle_replays(
+            lhtb_dir=root,
+            source_job_dir=source,
+            output_dir=tmp_path / "oracle",
+        )
+
+
+def test_prepare_oracle_replays_refuses_result_and_lock_fingerprint_disagreement(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    _retained_source_trial(root, source, fingerprint="a" * 64)
+    lock_file = source / "lock.json"
+    lock = json.loads(lock_file.read_text(encoding="utf-8"))
+    lock["trials"][0]["agent"]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] = "b" * 64
+    lock_file.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError, match="result fingerprint disagrees with Harbor lock audit"
+    ):
+        prepare_oracle_replays(
+            lhtb_dir=root,
+            source_job_dir=source,
+            output_dir=tmp_path / "oracle",
+        )
+
+
+@pytest.mark.parametrize("checkpoints_by_phase", [{0: 0}, {}])
+def test_prepare_oracle_replays_refuses_when_no_checkpoint_bundle_exists(
+    tmp_path: Path, checkpoints_by_phase: dict[int, int]
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    result_file, _ = _retained_source_trial(
+        root,
+        source,
+        retain_checkpoints=False,
+        checkpoints_by_phase=checkpoints_by_phase,
+    )
+    expected_pattern = (
+        result_file.parent / ".driftlock-checkpoints" / "phase-*" / "checkpoints" / "*"
+    )
+
+    with pytest.raises(ValueError, match="no loadable retained checkpoints") as raised:
+        prepare_oracle_replays(
+            lhtb_dir=root,
+            source_job_dir=source,
+            output_dir=tmp_path / "oracle",
+        )
+
+    assert str(expected_pattern) in str(raised.value)
+
+
+def test_oracle_prepare_cli_accepts_unflagged_retained_prefix(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _lhtb_tree(tmp_path, "task-a")
+    source = tmp_path / "source-job"
+    _retained_source_trial(root, source, retain_checkpoints=False, fingerprint="a" * 64)
+    result_file = next(source.glob("*/result.json"))
+    _replace_source_usage_with_trajectory(result_file)
+    output = tmp_path / "oracle"
+
+    exit_code = main(
+        [
+            "oracle-prepare",
+            "--lhtb-dir",
+            str(root),
+            "--source-job-dir",
+            str(source),
+            "--output-dir",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == (
+        f"wrote 1 replay configs and {output / 'oracle-manifest.json'}\n"
+    )
+    manifest = json.loads((output / "oracle-manifest.json").read_text())
+    assert manifest["candidates"][0]["source_usage"] == {
+        "input_tokens": 24,
+        "cache_tokens": 9,
+        "output_tokens": 7,
+        "cost_usd": 0.375,
+    }
+    assert manifest["candidates"][0]["source_usage_source"] == "trajectory"
+    assert manifest["candidates"][0]["source_fingerprint"] == "a" * 64
+    assert manifest["experiment_fingerprint"] == "a" * 64
+    assert manifest["candidates"][0]["checkpoint_coverage"] == {
+        "retained_phases": [0],
+        "scope": "prefix",
+        "whole_trial": False,
+    }
+    config = json.loads(Path(manifest["candidates"][0]["config"]).read_text())
+    assert config["agents"][0]["env"]["DRIFTLOCK_EXPERIMENT_FINGERPRINT"] == ("a" * 64)
+    assert config["agents"][0]["kwargs"]["driftlock_source_usage"] == {
+        "input_tokens": 24,
+        "cache_tokens": 9,
+        "output_tokens": 7,
+        "cost_usd": 0.375,
+    }
+    assert config["agents"][0]["kwargs"]["driftlock_source_usage_source"] == (
+        "trajectory"
+    )
 
 
 def test_prepare_oracle_replays_reports_native_incompatibility_explicitly(

@@ -13,6 +13,7 @@ from driftlock.lhtb import (
 )
 from driftlock.lhtb_analysis import (
     _task_directory_sha256,
+    _trajectory_usage,
     _validate_arm_identity,
     analyze_jobs,
     goal_drift_actions,
@@ -52,6 +53,7 @@ def _result(
     usage: dict[str, int | float] | None = None,
     exception: str | None = None,
     arm: str | None = None,
+    provider: str = "baidu/fp8",
 ) -> Path:
     directory = job / trial
     directory.mkdir(parents=True)
@@ -79,7 +81,7 @@ def _result(
                 "timeout": 240,
                 "extra_body": {
                     "provider": {
-                        "only": ["baidu/fp8"],
+                        "only": [provider],
                         "allow_fallbacks": False,
                     }
                 },
@@ -130,7 +132,7 @@ def _result(
                     "timeout": 240,
                     "extra_body": {
                         "provider": {
-                            "only": ["baidu/fp8"],
+                            "only": [provider],
                             "allow_fallbacks": False,
                         }
                     },
@@ -425,7 +427,9 @@ def _trajectory_steps() -> list[dict[str, object]]:
     ]
 
 
-def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _complete_jobs(
+    tmp_path: Path, *, provider: str = "baidu/fp8"
+) -> tuple[Path, Path, Path]:
     lhtb = tmp_path / "LHTB"
     _task(lhtb, "short", expert_minutes=60, category="build")
     _task(lhtb, "long", expert_minutes=240, category="debug")
@@ -433,14 +437,29 @@ def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
     driftlock = tmp_path / "driftlock"
     short_checksum = _task_directory_sha256(lhtb / "tasks" / "short")
     long_checksum = _task_directory_sha256(lhtb / "tasks" / "long")
-    _result(stock, "short-1", "short", 1.0, checksum=short_checksum)
-    _result(stock, "long-1", "long", 0.0, checksum=long_checksum)
+    _result(
+        stock,
+        "short-1",
+        "short",
+        1.0,
+        checksum=short_checksum,
+        provider=provider,
+    )
+    _result(
+        stock,
+        "long-1",
+        "long",
+        0.0,
+        checksum=long_checksum,
+        provider=provider,
+    )
     _result(
         driftlock,
         "short-1",
         "short",
         1.0,
         checksum=short_checksum,
+        provider=provider,
         usage={
             "n_input_tokens": 80,
             "n_cache_tokens": 40,
@@ -454,6 +473,7 @@ def _complete_jobs(tmp_path: Path) -> tuple[Path, Path, Path]:
         "long",
         1.0,
         checksum=long_checksum,
+        provider=provider,
         usage={
             "n_input_tokens": 120,
             "n_cache_tokens": 60,
@@ -1387,6 +1407,39 @@ def test_analyze_validates_canonical_job_lock(
         )
 
 
+def test_analyze_treats_harbor_retry_exception_order_as_set_order(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    lock_path = driftlock / "lock.json"
+    lock = json.loads(lock_path.read_text())
+    lock["retry"]["exclude_exceptions"] = list(
+        reversed(lock["retry"]["exclude_exceptions"])
+    )
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    assert report["matrix"]["complete"] is True
+
+
+def test_analyze_rejects_a_different_retry_exception_set(tmp_path: Path) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    lock_path = driftlock / "lock.json"
+    lock = json.loads(lock_path.read_text())
+    lock["retry"]["exclude_exceptions"][-1] = "FutureHarborError"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different Harbor job-level settings"):
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+
 def _restamp_build(job: Path, fingerprint: str) -> None:
     """Rewrite a job's recorded build fingerprint in the lock and every trial."""
     lock_path = job / "lock.json"
@@ -1610,8 +1663,8 @@ def test_analyze_accepts_graded_timeout_and_reconstructs_exact_usage(
         # an entirely absent one is read as "no cache hit". See the test below.
         ("bad-cache-type", "cached_tokens"),
         ("negative-cache", "cached_tokens"),
-        # Every other field stays required: absence there is real information
-        # loss, not a provider reporting zero.
+        # Prompt and completion stay required. Cost recovery additionally needs
+        # an audited provider; this fixture deliberately uses unaudited Baidu.
         ("no-prompt", "prompt_tokens"),
         ("no-completion", "completion_tokens"),
         ("no-cost", "cost_usd"),
@@ -1710,6 +1763,215 @@ def test_a_step_that_reports_no_cache_read_is_counted_as_zero_cache(
     assert trial["cache_tokens"] == 12
     assert trial["output_tokens"] == 8
     assert trial["cost_usd"] == 0.375
+
+
+def test_missing_trajectory_cost_is_imputed_and_reported_per_arm(
+    tmp_path: Path,
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path, provider="deepinfra/fp8")
+    result_file = stock / "long-1" / "result.json"
+    _set_graded_timeout(result_file, reward=0.15)
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    payload = json.loads(trajectory.read_text())
+    del payload["steps"][2]["metrics"]["cost_usd"]
+    trajectory.write_text(json.dumps(payload), encoding="utf-8")
+    _job_summary(stock, 2, errors=1)
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    stock_report = report["arms"]["stock"]
+    assert stock_report["cost_usd"] == pytest.approx(0.37500194)
+    assert stock_report["trajectory_reconstructed_usage"] == {
+        "input_tokens": 24,
+        "cache_tokens": 16,
+        "output_tokens": 8,
+        "cost_usd": pytest.approx(0.12500194),
+    }
+    assert stock_report["trajectory_cost_imputation"] == {
+        "step_count": 1,
+        "cost_usd": pytest.approx(0.00000194),
+    }
+    assert report["arms"]["driftlock"]["trajectory_cost_imputation"] == {
+        "step_count": 0,
+        "cost_usd": 0.0,
+    }
+
+
+def test_trajectory_usage_imputes_only_an_absent_cost_from_audited_rates(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "trial" / "result.json"
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir(parents=True)
+    trajectory.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 20,
+                            "cached_tokens": 12,
+                            "completion_tokens": 5,
+                        },
+                    },
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 4,
+                            "cached_tokens": 0,
+                            "completion_tokens": 3,
+                            "cost_usd": 0.25,
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    usage = _trajectory_usage(result_file, provider="deepinfra/fp8")
+
+    assert usage == {
+        "input_tokens": 24,
+        "cache_tokens": 12,
+        "output_tokens": 8,
+        "cost_usd": pytest.approx(0.2500025),
+        "imputed_cost_steps": 1,
+        "imputed_cost_usd": pytest.approx(0.0000025),
+    }
+
+
+def test_trajectory_usage_refuses_to_reuse_pricing_for_a_new_provider(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "trial" / "result.json"
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir(parents=True)
+    trajectory.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "source": "agent",
+                        "metrics": {
+                            "prompt_tokens": 20,
+                            "cached_tokens": 12,
+                            "completion_tokens": 5,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"provider 'future-provider/fp8'.*no audited",
+    ):
+        _trajectory_usage(result_file, provider="future-provider/fp8")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt_tokens", None),
+        ("cached_tokens", None),
+        ("completion_tokens", "3"),
+        ("cost_usd", None),
+    ],
+)
+def test_trajectory_usage_rejects_present_but_unusable_metrics(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    result_file = tmp_path / "trial" / "result.json"
+    trajectory = result_file.parent / "agent" / "trajectory.json"
+    trajectory.parent.mkdir(parents=True)
+    metrics: dict[str, object] = {
+        "prompt_tokens": 20,
+        "cached_tokens": 12,
+        "completion_tokens": 5,
+        "cost_usd": 0.25,
+    }
+    metrics[field] = value
+    trajectory.write_text(
+        json.dumps({"steps": [{"source": "agent", "metrics": metrics}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        _trajectory_usage(result_file, provider="deepinfra/fp8")
+
+
+def test_trajectory_usage_rejects_a_materially_truncated_episode_segment(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "trial" / "result.json"
+    agent_dir = result_file.parent / "agent"
+    agent_dir.mkdir(parents=True)
+    for number in range(46):
+        (agent_dir / f"episode-{number}").mkdir()
+    steps = [
+        {
+            "source": "agent",
+            "metrics": {
+                "prompt_tokens": 1,
+                "cached_tokens": 0,
+                "completion_tokens": 1,
+                "cost_usd": 0.000001,
+            },
+        }
+        for _ in range(11)
+    ]
+    (agent_dir / "trajectory.json").write_text(
+        json.dumps({"steps": steps}), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"contains 11 agent steps for 46 provider-call episode directories",
+    ):
+        _trajectory_usage(result_file, provider="deepinfra/fp8")
+
+
+def test_trajectory_usage_accepts_round_five_complete_episode_coverage(
+    tmp_path: Path,
+) -> None:
+    result_file = tmp_path / "trial" / "result.json"
+    agent_dir = result_file.parent / "agent"
+    agent_dir.mkdir(parents=True)
+    for number in range(50):
+        (agent_dir / f"episode-{number}").mkdir()
+    steps = [
+        {
+            "source": "agent",
+            "metrics": {
+                "prompt_tokens": 2,
+                "cached_tokens": 1,
+                "completion_tokens": 1,
+                "cost_usd": 0.01,
+            },
+        }
+        for _ in range(49)
+    ]
+    (agent_dir / "trajectory.json").write_text(
+        json.dumps({"steps": steps}), encoding="utf-8"
+    )
+
+    usage = _trajectory_usage(result_file, provider="deepinfra/fp8")
+
+    assert usage == {
+        "input_tokens": 98,
+        "cache_tokens": 49,
+        "output_tokens": 49,
+        "cost_usd": pytest.approx(0.49),
+        "imputed_cost_steps": 0,
+        "imputed_cost_usd": 0.0,
+    }
 
 
 def test_analyze_rejects_non_timeout_exception_by_type(tmp_path: Path) -> None:
@@ -1833,6 +2095,73 @@ def test_analyze_reports_validated_driftlock_status(tmp_path: Path) -> None:
     )
     assert trial["driftlock_run_statuses"] == ("completed",)
     assert trial["judge_reliability"] == "reliable"
+
+
+@pytest.mark.parametrize(
+    ("status", "termination_reason"),
+    [
+        ("completed", "confirmed_task_complete"),
+        ("completed", "max_turns"),
+        ("completed", "driftlock_output_length_boundary"),
+        ("step_limit", "driftlock_step_limit"),
+        ("token_limit", "driftlock_token_limit"),
+        ("rollback_limit", "driftlock_rollback_limit"),
+    ],
+)
+def test_analyze_accepts_producer_status_termination_pairings(
+    tmp_path: Path, status: str, termination_reason: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"]["metadata"] = {
+        "driftlock": {"status": status},
+        "termination_reason": termination_reason,
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = analyze_jobs(
+        lhtb_dir=lhtb,
+        arm_directories={"stock": stock, "driftlock": driftlock},
+    )
+
+    trial = next(
+        trial
+        for trial in report["arms"]["driftlock"]["trials"]
+        if trial["task"] == "long-horizon-terminal-bench/long"
+    )
+    assert trial["driftlock_run_statuses"] == (status,)
+
+
+@pytest.mark.parametrize(
+    ("status", "termination_reason"),
+    [
+        ("completed", "future_harbor_reason"),
+        ("rollback_limit", "max_turns"),
+        ("token_limit", "confirmed_task_complete"),
+    ],
+)
+def test_analyze_rejects_unknown_or_contradictory_status_termination_pairings(
+    tmp_path: Path, status: str, termination_reason: str
+) -> None:
+    lhtb, stock, driftlock = _complete_jobs(tmp_path)
+    payload_path = driftlock / "long-1" / "result.json"
+    payload = json.loads(payload_path.read_text())
+    payload["agent_result"]["metadata"] = {
+        "driftlock": {"status": status},
+        "termination_reason": termination_reason,
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        analyze_jobs(
+            lhtb_dir=lhtb,
+            arm_directories={"stock": stock, "driftlock": driftlock},
+        )
+
+    message = str(caught.value)
+    assert repr(status) in message
+    assert repr(termination_reason) in message
 
 
 @pytest.mark.parametrize(
