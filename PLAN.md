@@ -1,6 +1,6 @@
 # driftlock — Project Plan
 
-> A self-evolving long-horizon coding agent whose learning signal is its own rollbacks.
+> A self-evolving long-horizon coding agent that learns from its own scored checkpoints.
 > This is the working plan and gets updated as the project moves. For the
 > public-facing introduction, see `README.md`.
 
@@ -576,8 +576,8 @@ precise rollback to the last healthy point, not a blind restart. Which means the
 judge's quality is the project's quality, and which is why the compute-matched control
 arm is non-negotiable.
 
-> *"How is rollback-grounded distillation different from just showing the model the
-> failed trajectory?"*
+> *"How is checkpoint-localized distillation different from just showing the model
+> the failed trajectory?"*
 
 **Localization.** The whole-trajectory arm exists precisely to answer this, and if it
 wins, that gets published as the result.
@@ -784,10 +784,12 @@ the results section stays empty, per §1.
 
 ## 8. Deliverables
 
-1. **Open-source agent + library** — a terminal coding agent with checkpoint,
-   rollback, and rollback-grounded skill distillation, pip-installable, documented,
-   with a one-command reproduction script. The rollback layer stays usable
-   standalone around someone else's loop.
+1. **Open-source agent + library** — a terminal coding agent with checkpointing,
+   free checkpoint scoring, progress-aware rollback, and checkpoint-localized skill
+   distillation, pip-installable, documented, with a one-command reproduction script.
+   The rollback and scoring layers stay usable standalone around someone else's loop;
+   scoring in particular is useful to anyone who wants to know what an agent's work was
+   worth at each point rather than only at the end.
 2. **Technical blog post** — the drift curves, the transfer results, the candidate
    pass rate against 14.2%, failure-case analysis, and the design tradeoffs behind
    the judge.

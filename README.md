@@ -160,9 +160,9 @@ field measures at a 14.2% candidate pass rate.
 
 ## Planned deliverables
 
-1. This project — a terminal coding agent with checkpointing, progress-aware rollback,
-   and rollback-grounded skill distillation. The rollback layer stays usable
-   standalone around someone else's agent loop.
+1. This project — a terminal coding agent with checkpointing, free checkpoint scoring,
+   progress-aware rollback, and checkpoint-localized skill distillation. The rollback and
+   scoring layers stay usable standalone around someone else's agent loop.
 2. A technical writeup: the drift curves, the transfer results, the candidate pass
    rate against the 14.2% reference, failure-case analysis, and the judge design
    tradeoffs
