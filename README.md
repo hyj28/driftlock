@@ -429,6 +429,24 @@ must replay retained candidate checkpoints in isolated copies against the hidden
 verifier, then choose with hindsight; the CLI rejects attempts to label an ordinary
 agent config as that upper bound.
 
+Retained checkpoints can also be measured as a scored timeline without creating an
+oracle analysis arm or calling a model:
+
+```bash
+driftlock-lhtb score-checkpoints \
+  --lhtb-dir /srv/LHTB \
+  --source-job-dir /srv/LHTB/jobs/round-five-driftlock \
+  --output-dir /srv/LHTB/jobs/round-five-checkpoint-scores
+```
+
+Each checkpoint is restored into a fresh task environment and graded by the task's
+ordinary hidden verifier. The resulting `checkpoint-scores.json` records phase,
+step, checkpoint reward, the source trial's job-level final reward, and computable
+best-versus-final headroom. It is written after every score; reruns reuse completed
+entries. The replay agent reports zero provider tokens and needs no provider
+credential. Use `--dry-run` to enumerate retained and missing checkpoint timelines
+without Docker.
+
 Development uses Python 3.11+ and `uv`:
 
 ```bash

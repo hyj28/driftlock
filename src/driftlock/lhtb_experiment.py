@@ -20,6 +20,15 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
+from driftlock.checkpoint_scoring import (
+    SCORE_REPORT_NAME,
+    assemble_scored_timelines,
+    build_checkpoint_replay_config,
+    enumerate_retained_checkpoints,
+    load_completed_scores,
+    single_job_reward,
+    write_score_report,
+)
 from driftlock.judges import DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
 from driftlock.lhtb import (
     DRIFTLOCK_HARBOR_PATCH_VERSION,
@@ -931,6 +940,124 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if completed.returncode != 0:
                     return completed.returncode
             return 0
+        if args.command in {"score-checkpoints", "checkpoint-score"}:
+            plan = enumerate_retained_checkpoints(args.source_job_dir)
+            destination = args.output_dir.expanduser().resolve()
+            if destination == plan.source_job_dir or (
+                plan.source_job_dir in destination.parents
+            ):
+                raise ValueError(
+                    "checkpoint score output must be outside the source job"
+                )
+            print(
+                f"{len(plan.checkpoints)} checkpoint replays planned across "
+                f"{sum(bool(trial.checkpoints) for trial in plan.trials)} trials"
+            )
+            for trial in plan.trials:
+                if not trial.checkpoints:
+                    print(f"  {trial.trial_name}: no retained checkpoints")
+                    continue
+                points = [
+                    f"phase {checkpoint.phase} step {checkpoint.step}"
+                    for checkpoint in trial.checkpoints
+                ]
+                print(f"  {trial.trial_name}: " + ", ".join(points))
+            if args.dry_run:
+                return 0
+
+            preflight(
+                args.lhtb_dir,
+                credential_env=DEFAULT_CREDENTIAL_ENV,
+                require_credential=False,
+            )
+            configs_dir = destination / "configs"
+            jobs_dir = destination / "jobs"
+            configs_dir.mkdir(parents=True, exist_ok=True)
+            jobs_dir.mkdir(parents=True, exist_ok=True)
+            report_path = destination / SCORE_REPORT_NAME
+            scores = load_completed_scores(report_path, plan)
+            write_score_report(report_path, plan, scores)
+            harbor_command = _pinned_harbor_command()
+            child_env = os.environ.copy()
+            child_env.pop("HB_PROCESS_REWARD", None)
+            child_env["HB_CONTINUE_MODE"] = "same_conversation"
+            failed = False
+            for index, replay in enumerate(plan.checkpoints, 1):
+                if replay.candidate_id in scores:
+                    print(
+                        f"[{index}/{len(plan.checkpoints)}] {replay.trial_name} "
+                        f"phase {replay.phase} step {replay.step}: "
+                        f"already scored ({scores[replay.candidate_id]:.6g})"
+                    )
+                    continue
+                replay_job_dir = jobs_dir / replay.job_name
+                if (replay_job_dir / "result.json").is_file():
+                    reward = single_job_reward(replay_job_dir)
+                    if reward is not None:
+                        scores[replay.candidate_id] = reward
+                        write_score_report(report_path, plan, scores)
+                        print(
+                            f"[{index}/{len(plan.checkpoints)}] "
+                            f"{replay.trial_name} phase {replay.phase} "
+                            f"step {replay.step}: recovered {reward:.6g}"
+                        )
+                        continue
+                config = build_checkpoint_replay_config(
+                    lhtb_dir=args.lhtb_dir,
+                    jobs_dir=jobs_dir,
+                    replay=replay,
+                    timeout_sec=args.timeout_sec,
+                )
+                config_path = configs_dir / f"{replay.candidate_id}.json"
+                config_path.write_text(
+                    json.dumps(config, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                print(
+                    f"[{index}/{len(plan.checkpoints)}] {replay.trial_name} "
+                    f"phase {replay.phase} step {replay.step}: running"
+                )
+                completed = subprocess.run(
+                    [*harbor_command, "run", "-c", str(config_path)],
+                    cwd=args.lhtb_dir.expanduser().resolve(),
+                    check=False,
+                    env=child_env,
+                )
+                reward = (
+                    single_job_reward(replay_job_dir)
+                    if (replay_job_dir / "result.json").is_file()
+                    else None
+                )
+                if reward is not None:
+                    scores[replay.candidate_id] = reward
+                    write_score_report(report_path, plan, scores)
+                    print(f"  reward {reward:.6g}")
+                    continue
+                if completed.returncode != 0:
+                    failed = True
+                    print(f"  replay failed with exit code {completed.returncode}")
+                    continue
+                failed = True
+                print("  replay completed without a job-level reward")
+
+            report = assemble_scored_timelines(plan, scores)
+            for trial in report["trials"]:
+                best = trial["best_checkpoint_reward"]
+                final = trial["final_reward"]
+                if best is None:
+                    print(f"  {trial['trial_name']}: no checkpoint scored")
+                elif final is None:
+                    print(
+                        f"  {trial['trial_name']}: best checkpoint {best:.6g}; "
+                        "final reward unknown"
+                    )
+                else:
+                    print(
+                        f"  {trial['trial_name']}: best checkpoint {best:.6g} "
+                        f"vs final {final:.6g}; headroom {trial['headroom']:+.6g}"
+                    )
+            print(f"wrote {report_path}")
+            return 1 if failed else 0
         if args.command == "select":
             report = select_tasks(
                 args.job_dirs,
@@ -1001,6 +1128,16 @@ def _parser() -> argparse.ArgumentParser:
         oracle.add_argument("--source-job-dir", type=Path, required=True)
         oracle.add_argument("--output-dir", type=Path, required=True)
         oracle.add_argument("--timeout-sec", type=int, default=900)
+    scoring = sub.add_parser(
+        "score-checkpoints",
+        aliases=["checkpoint-score"],
+        help="score retained checkpoints with fresh hidden-verifier jobs",
+    )
+    scoring.add_argument("--lhtb-dir", type=Path, default=Path.cwd())
+    scoring.add_argument("--source-job-dir", type=Path, required=True)
+    scoring.add_argument("--output-dir", type=Path, required=True)
+    scoring.add_argument("--timeout-sec", type=int, default=900)
+    scoring.add_argument("--dry-run", action="store_true")
     choose = sub.add_parser("select", help="select tasks by measured partial credit")
     choose.add_argument("job_dirs", nargs="+", type=Path)
     choose.add_argument("--limit", type=int, default=12)
