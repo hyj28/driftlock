@@ -234,7 +234,7 @@ SWE-bench Verified containers. It implements all five levers:
 
 | Lever | Mechanism | Status |
 | --- | --- | --- |
-| **write** | Rollback-grounded skill distillation into a persistent library | To build |
+| **write** | Checkpoint-localized skill distillation into a persistent library | To build |
 | **select** | Embedding retrieval over `activation` conditions + a router that injects the top-k skills | To build |
 | **compress** | Context editing / summarization at checkpoint boundaries | To build |
 | **isolate** | Read-only subagents (read, grep, run tests; never write) returning 1–2k token condensed summaries | To build |
@@ -649,7 +649,7 @@ GEPA / Anchor Skill numbers are directly citable as reference points.
 | --- | --- |
 | 1. No skills | Reference point |
 | 2. **Whole-trajectory distillation** | The field's standard grounding (ReasoningBank-style) — **the arm that decides whether localization matters** |
-| 3. **Rollback-grounded distillation** | The transfer claim |
+| 3. **Checkpoint-localized distillation** | The transfer claim |
 | 4. **Human-curated skills** | Upper bound, mirroring EvoAgentBench's Anchor Skill (+7.5 to +10.5) — turns "better than nothing" into "closes N% of the field's standing gap" |
 
 Evolution: 2 distillation arms × 3 rounds × 30 runs (20 train + 10 validation) = 180
