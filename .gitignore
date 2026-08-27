@@ -30,3 +30,8 @@ results/raw/
 
 # Local-only operational notes (never published)
 ops/
+
+# coverage artifacts
+.coverage
+.coverage.*
+htmlcov/

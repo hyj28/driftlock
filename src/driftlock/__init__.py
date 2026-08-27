@@ -65,6 +65,22 @@ from driftlock.models import (
 )
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
 from driftlock.runner import DriftlockRunner, RunnerConfig
+from driftlock.skill_distillation import (
+    EVIDENCE_END,
+    EVIDENCE_START,
+    CallableSkillDistiller,
+    EvidenceAssemblyError,
+    Skill,
+    SkillDistillationResult,
+    SkillDistillationStatus,
+    SkillValidationError,
+    assemble_baseline_evidence,
+    assemble_localized_evidence,
+    build_distillation_prompt,
+    parse_skill,
+    serialize_skill,
+    validate_skill,
+)
 from driftlock.terminus import (
     Terminus2StateBridge,
     TerminusBoundary,
@@ -78,6 +94,8 @@ from driftlock.terminus import (
 __all__ = [
     "DEFAULT_JUDGE_MAX_OUTPUT_TOKENS",
     "DRIFTLOCK_HARBOR_PATCH_VERSION",
+    "EVIDENCE_END",
+    "EVIDENCE_START",
     "LHTB_LITELLM_VERSION",
     "LHTB_REPOSITORY_REVISION",
     "AgentCompletion",
@@ -87,6 +105,7 @@ __all__ = [
     "AgentProviderError",
     "AgentStateError",
     "CallableLLMJudge",
+    "CallableSkillDistiller",
     "Checkpoint",
     "DirectoryCheckpointStore",
     "DriftContext",
@@ -94,6 +113,7 @@ __all__ = [
     "DriftTriggerOutcome",
     "DriftTriggerRecord",
     "DriftlockRunner",
+    "EvidenceAssemblyError",
     "FineJudgeStatus",
     "HarborWorkspaceDeltaObserver",
     "HeuristicConfig",
@@ -112,6 +132,10 @@ __all__ = [
     "RunResult",
     "RunStatus",
     "RunnerConfig",
+    "Skill",
+    "SkillDistillationResult",
+    "SkillDistillationStatus",
+    "SkillValidationError",
     "SnapshotIntegrityError",
     "StepContext",
     "StepOutcome",
@@ -131,6 +155,9 @@ __all__ = [
     "WorkspaceDeltaObserver",
     "WorkspaceSnapshot",
     "analyze_jobs",
+    "assemble_baseline_evidence",
+    "assemble_localized_evidence",
+    "build_distillation_prompt",
     "classify_judge_reliability",
     "conservative_prefill_estimate",
     "goal_drift_actions",
@@ -140,4 +167,7 @@ __all__ = [
     "lhtb_experiment_fingerprint",
     "lhtb_harbor_patch_path",
     "merge_signal_counts",
+    "parse_skill",
+    "serialize_skill",
+    "validate_skill",
 ]

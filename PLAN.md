@@ -168,13 +168,15 @@ killed the checkpoint-carrying arms on `riscv-core-debug` in three consecutive r
 The failure mode of these agents is running out of capability, not losing the plot. They
 climb slowly and exhaust the ninety-minute cap; they do not walk into a dead end.
 
-**Boundaries, stated rather than buried.** The replays cover phase 0 only — everything
-before the first verifier rejection — because that is what round five retained. `2048`
-and `sudoku-recovery` score a replayed move log or a final state, so an intermediate
-snapshot scores zero by construction and cannot be compared against a final; they are not
-evidence in either direction. That leaves four informative tasks, of which one shows
-headroom. Each checkpoint was scored once. This is a result about this model, these
-tasks, and this scale. It is not a claim that rollback does not work.
+**Boundaries, stated rather than buried.** The replays cover only the phase whose
+cleanup was interrupted, because that is what round five happened to retain. That is
+phase 0 for the single-phase trials and a later phase for the multi-phase trials, not a
+complete history of any multi-phase attempt. `2048` and `sudoku-recovery` score a
+replayed move log or a final state, so an intermediate snapshot scores zero by
+construction and cannot be compared against a final; they are not evidence in either
+direction. That leaves four informative tasks, of which one shows headroom. Each
+checkpoint was scored once. This is a result about this model, these tasks, and this
+scale. It is not a claim that rollback does not work.
 
 **What this is.** The rollback layer was specified, built, instrumented and measured, and
 the measurement returned a small effect with a well-understood reason. That is a
@@ -778,7 +780,8 @@ the results section stays empty, per §1.
 | 12 | **The corroborating gate is fitted on 3 tasks** — `no_file_change` was demoted on one diagnostic run: 109 solo firings, 109 rejected, 2 rollbacks total (§3.2). The tasks were chosen for their spread on the week-1 screen, not sampled, and a task where the agent genuinely stalls *without* looping would now be missed | Missed intervention; a knob fitted on the data it is judged by | The miss is in the safe direction — a gated detector makes the driftlock arm behave more like the no-intervention arm, which can only understate the effect. Suppressed triggers keep being recorded, so the held-out week-9 run re-measures the gate on tasks it was not fitted on: if solo `no_file_change` ever precedes a genuine stall there, the demotion is wrong and the record shows it |
 | 13 | **Output-ceiling truncation** — the checkpoint boundary constraint roughly doubles median response length, so the driftlock arms hit the 8,192-token ceiling on 5–6% of calls where stock never does (§3.2.1) | Wasted steps; a confound in `stock` vs `driftlock` | A truncated batch is no longer fatal (patch v11) — it returns to the model as feedback and costs one step. The confound is structural, not fixable: `retry` is the arm that isolates rollback from the constraint |
 | 14 | **The scored timeline may not distil better than a whole trajectory** — §2.3a retired the rollback signal and replaced it with checkpoint scoring, and that substitution is now the project's central bet. It is argued, not measured: a flat segment provably bought nothing, but nothing yet shows a distiller does more with that than with the full trajectory the field already feeds it | The transfer claim fails and the project has no positive result | The two distillation arms differ in exactly this and nothing else (§3.3), so the comparison isolates it. Scoring checkpoints is free, so the signal can be produced for every training task rather than sampled. If it does not beat the baseline, that is the second honest negative result and the write-up carries both |
-| 15 | **Checkpoint scoring covers phase 0 only** — round five retained checkpoints only for the first phase, so every §2.3a number describes behaviour before the first verifier rejection. A distiller trained on phase-0 segments may miss the failures that matter later | Skills fitted to the easy half of a trial | Retention is a per-run flag; set it for the training split so later phases are covered too. The cost is disk, not tokens |
+| 15 | **Checkpoint scoring covers only the interrupted phase** — round five retained whichever phase cleanup did not finish, which is phase 0 for a one-phase trial and a later phase for a multi-phase trial. The retained timeline therefore does not cover every phase of a trial | Skills fitted to one phase rather than the whole attempt | Retention is a per-run flag; request it for the training split so every phase needed by localization survives. The cost is disk, not tokens |
+| 16 | **Checkpoint retention is currently an interruption side-effect** — the scored inputs survived because cleanup did not run, not because retention was requested. Fixing interrupted cleanup would silently remove the skill layer's checkpoint archives | Skill distillation loses its workspace-diff input while ordinary trial results still look valid | Make retention explicit for skill-producing runs and keep an integration check that every localized endpoint resolves to its requested archive before distillation |
 
 ---
 
