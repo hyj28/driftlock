@@ -65,6 +65,18 @@ from driftlock.models import (
 )
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
 from driftlock.runner import DriftlockRunner, RunnerConfig
+from driftlock.skill_admission import (
+    ADMISSION_RULE_ID,
+    DISTILLATION_ARMS,
+    NULL_ADMISSION_PROBABILITY_UPPER_BOUND,
+    VALIDATION_TASK_COUNT,
+    SkillAdmissionCandidate,
+    SkillAdmissionStatus,
+    SkillLibrary,
+    assemble_admission_report,
+    decide_skill_admission,
+    render_admission_report,
+)
 from driftlock.skill_distillation import (
     EVIDENCE_END,
     EVIDENCE_START,
@@ -92,12 +104,16 @@ from driftlock.terminus import (
 )
 
 __all__ = [
+    "ADMISSION_RULE_ID",
     "DEFAULT_JUDGE_MAX_OUTPUT_TOKENS",
+    "DISTILLATION_ARMS",
     "DRIFTLOCK_HARBOR_PATCH_VERSION",
     "EVIDENCE_END",
     "EVIDENCE_START",
     "LHTB_LITELLM_VERSION",
     "LHTB_REPOSITORY_REVISION",
+    "NULL_ADMISSION_PROBABILITY_UPPER_BOUND",
+    "VALIDATION_TASK_COUNT",
     "AgentCompletion",
     "AgentCompletionRequest",
     "AgentConversationCodec",
@@ -133,8 +149,11 @@ __all__ = [
     "RunStatus",
     "RunnerConfig",
     "Skill",
+    "SkillAdmissionCandidate",
+    "SkillAdmissionStatus",
     "SkillDistillationResult",
     "SkillDistillationStatus",
+    "SkillLibrary",
     "SkillValidationError",
     "SnapshotIntegrityError",
     "StepContext",
@@ -155,11 +174,13 @@ __all__ = [
     "WorkspaceDeltaObserver",
     "WorkspaceSnapshot",
     "analyze_jobs",
+    "assemble_admission_report",
     "assemble_baseline_evidence",
     "assemble_localized_evidence",
     "build_distillation_prompt",
     "classify_judge_reliability",
     "conservative_prefill_estimate",
+    "decide_skill_admission",
     "goal_drift_actions",
     "goal_drift_inaction",
     "judge_input_token_bound",
@@ -168,6 +189,7 @@ __all__ = [
     "lhtb_harbor_patch_path",
     "merge_signal_counts",
     "parse_skill",
+    "render_admission_report",
     "serialize_skill",
     "validate_skill",
 ]

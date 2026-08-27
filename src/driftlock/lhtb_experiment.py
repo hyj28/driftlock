@@ -57,6 +57,13 @@ from driftlock.oracle import (
     load_source_trial_provenance,
     validate_checkpoint_source_audit,
 )
+from driftlock.skill_admission import (
+    ADMISSION_REPORT_NAME,
+    SkillLibrary,
+    load_admission_candidates,
+    render_admission_report,
+    write_admission_report,
+)
 
 # Both identifiers carry an explicit dated build. An unversioned alias such as
 # "deepseek-v4-pro" silently follows whatever OpenRouter currently points it at,
@@ -1094,6 +1101,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             print(f"wrote {output}")
             return 0
+        if args.command == "admit-skills":
+            candidates = load_admission_candidates(args.validation_results)
+            library = SkillLibrary(args.library_dir)
+            report = library.submit_cohort(candidates)
+            output = args.output.expanduser().resolve()
+            write_admission_report(output, report)
+            print(render_admission_report(report))
+            print(f"wrote {output}")
+            return 0
         if args.command == "select":
             report = select_tasks(
                 args.job_dirs,
@@ -1182,6 +1198,13 @@ def _parser() -> argparse.ArgumentParser:
     localization.add_argument(
         "--output", type=Path, default=Path(LOCALIZATION_REPORT_NAME)
     )
+    admission = sub.add_parser(
+        "admit-skills",
+        help="apply the paired validation rule and update a skill library",
+    )
+    admission.add_argument("validation_results", type=Path)
+    admission.add_argument("--library-dir", type=Path, required=True)
+    admission.add_argument("--output", type=Path, default=Path(ADMISSION_REPORT_NAME))
     choose = sub.add_parser("select", help="select tasks by measured partial credit")
     choose.add_argument("job_dirs", nargs="+", type=Path)
     choose.add_argument("--limit", type=int, default=12)
