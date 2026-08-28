@@ -400,6 +400,27 @@ class SkillLibrary:
             ) from None
         return parse_skill(document)
 
+    def candidate_ids(self) -> tuple[str, ...]:
+        """List recorded candidates in deterministic identifier order."""
+
+        candidate_ids = []
+        for entry in self.entries.iterdir():
+            if not entry.is_dir() or entry.name.startswith(".tmp-"):
+                continue
+            _validate_candidate_id(entry.name)
+            candidate_ids.append(entry.name)
+        return tuple(sorted(candidate_ids))
+
+    def admitted_skill_ids(self) -> tuple[str, ...]:
+        """List admitted candidates through their canonical decision records."""
+
+        return tuple(
+            candidate_id
+            for candidate_id in self.candidate_ids()
+            if self.read_decision(candidate_id).get("status")
+            == SkillAdmissionStatus.ADMITTED.value
+        )
+
     def read_decision(self, candidate_id: str) -> dict[str, Any]:
         """Read the recorded admission or refusal reason."""
 

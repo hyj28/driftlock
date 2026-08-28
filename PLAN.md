@@ -549,8 +549,11 @@ observed that curated checklists spontaneously evolve toward compositional,
 preventative logic. A flat scored segment produces that form natively — it names a
 stretch of work that provably bought nothing — so we start where they ended up.
 
-Retrieval uses a local sentence-transformers model on the cloud box: **zero API cost**,
-outside the token budget.
+The library takes an injected embedding callable and has no model SDK dependency.  The
+experiment host must deliberately install and pin the concrete local
+sentence-transformers model, adapt it to that callable, and record its model revision.
+That host-local embedding remains **zero API cost**, outside the token budget; installing
+it is an explicit experiment-setup step rather than an implicit library dependency.
 
 ### 3.4 Skill admission: validation-filtered, never automatic
 
