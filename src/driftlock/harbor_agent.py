@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from importlib import import_module
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,12 @@ from driftlock.oracle import (
 )
 from driftlock.remote import RemoteArchiveCheckpointStore
 from driftlock.runner import DriftlockRunner, RunnerConfig
+from driftlock.skill_admission import DISTILLATION_ARMS, SkillLibrary
+from driftlock.skill_injection import (
+    SkillRetrievalFailed,
+    TaskSkillInjector,
+)
+from driftlock.skill_retrieval import ActivationSkillRetriever
 from driftlock.terminus import TerminusConversationCodec, TerminusStepAdapter
 
 # The fine judge must not be the same model as the agent. Its job is to notice
@@ -75,6 +82,59 @@ _JUDGE_PROVIDER_PRICING = {
         output_cost_per_token=0.000003485,
     )
 }
+
+
+def _build_task_skill_injector(
+    *,
+    library_dir: str | None,
+    embedder: Callable[[Sequence[str]], Any] | None,
+    embedder_import_path: str | None,
+    distillation_arm: str | None,
+) -> TaskSkillInjector | None:
+    configured = (
+        library_dir is not None,
+        embedder is not None,
+        embedder_import_path is not None,
+        distillation_arm is not None,
+    )
+    if not any(configured):
+        return None
+    if library_dir is None:
+        raise ValueError("skill configuration requires driftlock_skill_library_dir")
+    if distillation_arm not in DISTILLATION_ARMS:
+        raise ValueError(
+            "configured skill library requires driftlock_skill_distillation_arm "
+            "to be one of " + ", ".join(DISTILLATION_ARMS)
+        )
+    if (embedder is None) == (embedder_import_path is None):
+        raise ValueError(
+            "configured skill library requires exactly one of "
+            "driftlock_skill_embedder and driftlock_skill_embedder_import_path"
+        )
+    resolved_embedder = (
+        embedder
+        if embedder is not None
+        else _load_skill_embedder(embedder_import_path or "")
+    )
+    retriever = ActivationSkillRetriever(SkillLibrary(library_dir), resolved_embedder)
+    return TaskSkillInjector(retriever, distillation_arm)
+
+
+def _load_skill_embedder(import_path: str) -> Callable[[Sequence[str]], Any]:
+    module_name, separator, attribute = import_path.partition(":")
+    if not separator or not module_name or not attribute or ":" in attribute:
+        raise ValueError(
+            "driftlock_skill_embedder_import_path must have form module:callable"
+        )
+    try:
+        value = getattr(import_module(module_name), attribute)
+    except (ImportError, AttributeError) as error:
+        raise ValueError(
+            f"could not import skill embedder {import_path!r}: {error}"
+        ) from error
+    if not callable(value):
+        raise ValueError(f"skill embedder {import_path!r} is not callable")
+    return value
 
 
 class LHTBCheckpointReplayOracle(BaseAgent):
@@ -314,6 +374,10 @@ class LHTBDriftlockAgent(Terminus2):
         driftlock_judge_max_output_tokens: int = DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
         driftlock_judge_timeout_sec: float = 120.0,
         driftlock_judge_llm_call_kwargs: dict[str, Any] | None = None,
+        driftlock_skill_library_dir: str | None = None,
+        driftlock_skill_embedder: Callable[[Sequence[str]], Any] | None = None,
+        driftlock_skill_embedder_import_path: str | None = None,
+        driftlock_skill_distillation_arm: str | None = None,
         **kwargs: Any,
     ) -> None:
         if enable_summarize:
@@ -360,6 +424,12 @@ class LHTBDriftlockAgent(Terminus2):
         )
         self._driftlock_plan = driftlock_plan
         self._driftlock_retain_checkpoints = driftlock_retain_checkpoints
+        self._driftlock_skill_injector = _build_task_skill_injector(
+            library_dir=driftlock_skill_library_dir,
+            embedder=driftlock_skill_embedder,
+            embedder_import_path=driftlock_skill_embedder_import_path,
+            distillation_arm=driftlock_skill_distillation_arm,
+        )
         self._driftlock_runtime: LHTBTerminusRuntime | None = None
         self._driftlock_step: TerminusStepAdapter | None = None
         self._driftlock_environment: Any | None = None
@@ -370,6 +440,7 @@ class LHTBDriftlockAgent(Terminus2):
         self._driftlock_accounting = _AccountingSnapshot()
         self._driftlock_phases: list[dict[str, Any]] = []
         self._driftlock_tokens_consumed = 0
+        self._driftlock_task_instruction: str | None = None
 
     @staticmethod
     def name() -> str:
@@ -384,6 +455,7 @@ class LHTBDriftlockAgent(Terminus2):
         )
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        self._driftlock_task_instruction = instruction
         await self._run_driftlock_phase(
             instruction=instruction,
             environment=environment,
@@ -412,7 +484,7 @@ class LHTBDriftlockAgent(Terminus2):
             ),
         )
         await self._run_driftlock_phase(
-            instruction=self._original_instruction,
+            instruction=self._task_instruction(),
             environment=self._driftlock_environment,
             context=context,
             initial_state=codec.encode(continued),
@@ -426,6 +498,9 @@ class LHTBDriftlockAgent(Terminus2):
         context: Any,
         initial_state: dict[str, Any] | None,
     ) -> None:
+        instruction, initial_state = self._skill_aware_phase_entry(
+            instruction, initial_state, context
+        )
         self._ensure_runtime(environment, context)
         assert self._driftlock_runtime is not None
         assert self._driftlock_store_root is not None
@@ -509,6 +584,60 @@ class LHTBDriftlockAgent(Terminus2):
     def _retain_phase_checkpoints(self, phase: int) -> bool:
         del phase
         return self._driftlock_retain_checkpoints
+
+    def _task_instruction(self) -> str:
+        instruction = getattr(self, "_driftlock_task_instruction", None)
+        if (
+            instruction is None
+            and getattr(self, "_driftlock_skill_injector", None) is None
+        ):
+            instruction = getattr(self, "_original_instruction", None)
+        if instruction is None:
+            raise RuntimeError("cannot resume before the task instruction is recorded")
+        return instruction
+
+    def _skill_aware_phase_entry(
+        self,
+        instruction: str,
+        initial_state: dict[str, Any] | None,
+        context: Any,
+    ) -> tuple[str, dict[str, Any] | None]:
+        injector = getattr(self, "_driftlock_skill_injector", None)
+        if injector is None:
+            return instruction, initial_state
+
+        query = self._task_instruction()
+        result = injector.retrieve_for_task(query)
+        self._record_skill_layer(context)
+        if result.status.value == "failed":
+            metadata = dict(context.metadata or {})
+            metadata["termination_reason"] = "driftlock_skill_retrieval_failed"
+            context.metadata = metadata
+            self._write_trial_record()
+            refusal = result.refusal or {}
+            reason = refusal.get("reason", "unknown_retrieval_failure")
+            raise SkillRetrievalFailed(f"skill retrieval failed: {reason}")
+
+        phase_instruction = injector.inject_phase_entry(instruction)
+        if initial_state is None:
+            return phase_instruction, None
+        codec = TerminusConversationCodec()
+        state = codec.decode(initial_state)
+        if state is None:
+            return phase_instruction, initial_state
+        continued = replace(
+            state,
+            next_prompt=injector.inject_phase_entry(state.next_prompt),
+        )
+        return phase_instruction, codec.encode(continued)
+
+    def _record_skill_layer(self, context: Any) -> None:
+        injector = getattr(self, "_driftlock_skill_injector", None)
+        if injector is None:
+            return
+        metadata = dict(context.metadata or {})
+        metadata["driftlock_skill_layer"] = injector.to_report()
+        context.metadata = metadata
 
     def _ensure_runtime(self, environment: Any, context: Any) -> None:
         if self._driftlock_runtime is not None:
@@ -609,10 +738,20 @@ class LHTBDriftlockAgent(Terminus2):
                     "rate_limited_calls": self._driftlock_rate_limited_calls(),
                 }
             )
+        injector = getattr(self, "_driftlock_skill_injector", None)
+        if injector is not None:
+            record["skill_injection"] = injector.phase_report()
         self._driftlock_phases.append(record)
+        self._write_trial_record()
+
+    def _write_trial_record(self) -> None:
+        payload: dict[str, Any] = {"phases": self._driftlock_phases}
+        injector = getattr(self, "_driftlock_skill_injector", None)
+        if injector is not None:
+            payload["skill_layer"] = injector.to_report()
         output = Path(self.logs_dir) / "driftlock-result.json"
         output.write_text(
-            json.dumps({"phases": self._driftlock_phases}, indent=2) + "\n",
+            json.dumps(payload, indent=2) + "\n",
             encoding="utf-8",
         )
 
@@ -682,7 +821,7 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
             and self._driftlock_tokens_consumed >= configured_budget
         ):
             await self._run_driftlock_phase(
-                instruction=self._original_instruction,
+                instruction=self._task_instruction(),
                 environment=self._driftlock_environment,
                 context=context,
                 initial_state=TerminusConversationCodec().initial_state(),
@@ -722,7 +861,7 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
         try:
             initial_state = await store.restore(checkpoint)
             await self._run_driftlock_phase(
-                instruction=self._original_instruction,
+                instruction=self._task_instruction(),
                 environment=self._driftlock_environment,
                 context=context,
                 initial_state=initial_state,
