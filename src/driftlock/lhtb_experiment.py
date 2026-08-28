@@ -74,7 +74,17 @@ DEFAULT_PROVIDER = "deepinfra/fp8"
 DEFAULT_JUDGE_MODEL = "openrouter/deepseek/deepseek-v4-pro-0813"
 DEFAULT_JUDGE_PROVIDER = "alibaba"
 # Arms that pay for a fine judge, and therefore need its provider probed too.
-_FINE_JUDGE_ARMS = frozenset({"driftlock", "native-driftlock"})
+_SKILL_DISTILLATION_ARM_BY_RUNNABLE_ARM = {
+    "skill-baseline": "baseline",
+    "skill-localized": "localized",
+}
+_FINE_JUDGE_ARMS = frozenset(
+    {
+        "driftlock",
+        "native-driftlock",
+        *_SKILL_DISTILLATION_ARM_BY_RUNNABLE_ARM,
+    }
+)
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
 RUNNABLE_ARMS = (
@@ -84,6 +94,7 @@ RUNNABLE_ARMS = (
     "driftlock",
     "native-driftlock-heuristic",
     "native-driftlock",
+    *_SKILL_DISTILLATION_ARM_BY_RUNNABLE_ARM,
 )
 DRIFTLOCK_DETECTOR_DEFAULTS = {
     "driftlock_no_change_steps": 4,
@@ -157,6 +168,8 @@ def build_job_config(
     judge_api_base: str | None = None,
     judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     retain_checkpoints: bool = False,
+    skill_library_dir: Path | None = None,
+    skill_embedder_import_path: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact JSON-compatible Harbor configuration for one run."""
     root = lhtb_dir.expanduser().resolve()
@@ -170,7 +183,23 @@ def build_job_config(
         )
     if arm not in RUNNABLE_ARMS:
         raise ValueError("arm must be one of " + ", ".join(RUNNABLE_ARMS))
-    checkpoint_arms = {"driftlock", "driftlock-heuristic"}
+    skill_distillation_arm = _SKILL_DISTILLATION_ARM_BY_RUNNABLE_ARM.get(arm)
+    skill_options = (skill_library_dir, skill_embedder_import_path)
+    if skill_distillation_arm is None and any(
+        option is not None for option in skill_options
+    ):
+        raise ValueError("skill configuration requires a skill-* arm")
+    if skill_distillation_arm is not None and any(
+        option is None for option in skill_options
+    ):
+        raise ValueError(
+            "skill arms require skill_library_dir and skill_embedder_import_path"
+        )
+    checkpoint_arms = {
+        "driftlock",
+        "driftlock-heuristic",
+        *_SKILL_DISTILLATION_ARM_BY_RUNNABLE_ARM,
+    }
     if retain_checkpoints and arm.startswith("native-"):
         raise ValueError(
             "native checkpoint retention is not supported by oracle replay; "
@@ -245,11 +274,12 @@ def build_job_config(
             "driftlock",
             "native-driftlock-heuristic",
             "native-driftlock",
+            *_SKILL_DISTILLATION_ARM_BY_RUNNABLE_ARM,
         }:
             agent["kwargs"].update(DRIFTLOCK_DETECTOR_DEFAULTS)
         if retain_checkpoints:
             agent["kwargs"]["driftlock_retain_checkpoints"] = True
-        if arm in {"driftlock", "native-driftlock"}:
+        if arm in _FINE_JUDGE_ARMS:
             agent["kwargs"].update(
                 {
                     "driftlock_judge_model": DEFAULT_JUDGE_MODEL,
@@ -260,6 +290,20 @@ def build_job_config(
                     "driftlock_judge_llm_call_kwargs": (
                         openrouter_provider_call_kwargs(judge_provider)
                     ),
+                }
+            )
+        if skill_distillation_arm is not None:
+            assert skill_library_dir is not None
+            assert skill_embedder_import_path is not None
+            agent["kwargs"].update(
+                {
+                    "driftlock_skill_library_dir": str(
+                        skill_library_dir.expanduser().resolve()
+                    ),
+                    "driftlock_skill_embedder_import_path": (
+                        skill_embedder_import_path
+                    ),
+                    "driftlock_skill_distillation_arm": skill_distillation_arm,
                 }
             )
 
@@ -885,6 +929,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 judge_api_base=args.judge_api_base,
                 judge_provider=args.judge_provider,
                 retain_checkpoints=args.retain_checkpoints,
+                skill_library_dir=args.skill_library_dir,
+                skill_embedder_import_path=args.skill_embedder,
             )
             config_arg = args.config or Path(f"driftlock-job-{args.job_name}.json")
             config_path = config_arg.expanduser().resolve()
@@ -1172,6 +1218,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--max-total-tokens", type=int, default=10_000_000)
         command.add_argument("--ack-unbounded-stock-tokens", action="store_true")
         command.add_argument("--retain-checkpoints", action="store_true")
+        command.add_argument("--skill-library-dir", type=Path)
+        command.add_argument(
+            "--skill-embedder",
+            help="local embedding callable as module:callable (skill arms only)",
+        )
     for name in ("oracle-prepare", "oracle-run"):
         oracle = sub.add_parser(
             name, help=f"{name} isolated retained-checkpoint verifier jobs"
