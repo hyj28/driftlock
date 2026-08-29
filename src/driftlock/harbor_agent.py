@@ -923,6 +923,7 @@ class _LHTBJudgeClient:
         max_output_tokens: int,
         timeout_sec: float,
         llm_call_kwargs: dict[str, Any] | None,
+        raise_provider_errors: bool = False,
     ) -> None:
         if model != PINNED_LHTB_JUDGE_MODEL:
             raise ValueError(
@@ -950,6 +951,7 @@ class _LHTBJudgeClient:
         self.pricing = pricing
         self.max_output_tokens = max_output_tokens
         self.timeout_sec = timeout_sec
+        self.raise_provider_errors = raise_provider_errors
         self.llm = LiteLLM(
             model_name=model,
             api_base=api_base,
@@ -990,6 +992,7 @@ class _LHTBJudgeClient:
         started = time.monotonic()
         response: Any | None = None
         fatal_error: BaseException | None = None
+        provider_error: Exception | None = None
         try:
             call = getattr(self.llm.call, "__wrapped__", None)
             if call is None:
@@ -1008,6 +1011,8 @@ class _LHTBJudgeClient:
             content = getattr(error, "truncated_response", None) or ""
             if not isinstance(error, Exception):
                 fatal_error = error
+            elif self.raise_provider_errors and not content:
+                provider_error = error
         finally:
             self.request_times_msec.append((time.monotonic() - started) * 1000)
 
@@ -1032,6 +1037,8 @@ class _LHTBJudgeClient:
         self.cost_usd += cost_usd
         if fatal_error is not None:
             raise fatal_error
+        if provider_error is not None:
+            raise provider_error
         return JudgeCompletion(
             text=content,
             tokens=prompt_tokens + completion_tokens,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -51,7 +52,6 @@ from driftlock.lhtb_analysis import (
 )
 from driftlock.oracle import (
     OracleCheckpointError,
-    ReplayUsage,
     file_sha256,
     load_remote_checkpoint_bundle,
     load_source_trial_provenance,
@@ -64,6 +64,14 @@ from driftlock.skill_admission import (
     render_admission_report,
     write_admission_report,
 )
+from driftlock.skill_distillation import CallableSkillDistiller
+from driftlock.skill_distillation_driver import (
+    DISTILLATION_ARMS,
+    DISTILLATION_REPORT_NAME,
+    plan_skill_distillation,
+    run_skill_distillation,
+)
+from driftlock.usage import ReplayUsage
 
 # Both identifiers carry an explicit dated build. An unversioned alias such as
 # "deepseek-v4-pro" silently follows whatever OpenRouter currently points it at,
@@ -875,6 +883,71 @@ def probe_provider(
         ) from error
 
 
+def _build_skill_distiller(
+    *,
+    model: str,
+    provider: str,
+    api_base: str,
+    max_output_tokens: int,
+    timeout_sec: float,
+) -> tuple[CallableSkillDistiller, Any, dict[str, Any]]:
+    """Reuse the pinned fine-judge client for one-call skill completions."""
+
+    # Harbor is intentionally an experiment-environment dependency, not a core
+    # package dependency.  Keep this import behind the paid command just as the
+    # existing agent and fine-judge provider path does.
+    from driftlock.harbor_agent import _LHTBJudgeClient
+
+    client = _LHTBJudgeClient(
+        model=model,
+        api_base=api_base,
+        max_output_tokens=max_output_tokens,
+        timeout_sec=timeout_sec,
+        llm_call_kwargs=openrouter_provider_call_kwargs(provider),
+        raise_provider_errors=True,
+    )
+
+    async def complete(prompt: str) -> Any:
+        return await client.complete(prompt, tokens_remaining=None)
+
+    def usage_reader() -> ReplayUsage:
+        return ReplayUsage(
+            input_tokens=client.n_input_tokens,
+            cache_tokens=client.n_cache_tokens,
+            output_tokens=client.n_output_tokens,
+            cost_usd=client.cost_usd,
+        )
+
+    return (
+        CallableSkillDistiller(complete),
+        usage_reader,
+        _skill_distillation_metadata(
+            model=model,
+            provider=provider,
+            api_base=api_base,
+            max_output_tokens=max_output_tokens,
+            timeout_sec=timeout_sec,
+        ),
+    )
+
+
+def _skill_distillation_metadata(
+    *,
+    model: str,
+    provider: str,
+    api_base: str,
+    max_output_tokens: int,
+    timeout_sec: float,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "provider": provider,
+        "api_base": api_base,
+        "max_output_tokens": max_output_tokens,
+        "timeout_sec": timeout_sec,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -1147,6 +1220,121 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             print(f"wrote {output}")
             return 0
+        if args.command == "distill-skills":
+            plan = plan_skill_distillation(args.localization_report)
+            output = args.output.expanduser().resolve()
+            metadata = _skill_distillation_metadata(
+                model=args.model,
+                provider=args.provider,
+                api_base=args.api_base,
+                max_output_tokens=args.max_output_tokens,
+                timeout_sec=args.timeout_sec,
+            )
+
+            class _UncallableDistiller:
+                async def distill(self, evidence: Any) -> Any:
+                    del evidence
+                    raise AssertionError("zero-call run must not invoke the distiller")
+
+            if args.dry_run or not plan.work_items:
+                report = asyncio.run(
+                    run_skill_distillation(
+                        plan,
+                        output,
+                        distiller=_UncallableDistiller(),
+                        usage_reader=lambda: ReplayUsage(0, 0, 0, 0.0),
+                        run_metadata=metadata,
+                        dry_run=args.dry_run,
+                    )
+                )
+            else:
+                distiller, usage_reader, metadata = _build_skill_distiller(
+                    model=args.model,
+                    provider=args.provider,
+                    api_base=args.api_base,
+                    max_output_tokens=args.max_output_tokens,
+                    timeout_sec=args.timeout_sec,
+                )
+                report = asyncio.run(
+                    run_skill_distillation(
+                        plan,
+                        output,
+                        distiller=distiller,
+                        usage_reader=usage_reader,
+                        run_metadata=metadata,
+                    )
+                )
+            summary = report["summary"]
+            if args.dry_run:
+                print(
+                    f"{summary['pending_call_count']} model call(s) to make; "
+                    f"{summary['planned_call_count']} planned across "
+                    f"{len(plan.work_items) // len(DISTILLATION_ARMS)} segment(s); "
+                    f"{summary['reused_call_count']} reused; "
+                    f"{summary['evidence_refusal_count']} evidence-refused "
+                    "segment(s)"
+                )
+            else:
+                print(
+                    f"completed {summary['completed_call_count']} model call(s); "
+                    f"{summary['new_call_count']} new, "
+                    f"{summary['reused_call_count']} reused; "
+                    f"{len(plan.work_items) // len(DISTILLATION_ARMS)} callable "
+                    f"segment(s); {summary['evidence_refusal_count']} "
+                    "evidence-refused segment(s); "
+                    f"{summary['retryable_failure_count']} retryable failure(s); "
+                    f"{summary['unpaired_segment_count']} unpaired segment(s)"
+                )
+            completed = {
+                attempt["candidate_id"]: attempt for attempt in report["attempts"]
+            }
+            for item in plan.work_items:
+                attempt = completed.get(item.candidate_id)
+                disposition = (
+                    f"{attempt['status']}" + (" (reused)" if attempt["reused"] else "")
+                    if attempt is not None
+                    else "planned"
+                )
+                print(
+                    f"  {item.task_name} segment {item.segment_index} "
+                    f"{item.arm}: {disposition}"
+                )
+            for task in report["refused_tasks"]:
+                refusal = task["refusal"]
+                print(
+                    f"  {task['task_name']}: localization refused "
+                    f"({refusal['reason']}): {refusal['detail']}"
+                )
+            for segment in report["evidence_refusals"]:
+                print(
+                    f"  {segment['task_name']} segment "
+                    f"{segment['segment_index']}: evidence refused; "
+                    f"{segment['detail']}"
+                )
+                for arm in DISTILLATION_ARMS:
+                    refusal = segment["refusals_by_arm"].get(arm)
+                    if refusal is not None:
+                        print(f"    {arm} ({refusal['reason']}): {refusal['detail']}")
+            if args.dry_run:
+                print("dry run; no provider calls made and no output written")
+            else:
+                print(f"wrote {output}")
+            # Treat partial evidence refusal, retryable provider failure, and a
+            # one-sided generated outcome as failures. Any of them would otherwise
+            # let automation validate/admit a different paired cohort than the
+            # localization report requested. A fully generated cohort and a genuine
+            # nothing-to-do report both remain successful: neither misrepresents
+            # arm membership. Persisted successful calls are reused on repair, while
+            # failed calls remain audited and are retried automatically.
+            invalid_cohort = any(
+                summary[key] > 0
+                for key in (
+                    "evidence_refusal_count",
+                    "retryable_failure_count",
+                    "unpaired_segment_count",
+                )
+            )
+            return 1 if invalid_cohort else 0
         if args.command == "admit-skills":
             candidates = load_admission_candidates(args.validation_results)
             library = SkillLibrary(args.library_dir)
@@ -1249,6 +1437,22 @@ def _parser() -> argparse.ArgumentParser:
     localization.add_argument(
         "--output", type=Path, default=Path(LOCALIZATION_REPORT_NAME)
     )
+    distillation = sub.add_parser(
+        "distill-skills",
+        help="distill paired localized and whole-trajectory skill candidates",
+    )
+    distillation.add_argument("localization_report", type=Path)
+    distillation.add_argument(
+        "--output", type=Path, default=Path(DISTILLATION_REPORT_NAME)
+    )
+    distillation.add_argument("--model", default=DEFAULT_JUDGE_MODEL)
+    distillation.add_argument("--provider", default=DEFAULT_JUDGE_PROVIDER)
+    distillation.add_argument("--api-base", default=DEFAULT_API_BASE)
+    distillation.add_argument(
+        "--max-output-tokens", type=int, default=DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
+    )
+    distillation.add_argument("--timeout-sec", type=float, default=120.0)
+    distillation.add_argument("--dry-run", action="store_true")
     admission = sub.add_parser(
         "admit-skills",
         help="apply the paired validation rule and update a skill library",
