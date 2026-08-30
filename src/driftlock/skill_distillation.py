@@ -37,6 +37,18 @@ _DECLINE = re.compile(r"^DECLINE:[ \t]*(.+)$", re.IGNORECASE | re.DOTALL)
 _MAX_TEXT_FILE_BYTES = 256 * 1024
 _MAX_DIFF_CHARACTERS = 100_000
 
+# This is 90% of the provider's reported 1,000,000 input-length limit; the error
+# does not establish whether that unit means tokens or characters.  Evidence is
+# JSON-serialized with ASCII escaping, so its character count is also its UTF-8
+# byte count and therefore a conservative token upper bound.  The remaining 10%
+# pays for the shared prompt and avoids relying on a tokenizer-specific average.
+# In the first paid run all seven successful localized inputs were <=161,291
+# characters (the largest baseline was 350,483), while the rejected checkout diff
+# was 2,552,299.  This bound therefore removes that failure without changing the
+# observed viable cohort.  A tokenizer-backed count for the pinned dated model,
+# validated against the provider's accepted envelope, would settle a tighter bound.
+EVIDENCE_CHARACTER_LIMIT = 900_000
+
 
 class SkillValidationError(ValueError):
     """A skill document does not satisfy the shared schema."""
@@ -163,22 +175,19 @@ def assemble_localized_evidence(
     except EvidenceAssemblyError as error:
         return _refusal("localized", error.reason, error.detail)
 
-    return {
-        "status": "usable",
-        "mode": "localized",
-        "evidence": {
-            "trial_name": trial.name,
-            "segment": normalized_segment,
-            "trajectory": {
-                "phase": bounds["phase"],
-                "phase_offset": phase_offset,
-                "start_step": start_position,
-                "end_step": end_position,
-                "steps": steps,
-            },
-            "workspace_diff": workspace_diff,
+    evidence = {
+        "trial_name": trial.name,
+        "segment": normalized_segment,
+        "trajectory": {
+            "phase": bounds["phase"],
+            "phase_offset": phase_offset,
+            "start_step": start_position,
+            "end_step": end_position,
+            "steps": steps,
         },
+        "workspace_diff": workspace_diff,
     }
+    return _bounded_evidence("localized", evidence)
 
 
 def assemble_baseline_evidence(trial_dir: Path | str) -> dict[str, Any]:
@@ -190,14 +199,10 @@ def assemble_baseline_evidence(trial_dir: Path | str) -> dict[str, Any]:
         steps = _evidence_steps(trajectory, range(len(trajectory)))
     except EvidenceAssemblyError as error:
         return _refusal("baseline", error.reason, error.detail)
-    return {
-        "status": "usable",
-        "mode": "baseline",
-        "evidence": {
-            "trial_name": trial.name,
-            "trajectory": {"steps": steps},
-        },
-    }
+    return _bounded_evidence(
+        "baseline",
+        {"trial_name": trial.name, "trajectory": {"steps": steps}},
+    )
 
 
 def build_distillation_prompt(evidence: Mapping[str, Any]) -> str:
@@ -213,7 +218,7 @@ def build_distillation_prompt(evidence: Mapping[str, Any]) -> str:
         raise ValueError("cannot build a prompt from refused evidence")
     else:
         evidence_block = evidence
-    serialized = json.dumps(evidence_block, indent=2, sort_keys=True)
+    serialized = _serialize_evidence(evidence_block)
     return (
         "You distill preventative procedural memory from a coding-agent record.\n"
         "Use only the supplied evidence; do not infer missing events or outcomes.\n"
@@ -693,9 +698,42 @@ def _json_value(value: object, description: str) -> Any:
         ) from error
 
 
-def _refusal(mode: str, reason: str, detail: str) -> dict[str, Any]:
+def _serialize_evidence(evidence: Mapping[str, Any]) -> str:
+    return json.dumps(evidence, indent=2, sort_keys=True)
+
+
+def _bounded_evidence(mode: str, evidence: dict[str, Any]) -> dict[str, Any]:
+    characters = len(_serialize_evidence(evidence))
+    if characters >= EVIDENCE_CHARACTER_LIMIT:
+        return _refusal(
+            mode,
+            "evidence_size_limit_exceeded",
+            f"{mode} evidence is {characters} characters, at or over the "
+            f"{EVIDENCE_CHARACTER_LIMIT}-character input bound",
+            evidence_characters=characters,
+        )
     return {
+        "status": "usable",
+        "mode": mode,
+        "evidence_characters": characters,
+        "evidence_character_limit": EVIDENCE_CHARACTER_LIMIT,
+        "evidence": evidence,
+    }
+
+
+def _refusal(
+    mode: str,
+    reason: str,
+    detail: str,
+    *,
+    evidence_characters: int | None = None,
+) -> dict[str, Any]:
+    refusal = {
         "status": "refused",
         "mode": mode,
         "refusal": {"reason": reason, "detail": detail},
     }
+    if evidence_characters is not None:
+        refusal["evidence_characters"] = evidence_characters
+        refusal["evidence_character_limit"] = EVIDENCE_CHARACTER_LIMIT
+    return refusal

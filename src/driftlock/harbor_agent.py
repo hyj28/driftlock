@@ -8,6 +8,7 @@ dependency-free.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
 from collections.abc import Callable, Sequence
@@ -972,6 +973,13 @@ class _LHTBJudgeClient:
         self.cost_usd = 0.0
         self.request_times_msec: list[float] = []
         self.usage_fallbacks = 0
+        self.provider_reported_token_count = 0
+        self.provider_reported_cost_count = 0
+        self.reported_tokens_priced_count = 0
+        self.successful_response_fallback_count = 0
+        self.missing_reported_usage_count = 0
+        self.invalid_reported_usage_count = 0
+        self.error_without_usage_count = 0
         self._applied_context_id: int | None = None
         self._applied_input_tokens = 0
         self._applied_cache_tokens = 0
@@ -991,6 +999,7 @@ class _LHTBJudgeClient:
 
         started = time.monotonic()
         response: Any | None = None
+        call_error: BaseException | None = None
         fatal_error: BaseException | None = None
         provider_error: Exception | None = None
         try:
@@ -1007,6 +1016,7 @@ class _LHTBJudgeClient:
             )
             content = response.content
         except BaseException as error:
+            call_error = error
             response = getattr(error, "response", None)
             content = getattr(error, "truncated_response", None) or ""
             if not isinstance(error, Exception):
@@ -1017,20 +1027,51 @@ class _LHTBJudgeClient:
             self.request_times_msec.append((time.monotonic() - started) * 1000)
 
         usage = getattr(response, "usage", None)
-        if self._valid_usage(usage):
+        if self._valid_token_usage(
+            usage, input_bound=input_bound, output_ceiling=ceiling
+        ):
+            self.provider_reported_token_count += 1
             prompt_tokens = usage.prompt_tokens
             completion_tokens = usage.completion_tokens
             cache_tokens = usage.cache_tokens
-            cost_usd = float(usage.cost_usd)
+            if self._valid_cost(getattr(usage, "cost_usd", None)):
+                cost_usd = float(usage.cost_usd)
+                self.provider_reported_cost_count += 1
+            else:
+                cost_usd = self._priced_cost(
+                    prompt_tokens=prompt_tokens,
+                    cache_tokens=cache_tokens,
+                    completion_tokens=completion_tokens,
+                )
+                self.usage_fallbacks += 1
+                self.reported_tokens_priced_count += 1
+        elif call_error is not None:
+            # A raised call with no response usage has no auditable bill.  The old
+            # path charged the one-token-per-byte budget bound and full output
+            # ceiling; that made rejected calls phantom-expensive and affected the
+            # fine judge as well as distillation.  Record the missing usage signal,
+            # but never invent tokens or cost for either caller.
+            self.error_without_usage_count += 1
+            if fatal_error is not None:
+                raise fatal_error
+            if provider_error is not None:
+                raise provider_error
+            return JudgeCompletion(text=content, tokens=0)
         else:
+            if usage is None:
+                self.missing_reported_usage_count += 1
+            else:
+                self.invalid_reported_usage_count += 1
             prompt_tokens = input_bound
             completion_tokens = ceiling
             cache_tokens = 0
-            cost_usd = (
-                prompt_tokens * self.pricing.input_cost_per_token
-                + completion_tokens * self.pricing.output_cost_per_token
+            cost_usd = self._priced_cost(
+                prompt_tokens=prompt_tokens,
+                cache_tokens=cache_tokens,
+                completion_tokens=completion_tokens,
             )
             self.usage_fallbacks += 1
+            self.successful_response_fallback_count += 1
         self.n_input_tokens += prompt_tokens
         self.n_cache_tokens += cache_tokens
         self.n_output_tokens += completion_tokens
@@ -1045,24 +1086,58 @@ class _LHTBJudgeClient:
         )
 
     @staticmethod
-    def _valid_usage(usage: Any) -> bool:
+    def _valid_token_usage(
+        usage: Any, *, input_bound: int, output_ceiling: int
+    ) -> bool:
         if usage is None:
             return False
-        integer_values = (
-            getattr(usage, "prompt_tokens", None),
-            getattr(usage, "completion_tokens", None),
-            getattr(usage, "cache_tokens", None),
-        )
-        cost = getattr(usage, "cost_usd", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        cache_tokens = getattr(usage, "cache_tokens", None)
         return (
             all(
                 isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                for value in integer_values
+                for value in (prompt_tokens, completion_tokens, cache_tokens)
             )
-            and isinstance(cost, (int, float))
+            and cache_tokens <= prompt_tokens
+            and prompt_tokens <= input_bound
+            and completion_tokens <= output_ceiling
+        )
+
+    @staticmethod
+    def _valid_cost(cost: Any) -> bool:
+        return (
+            isinstance(cost, (int, float))
             and not isinstance(cost, bool)
+            and math.isfinite(float(cost))
             and cost >= 0
         )
+
+    def _priced_cost(
+        self, *, prompt_tokens: int, cache_tokens: int, completion_tokens: int
+    ) -> float:
+        return (
+            (prompt_tokens - cache_tokens) * self.pricing.input_cost_per_token
+            + cache_tokens * self.pricing.cache_cost_per_token
+            + completion_tokens * self.pricing.output_cost_per_token
+        )
+
+    def accounting_snapshot(self) -> dict[str, int]:
+        """Return monotonic per-path counts for paid-call reconciliation."""
+
+        return {
+            "physical_request_count": len(self.request_times_msec),
+            "provider_reported_token_count": self.provider_reported_token_count,
+            "provider_reported_cost_count": self.provider_reported_cost_count,
+            "reported_tokens_priced_count": self.reported_tokens_priced_count,
+            "successful_response_fallback_count": (
+                self.successful_response_fallback_count
+            ),
+            "missing_reported_usage_count": self.missing_reported_usage_count,
+            "invalid_reported_usage_count": self.invalid_reported_usage_count,
+            "error_without_usage_count": self.error_without_usage_count,
+            "conservative_usage_fallbacks": self.usage_fallbacks,
+        }
 
     def apply_accounting(self, context: Any) -> None:
         context.n_input_tokens = (context.n_input_tokens or 0) + self.n_input_tokens
@@ -1084,6 +1159,7 @@ class _LHTBJudgeClient:
             "cost_usd": self.cost_usd,
             "request_count": len(self.request_times_msec),
             "conservative_usage_fallbacks": self.usage_fallbacks,
+            "accounting_paths": self.accounting_snapshot(),
         }
         context.metadata = metadata
         self._applied_context_id = id(context)

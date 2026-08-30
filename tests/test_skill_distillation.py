@@ -17,6 +17,7 @@ from driftlock.models import (
     RunStatus,
 )
 from driftlock.skill_distillation import (
+    EVIDENCE_CHARACTER_LIMIT,
     EVIDENCE_END,
     EVIDENCE_START,
     CallableSkillDistiller,
@@ -80,6 +81,27 @@ def _checkpoint(
         ),
         encoding="utf-8",
     )
+
+
+def _replace_checkpoint_archive(
+    trial: Path, *, phase: int, checkpoint_id: str, files: dict[str, str]
+) -> None:
+    directory = (
+        trial
+        / ".driftlock-checkpoints"
+        / f"phase-{phase}"
+        / "checkpoints"
+        / checkpoint_id
+    )
+    archive = _archive(files)
+    state = (directory / "state.json").read_bytes()
+    digest = hashlib.sha256(archive)
+    digest.update(b"\0state\0")
+    digest.update(state)
+    (directory / "workspace.tar.gz").write_bytes(archive)
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    manifest["digest"] = digest.hexdigest()
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def _trial(tmp_path: Path, *, prior_steps: int | None = 3) -> Path:
@@ -201,6 +223,34 @@ def test_localized_evidence_uses_nonzero_phase_offset_and_real_workspace_diff(
     assert workspace["files"][0]["path"] == "src/parser.py"
     assert "-mode = 'old'" in workspace["files"][0]["diff"]
     assert "+mode = 'new'" in workspace["files"][0]["diff"]
+
+
+def test_localized_evidence_refuses_an_oversized_checkout_diff(tmp_path: Path) -> None:
+    trial = _trial(tmp_path)
+    files = {f"vendor/{index:04d}-{'x' * 340}.py": "x\n" for index in range(2_500)}
+    _replace_checkpoint_archive(trial, phase=2, checkpoint_id="b" * 32, files=files)
+
+    result = assemble_localized_evidence(trial, _segment())
+
+    assert result["status"] == "refused"
+    assert result["refusal"]["reason"] == "evidence_size_limit_exceeded"
+    assert result["evidence_character_limit"] == 900_000
+    assert result["evidence_characters"] >= 900_000
+    assert "at or over the 900000-character input bound" in result["refusal"]["detail"]
+
+
+@pytest.mark.parametrize(
+    "measured_characters",
+    [146_276, 28_586, 134_003, 94_231, 161_291, 51_528, 15_905],
+)
+def test_evidence_bound_keeps_each_observed_viable_localized_segment(
+    measured_characters: int,
+) -> None:
+    assert measured_characters < EVIDENCE_CHARACTER_LIMIT
+
+
+def test_evidence_bound_refuses_the_observed_checkout_segment_size() -> None:
+    assert EVIDENCE_CHARACTER_LIMIT <= 2_552_299
 
 
 def test_localized_evidence_maps_an_offset_zero_phase_directly(tmp_path: Path) -> None:

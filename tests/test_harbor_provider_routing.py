@@ -375,6 +375,165 @@ async def test_judge_client_reports_preflight_output_budget_exhaustion(
     assert client.n_output_tokens == 0
 
 
+async def test_judge_client_prices_reported_tokens_when_response_omits_cost(
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+    client = harbor_agent._LHTBJudgeClient(
+        model="openrouter/deepseek/deepseek-v4-pro-0813",
+        api_base="https://openrouter.ai/api/v1",
+        max_output_tokens=8192,
+        timeout_sec=120,
+        llm_call_kwargs=_judge_call_kwargs(),
+    )
+
+    async def respond(_llm: object, **kwargs: object) -> object:
+        del kwargs
+        return SimpleNamespace(
+            content="complete",
+            usage=SimpleNamespace(
+                prompt_tokens=120,
+                cache_tokens=20,
+                completion_tokens=10,
+                cost_usd=None,
+            ),
+        )
+
+    client.llm.call = SimpleNamespace(__wrapped__=respond)
+
+    completion = await client.complete("short prompt", tokens_remaining=None)
+
+    assert completion.tokens == 130
+    assert client.n_input_tokens == 120
+    assert client.n_cache_tokens == 20
+    assert client.n_output_tokens == 10
+    assert client.cost_usd == pytest.approx(0.000153374)
+    assert client.usage_fallbacks == 1
+    assert client.accounting_snapshot() == {
+        "physical_request_count": 1,
+        "provider_reported_token_count": 1,
+        "provider_reported_cost_count": 0,
+        "reported_tokens_priced_count": 1,
+        "successful_response_fallback_count": 0,
+        "missing_reported_usage_count": 0,
+        "invalid_reported_usage_count": 0,
+        "error_without_usage_count": 0,
+        "conservative_usage_fallbacks": 1,
+    }
+
+
+async def test_raised_provider_rejection_without_usage_is_not_imputed_as_billed(
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+    client = harbor_agent._LHTBJudgeClient(
+        model="openrouter/deepseek/deepseek-v4-pro-0813",
+        api_base="https://openrouter.ai/api/v1",
+        max_output_tokens=8192,
+        timeout_sec=120,
+        llm_call_kwargs=_judge_call_kwargs(),
+        raise_provider_errors=True,
+    )
+
+    async def reject(_llm: object, **kwargs: object) -> object:
+        del kwargs
+        raise ValueError("Range of input length should be [1, 1000000]")
+
+    client.llm.call = SimpleNamespace(__wrapped__=reject)
+
+    with pytest.raises(ValueError, match="Range of input length"):
+        await client.complete("oversized", tokens_remaining=None)
+
+    assert client.n_input_tokens == 0
+    assert client.n_cache_tokens == 0
+    assert client.n_output_tokens == 0
+    assert client.cost_usd == 0.0
+    assert client.usage_fallbacks == 0
+
+
+async def test_fine_judge_rejection_without_usage_is_not_imputed_as_billed(
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+    client = harbor_agent._LHTBJudgeClient(
+        model="openrouter/deepseek/deepseek-v4-pro-0813",
+        api_base="https://openrouter.ai/api/v1",
+        max_output_tokens=8192,
+        timeout_sec=120,
+        llm_call_kwargs=_judge_call_kwargs(),
+    )
+
+    async def reject(_llm: object, **kwargs: object) -> object:
+        del kwargs
+        raise ValueError("Range of input length should be [1, 1000000]")
+
+    client.llm.call = SimpleNamespace(__wrapped__=reject)
+
+    completion = await client.complete("oversized", tokens_remaining=None)
+
+    assert completion.tokens == 0
+    assert completion.text == ""
+    assert client.n_input_tokens == 0
+    assert client.n_cache_tokens == 0
+    assert client.n_output_tokens == 0
+    assert client.cost_usd == 0.0
+    assert client.accounting_snapshot() == {
+        "physical_request_count": 1,
+        "provider_reported_token_count": 0,
+        "provider_reported_cost_count": 0,
+        "reported_tokens_priced_count": 0,
+        "successful_response_fallback_count": 0,
+        "missing_reported_usage_count": 0,
+        "invalid_reported_usage_count": 0,
+        "error_without_usage_count": 1,
+        "conservative_usage_fallbacks": 0,
+    }
+
+
+async def test_impossible_reported_tokens_use_the_stated_fallback_ceiling(
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _ = harbor_agent_modules
+    client = harbor_agent._LHTBJudgeClient(
+        model="openrouter/deepseek/deepseek-v4-pro-0813",
+        api_base="https://openrouter.ai/api/v1",
+        max_output_tokens=10,
+        timeout_sec=120,
+        llm_call_kwargs=_judge_call_kwargs(),
+    )
+
+    async def respond(_llm: object, **kwargs: object) -> object:
+        del kwargs
+        return SimpleNamespace(
+            content="complete",
+            usage=SimpleNamespace(
+                prompt_tokens=500,
+                cache_tokens=0,
+                completion_tokens=3,
+                cost_usd=0.5,
+            ),
+        )
+
+    client.llm.call = SimpleNamespace(__wrapped__=respond)
+
+    completion = await client.complete("x", tokens_remaining=None)
+
+    assert completion.tokens == 267
+    assert client.n_input_tokens == 257
+    assert client.n_output_tokens == 10
+    assert client.accounting_snapshot() == {
+        "physical_request_count": 1,
+        "provider_reported_token_count": 0,
+        "provider_reported_cost_count": 0,
+        "reported_tokens_priced_count": 0,
+        "successful_response_fallback_count": 1,
+        "missing_reported_usage_count": 0,
+        "invalid_reported_usage_count": 1,
+        "error_without_usage_count": 0,
+        "conservative_usage_fallbacks": 1,
+    }
+
+
 def test_native_agent_forwards_only_audited_call_kwargs_to_litellm(
     tmp_path: Path,
     harbor_agent_modules: tuple[Any, Any],
