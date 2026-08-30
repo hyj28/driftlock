@@ -89,8 +89,11 @@ benchmark's scoring rather than on a judge being right.
 
 Skills use the ProcMEM `activation` / `execution` / `termination` schema and carry
 preventative content ("when X appears, do not do Y; do Z instead"). A candidate only
-enters the library after a **measured** improvement on a held-out validation split —
-an unfiltered library demonstrably makes agents worse.
+enters the library after a **measured** improvement. For the heterogeneous LHTB pool,
+the current gate uses fresh same-task trials (five tasks × two replicates), with one
+fresh no-skill control shared across candidates inside each `(task, replicate)` pair.
+That measures repeated runs, not ten different tasks; an unfiltered library
+demonstrably makes agents worse.
 
 ## The question this has to answer
 

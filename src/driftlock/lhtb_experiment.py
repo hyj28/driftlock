@@ -1578,22 +1578,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{summary['treatment_trial_count']} with-skill; estimated "
                 f"${summary['estimated_planned_cost_usd']:.3f} at "
                 f"${summary['estimated_cost_per_trial_usd']:.3f}/trial; "
+                f"{len(plan.tasks)} task(s) x "
+                f"{plan.replicate_count} replicate(s) = "
+                f"{plan.observation_count} paired observation(s); "
                 f"{summary['pending_trial_count']} pending, "
                 f"{summary['reused_trial_count']} reused"
             )
             print("  shared no-skill controls:")
             for task in plan.tasks:
-                print(
-                    f"    {task}: 1 trial, estimated "
-                    f"${plan.estimated_cost_per_trial_usd:.3f}"
-                )
+                for replicate_index in range(1, plan.replicate_count + 1):
+                    replicate = (
+                        ""
+                        if plan.replicate_count == 1
+                        else f" replicate {replicate_index}"
+                    )
+                    print(
+                        f"    {task}{replicate}: 1 trial, estimated "
+                        f"${plan.estimated_cost_per_trial_usd:.3f}"
+                    )
             for candidate in plan.candidates:
                 print(f"  {candidate.candidate_id} [{candidate.arm}]:")
                 for task in plan.tasks:
-                    print(
-                        f"    {task}: 1 with-skill trial, estimated "
-                        f"${plan.estimated_cost_per_trial_usd:.3f}"
-                    )
+                    for replicate_index in range(1, plan.replicate_count + 1):
+                        replicate = (
+                            ""
+                            if plan.replicate_count == 1
+                            else f" replicate {replicate_index}"
+                        )
+                        print(
+                            f"    {task}{replicate}: 1 with-skill trial, estimated "
+                            f"${plan.estimated_cost_per_trial_usd:.3f}"
+                        )
             if args.dry_run:
                 print("dry run; no trials run and no files written")
                 return 0
@@ -1610,7 +1625,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if attempt["reused"]:
                         disposition += " (reused)"
                 label = trial.candidate_id or "shared no-skill"
-                print(f"  {label} / {trial.task_name}: {disposition}")
+                print(
+                    f"  {label} / {trial.task_name} / replicate "
+                    f"{trial.replicate_index}: {disposition}"
+                )
             print(f"wrote {output}")
             return 1 if summary["pending_trial_count"] else 0
         if args.command == "admit-skills":

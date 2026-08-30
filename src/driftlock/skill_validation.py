@@ -28,7 +28,7 @@ from driftlock.skill_distillation import parse_skill, serialize_skill
 
 VALIDATION_REPORT_NAME = "validated-skill-candidates.json"
 VALIDATION_MODE = "skill-paired-validation"
-VALIDATION_PROCEDURE_ID = "shared-single-candidate-paired-v1"
+VALIDATION_PROCEDURE_ID = "shared-replicated-single-candidate-paired-v2"
 
 # The most recent paid LHTB measurement supplied for this validation round was
 # $0.151 per trial (2026-08-30).  This is an operator-facing budget estimate,
@@ -77,6 +77,7 @@ class ValidationTrial:
 
     trial_id: str
     task_name: str
+    replicate_index: int
     condition: str
     distillation_arm: str
     library_dir: Path
@@ -93,6 +94,7 @@ class ValidationTrial:
         return {
             "trial_id": self.trial_id,
             "task_name": self.task_name,
+            "replicate_index": self.replicate_index,
             "condition": self.condition,
             "candidate_id": self.candidate_id,
             "distillation_arm": self.distillation_arm,
@@ -143,17 +145,22 @@ class SkillValidationTrialRunner(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class SkillValidationPlan:
-    """Validated candidates, held-out tasks, and the exact paid-work plan."""
+    """Validated candidates, replicated tasks, and the exact paid-work plan."""
 
     source_candidate_file: Path
     source_payload: Mapping[str, Any]
     candidates: tuple[ValidationCandidate, ...]
     tasks: tuple[str, ...]
+    replicate_count: int
     estimated_cost_per_trial_usd: float
 
     @property
+    def observation_count(self) -> int:
+        return len(self.tasks) * self.replicate_count
+
+    @property
     def planned_trial_count(self) -> int:
-        return len(self.tasks) * (len(self.candidates) + 1)
+        return self.observation_count * (len(self.candidates) + 1)
 
     @property
     def estimated_cost_usd(self) -> float:
@@ -167,8 +174,10 @@ class SkillValidationPlan:
                 candidate.identity() for candidate in self.candidates
             ],
             "validation_tasks": list(self.tasks),
-            "shared_control_trial_count": len(self.tasks),
-            "treatment_trial_count": len(self.tasks) * len(self.candidates),
+            "replicate_count": self.replicate_count,
+            "observation_count": self.observation_count,
+            "shared_control_trial_count": self.observation_count,
+            "treatment_trial_count": self.observation_count * len(self.candidates),
             "planned_trial_count": self.planned_trial_count,
             "estimated_cost_per_trial_usd": self.estimated_cost_per_trial_usd,
             "estimated_cost_usd": self.estimated_cost_usd,
@@ -180,21 +189,25 @@ class SkillValidationPlan:
         controls = tuple(
             _trial(
                 task_name=task,
+                replicate_index=replicate_index,
                 condition="without_skill",
                 candidate=None,
                 library_dir=libraries / "empty",
             )
             for task in self.tasks
+            for replicate_index in range(1, self.replicate_count + 1)
         )
         treatments = tuple(
             _trial(
                 task_name=task,
+                replicate_index=replicate_index,
                 condition="with_skill",
                 candidate=candidate,
                 library_dir=libraries / candidate.candidate_id,
             )
             for candidate in self.candidates
             for task in self.tasks
+            for replicate_index in range(1, self.replicate_count + 1)
         )
         return controls + treatments
 
@@ -205,7 +218,7 @@ def plan_skill_validation(
     *,
     estimated_cost_per_trial_usd: float = DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
 ) -> SkillValidationPlan:
-    """Load an admission-ready candidate cohort and a caller-chosen task list."""
+    """Load candidates and tasks whose object form may set ``replicate_count``."""
 
     if (
         isinstance(estimated_cost_per_trial_usd, bool)
@@ -255,15 +268,24 @@ def plan_skill_validation(
     tasks_payload = _read_json(tasks_path, "validation task list")
     if isinstance(tasks_payload, list):
         raw_tasks = tasks_payload
+        replicate_count = 1
     elif isinstance(tasks_payload, Mapping):
         raw_tasks = tasks_payload.get("selected_tasks")
+        replicate_count = tasks_payload.get("replicate_count", 1)
     else:
         raw_tasks = None
+        replicate_count = None
     if not isinstance(raw_tasks, list) or not raw_tasks:
         raise ValueError(
             "validation task list must be a non-empty array or an object with "
             "selected_tasks"
         )
+    if (
+        isinstance(replicate_count, bool)
+        or not isinstance(replicate_count, int)
+        or replicate_count <= 0
+    ):
+        raise ValueError("validation task replicate_count must be a positive integer")
     tasks: list[str] = []
     for index, task in enumerate(raw_tasks):
         if not isinstance(task, str) or _SAFE_NAME.fullmatch(task) is None:
@@ -271,10 +293,12 @@ def plan_skill_validation(
         if task in tasks:
             raise ValueError(f"duplicate validation task: {task}")
         tasks.append(task)
-    if len(tasks) > VALIDATION_TASK_COUNT:
+    observation_count = len(tasks) * replicate_count
+    if observation_count > VALIDATION_TASK_COUNT:
         raise ValueError(
-            f"validation task list has {len(tasks)} tasks; admission accepts at "
-            f"most {VALIDATION_TASK_COUNT} paired deltas"
+            f"validation task list has {observation_count} observations "
+            f"({len(tasks)} tasks x {replicate_count} replicates); admission "
+            f"accepts at most {VALIDATION_TASK_COUNT} paired deltas"
         )
 
     return SkillValidationPlan(
@@ -282,6 +306,7 @@ def plan_skill_validation(
         source_payload=payload,
         candidates=tuple(candidates),
         tasks=tuple(tasks),
+        replicate_count=replicate_count,
         estimated_cost_per_trial_usd=float(estimated_cost_per_trial_usd),
     )
 
@@ -410,19 +435,32 @@ async def run_skill_validation(
 def _trial(
     *,
     task_name: str,
+    replicate_index: int,
     condition: str,
     candidate: ValidationCandidate | None,
     library_dir: Path,
 ) -> ValidationTrial:
     candidate_id = candidate.candidate_id if candidate is not None else None
     identity = json.dumps(
-        [VALIDATION_PROCEDURE_ID, condition, candidate_id, task_name],
+        [
+            VALIDATION_PROCEDURE_ID,
+            condition,
+            candidate_id,
+            task_name,
+            replicate_index,
+        ],
         separators=(",", ":"),
     )
+    # The replicate index changes the trial ID and therefore the Harbor job name.
+    # Harbor creates a separate job/container and the agent is sampled afresh, so
+    # this is repeated sampling rather than one run counted twice.  It estimates
+    # within-task run variability; it does not create the diversity or independent
+    # task effects that sampling another task would provide.
     trial_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
     return ValidationTrial(
         trial_id=trial_id,
         task_name=task_name,
+        replicate_index=replicate_index,
         condition=condition,
         candidate_id=candidate_id,
         distillation_arm=(
@@ -604,12 +642,16 @@ def _report(
         if attempt["status"] == ValidationTrialStatus.MEASURED.value
     }
     control_rewards = {
-        trial.task_name: measured[trial.trial_id]["reward"]
+        (trial.task_name, trial.replicate_index): measured[trial.trial_id]["reward"]
         for trial in trials
         if trial.condition == "without_skill" and trial.trial_id in measured
     }
     treatment_rewards = {
-        (trial.candidate_id, trial.task_name): measured[trial.trial_id]["reward"]
+        (
+            trial.candidate_id,
+            trial.task_name,
+            trial.replicate_index,
+        ): measured[trial.trial_id]["reward"]
         for trial in trials
         if trial.condition == "with_skill" and trial.trial_id in measured
     }
@@ -620,34 +662,45 @@ def _report(
     }
     rendered_candidates: list[dict[str, Any]] = []
     paired_measurements: list[dict[str, Any]] = []
-    trial_by_key = {(trial.candidate_id, trial.task_name): trial for trial in trials}
+    trial_by_key = {
+        (trial.candidate_id, trial.task_name, trial.replicate_index): trial
+        for trial in trials
+    }
     for candidate in plan.candidates:
         raw = raw_by_id[candidate.candidate_id]
         deltas: list[float | None] = []
         for task in plan.tasks:
-            baseline = control_rewards.get(task)
-            treatment = treatment_rewards.get((candidate.candidate_id, task))
-            delta = (
-                treatment - baseline
-                if treatment is not None and baseline is not None
-                else None
-            )
-            deltas.append(delta)
-            control_trial = trial_by_key[(None, task)]
-            treatment_trial = trial_by_key[(candidate.candidate_id, task)]
-            paired_measurements.append(
-                {
-                    "candidate_id": candidate.candidate_id,
-                    "arm": candidate.arm,
-                    "task_name": task,
-                    "control_trial_id": control_trial.trial_id,
-                    "treatment_trial_id": treatment_trial.trial_id,
-                    "control_reward": baseline,
-                    "treatment_reward": treatment,
-                    "delta": delta,
-                    "measured": delta is not None,
-                }
-            )
+            for replicate_index in range(1, plan.replicate_count + 1):
+                observation_key = (task, replicate_index)
+                treatment_key = (
+                    candidate.candidate_id,
+                    task,
+                    replicate_index,
+                )
+                baseline = control_rewards.get(observation_key)
+                treatment = treatment_rewards.get(treatment_key)
+                delta = (
+                    treatment - baseline
+                    if treatment is not None and baseline is not None
+                    else None
+                )
+                deltas.append(delta)
+                control_trial = trial_by_key[(None, task, replicate_index)]
+                treatment_trial = trial_by_key[treatment_key]
+                paired_measurements.append(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "arm": candidate.arm,
+                        "task_name": task,
+                        "replicate_index": replicate_index,
+                        "control_trial_id": control_trial.trial_id,
+                        "treatment_trial_id": treatment_trial.trial_id,
+                        "control_reward": baseline,
+                        "treatment_reward": treatment,
+                        "delta": delta,
+                        "measured": delta is not None,
+                    }
+                )
         raw["skill"] = candidate.skill_document
         raw["paired_deltas"] = deltas
         rendered_candidates.append(raw)
@@ -664,8 +717,8 @@ def _report(
             "completed_attempt_count": len(ordered_attempts),
             "measured_trial_count": len(measured),
             "pending_trial_count": pending,
-            "shared_control_trial_count": len(plan.tasks),
-            "treatment_trial_count": len(plan.tasks) * len(plan.candidates),
+            "shared_control_trial_count": plan.observation_count,
+            "treatment_trial_count": plan.observation_count * len(plan.candidates),
             "reused_trial_count": len(reused_ids),
             "new_attempt_count": len(ordered_attempts) - previous_attempt_count,
             "failed_attempt_count": status_counts[ValidationTrialStatus.FAILED.value],
@@ -674,7 +727,19 @@ def _report(
             "estimated_pending_cost_usd": (pending * plan.estimated_cost_per_trial_usd),
             "status_counts": dict(sorted(status_counts.items())),
         },
-        "control_rewards": control_rewards,
+        "control_measurements": [
+            {
+                "task_name": trial.task_name,
+                "replicate_index": trial.replicate_index,
+                "control_trial_id": trial.trial_id,
+                "reward": control_rewards.get((trial.task_name, trial.replicate_index)),
+                "measured": (
+                    (trial.task_name, trial.replicate_index) in control_rewards
+                ),
+            }
+            for trial in trials
+            if trial.condition == "without_skill"
+        ],
         "paired_measurements": paired_measurements,
         "attempts": ordered_attempts,
     }

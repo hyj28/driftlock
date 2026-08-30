@@ -1,0 +1,10 @@
+{
+  "selected_tasks": [
+    "alp-paper-reproduction",
+    "riscv-core-debug",
+    "spice-ephemeris-regression",
+    "commit0-multilib-tdd",
+    "unknown-config-semantics"
+  ],
+  "replicate_count": 2
+}
