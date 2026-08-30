@@ -470,10 +470,87 @@ async def test_distillation_keeps_declined_malformed_and_failed_distinct(
     assert result["attempts"][0]["reason"] == ("no repeatable prevention is supported")
     assert "malformed response" in result["attempts"][1]["reason"]
     assert "provider unavailable" in result["attempts"][2]["reason"]
+    assert result["attempts"][0]["response"] == {
+        "excerpt": "DECLINE: no repeatable prevention is supported",
+        "original_characters": 46,
+        "retained_characters": 46,
+        "retained_character_limit": 16_384,
+        "dropped_characters": 0,
+        "truncated": False,
+    }
+    assert result["attempts"][1]["response"] == {
+        "excerpt": "garbage",
+        "original_characters": 7,
+        "retained_characters": 7,
+        "retained_character_limit": 16_384,
+        "dropped_characters": 0,
+        "truncated": False,
+    }
+    assert "response" not in result["attempts"][2]
+    assert "response" not in result["attempts"][3]
     assert result["summary"]["candidate_count"] == 0
     assert result["summary"]["paired_candidate_segment_count"] == 0
     assert result["summary"]["unpaired_segment_count"] == 1
     assert result["summary"]["retryable_failure_count"] == 1
+
+
+async def test_hostile_malformed_response_is_bounded_and_report_round_trips(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path, segment_count=2)
+    plan = plan_skill_distillation(report_path)
+    meter = _Meter()
+    prefix = '\x00"status": "generated" {\ud800 START'
+    suffix = " END }}}\x1f\udfff"
+    hostile = prefix + ("x" * 499_959) + suffix
+    responses = iter(
+        [
+            hostile,
+            "DECLINE: evidence is not sufficient",
+            _SKILL,
+            _SKILL,
+        ]
+    )
+
+    async def complete(_prompt: str) -> str:
+        meter.charge()
+        return next(responses)
+
+    output = tmp_path / "candidates.json"
+    await run_skill_distillation(
+        plan,
+        output,
+        distiller=CallableSkillDistiller(complete),
+        usage_reader=meter.read,
+    )
+
+    serialized = output.read_text(encoding="utf-8")
+    persisted = json.loads(serialized)
+    malformed = persisted["attempts"][0]
+    assert malformed["status"] == "malformed"
+    assert malformed["response"]["original_characters"] == 500_000
+    assert malformed["response"]["retained_characters"] == 16_384
+    assert malformed["response"]["retained_character_limit"] == 16_384
+    assert malformed["response"]["dropped_characters"] == 483_616
+    assert malformed["response"]["truncated"] is True
+    assert malformed["response"]["excerpt"].startswith(prefix)
+    assert malformed["response"]["excerpt"].endswith(suffix)
+    assert (
+        "[... 483616 response characters omitted between excerpt halves ...]"
+        in malformed["response"]["excerpt"]
+    )
+    assert "\\u0000" in serialized
+    assert "\\ud800" in serialized
+    assert "\\u001f" in serialized
+    assert "\\udfff" in serialized
+    assert persisted["attempts"][1]["response"]["excerpt"] == (
+        "DECLINE: evidence is not sufficient"
+    )
+    assert "response" not in persisted["attempts"][2]
+    assert "response" not in persisted["attempts"][3]
+
+    loaded = load_admission_candidates(output)
+    assert [candidate.arm for candidate in loaded] == ["localized", "baseline"]
 
 
 def test_one_sided_call_failure_writes_no_candidate_and_exits_nonzero(
