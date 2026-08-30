@@ -49,6 +49,16 @@ _MAX_DIFF_CHARACTERS = 100_000
 # validated against the provider's accepted envelope, would settle a tighter bound.
 EVIDENCE_CHARACTER_LIMIT = 900_000
 
+# Only declined and malformed completions retain model text: generated text is
+# already represented by its parsed Skill, while a failed call has no response.
+# A 16 Ki-character head/tail excerpt is enough to expose wrappers, headings,
+# and trailing prose without letting repeated failures dominate the report.
+# Counts make every omission explicit.  The report writer's ASCII JSON escaping
+# safely represents controls and lone surrogates without changing this excerpt.
+# Decline reasons get a smaller cap because they otherwise duplicate that text.
+DISTILLATION_RESPONSE_CHARACTER_LIMIT = 16_384
+_DISTILLATION_REASON_CHARACTER_LIMIT = 1_024
+
 
 class SkillValidationError(ValueError):
     """A skill document does not satisfy the shared schema."""
@@ -86,14 +96,39 @@ def parse_skill(document: str) -> Skill:
     text = _unwrap_markdown_fence(document.strip())
     matches = list(_SECTION_HEADING.finditer(text))
     present = [match.group(1) for match in matches]
-    for section in SKILL_SECTIONS:
-        if section not in present:
-            raise SkillValidationError(f"skill is missing required section: {section}")
+    if not present:
+        if not text:
+            raise SkillValidationError(
+                "skill document is empty; no recognizable required section headings"
+            )
+        mentioned = [
+            section
+            for section in SKILL_SECTIONS
+            if re.search(rf"\b{section}\b", text, re.IGNORECASE)
+        ]
+        if mentioned:
+            raise SkillValidationError(
+                "skill has no recognizable required section headings; section names "
+                "appear without the required Markdown heading syntax: "
+                f"{', '.join(mentioned)}"
+            )
+        raise SkillValidationError(
+            "skill has no recognizable required section headings"
+        )
     duplicates = sorted(
         section for section in SKILL_SECTIONS if present.count(section) > 1
     )
     if duplicates:
-        raise SkillValidationError(f"skill repeats section: {', '.join(duplicates)}")
+        raise SkillValidationError(
+            f"skill has duplicate section: {', '.join(duplicates)}"
+        )
+    missing = [section for section in SKILL_SECTIONS if section not in present]
+    if len(missing) == 1:
+        raise SkillValidationError(f"skill is missing required section: {missing[0]}")
+    if missing:
+        raise SkillValidationError(
+            f"skill is missing required sections: {', '.join(missing)}"
+        )
     if tuple(present) != SKILL_SECTIONS:
         raise SkillValidationError(
             "skill sections must appear in activation, execution, termination order"
@@ -243,6 +278,68 @@ class SkillDistillationStatus(StrEnum):
     FAILED = "failed"
 
 
+def _response_omission_marker(dropped_characters: int) -> str:
+    return (
+        "\n\n[... "
+        f"{dropped_characters} response characters omitted between excerpt halves"
+        " ...]\n\n"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SkillDistillationResponse:
+    """Bounded diagnostic evidence from a non-generated model response."""
+
+    excerpt: str
+    original_characters: int
+    retained_characters: int
+    dropped_characters: int
+    truncated: bool
+
+    def __post_init__(self) -> None:
+        counts = (
+            self.original_characters,
+            self.retained_characters,
+            self.dropped_characters,
+        )
+        if (
+            not isinstance(self.excerpt, str)
+            or not isinstance(self.truncated, bool)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in counts
+            )
+            or self.retained_characters > DISTILLATION_RESPONSE_CHARACTER_LIMIT
+        ):
+            raise ValueError("distillation response evidence has invalid values")
+        if self.original_characters != (
+            self.retained_characters + self.dropped_characters
+        ) or self.truncated != (self.dropped_characters > 0):
+            raise ValueError("distillation response evidence has inconsistent counts")
+        if self.truncated:
+            marker = _response_omission_marker(self.dropped_characters)
+            marker_start = DISTILLATION_RESPONSE_CHARACTER_LIMIT // 2
+            if (
+                self.retained_characters != DISTILLATION_RESPONSE_CHARACTER_LIMIT
+                or len(self.excerpt)
+                != DISTILLATION_RESPONSE_CHARACTER_LIMIT + len(marker)
+                or self.excerpt[marker_start : marker_start + len(marker)] != marker
+            ):
+                raise ValueError("distillation response excerpt is not bounded")
+        elif len(self.excerpt) != self.retained_characters:
+            raise ValueError("complete distillation response count does not match text")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "excerpt": self.excerpt,
+            "original_characters": self.original_characters,
+            "retained_characters": self.retained_characters,
+            "retained_character_limit": DISTILLATION_RESPONSE_CHARACTER_LIMIT,
+            "dropped_characters": self.dropped_characters,
+            "truncated": self.truncated,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class SkillDistillationResult:
     """Parsed output without conflating a decline with an invalid response."""
@@ -251,6 +348,7 @@ class SkillDistillationResult:
     skill: Skill | None = None
     reason: str = ""
     tokens: int = 0
+    response: SkillDistillationResponse | None = None
 
     def __post_init__(self) -> None:
         if self.tokens < 0:
@@ -259,6 +357,14 @@ class SkillDistillationResult:
             self.status is SkillDistillationStatus.GENERATED
         ):
             raise ValueError("only generated distillation may carry a skill")
+        retains_response = self.status in {
+            SkillDistillationStatus.DECLINED,
+            SkillDistillationStatus.MALFORMED,
+        }
+        if (self.response is not None) != retains_response:
+            raise ValueError(
+                "only declined and malformed distillation must carry response evidence"
+            )
 
 
 class CallableSkillDistiller:
@@ -290,8 +396,9 @@ class CallableSkillDistiller:
         if decline is not None:
             return SkillDistillationResult(
                 status=SkillDistillationStatus.DECLINED,
-                reason=decline.group(1).strip(),
+                reason=_bounded_reason(decline.group(1).strip()),
                 tokens=tokens,
+                response=_response_excerpt(response),
             )
         try:
             skill = parse_skill(response)
@@ -300,12 +407,46 @@ class CallableSkillDistiller:
                 status=SkillDistillationStatus.MALFORMED,
                 reason=f"skill distiller returned a malformed response: {error}",
                 tokens=tokens,
+                response=_response_excerpt(response),
             )
         return SkillDistillationResult(
             status=SkillDistillationStatus.GENERATED,
             skill=skill,
             tokens=tokens,
         )
+
+
+def _response_excerpt(response: str) -> SkillDistillationResponse:
+    original_characters = len(response)
+    if original_characters <= DISTILLATION_RESPONSE_CHARACTER_LIMIT:
+        return SkillDistillationResponse(
+            excerpt=response,
+            original_characters=original_characters,
+            retained_characters=original_characters,
+            dropped_characters=0,
+            truncated=False,
+        )
+    head_characters = DISTILLATION_RESPONSE_CHARACTER_LIMIT // 2
+    tail_characters = DISTILLATION_RESPONSE_CHARACTER_LIMIT - head_characters
+    dropped_characters = original_characters - DISTILLATION_RESPONSE_CHARACTER_LIMIT
+    marker = _response_omission_marker(dropped_characters)
+    return SkillDistillationResponse(
+        excerpt=response[:head_characters] + marker + response[-tail_characters:],
+        original_characters=original_characters,
+        retained_characters=DISTILLATION_RESPONSE_CHARACTER_LIMIT,
+        dropped_characters=dropped_characters,
+        truncated=True,
+    )
+
+
+def _bounded_reason(reason: str) -> str:
+    if len(reason) <= _DISTILLATION_REASON_CHARACTER_LIMIT:
+        return reason
+    dropped = len(reason) - _DISTILLATION_REASON_CHARACTER_LIMIT
+    return (
+        reason[:_DISTILLATION_REASON_CHARACTER_LIMIT]
+        + f" [... {dropped} response characters omitted; see response excerpt]"
+    )
 
 
 def _unwrap_markdown_fence(text: str) -> str:

@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 from driftlock.skill_distillation import (
     EVIDENCE_CHARACTER_LIMIT,
+    SkillDistillationResponse,
     SkillDistillationResult,
     SkillDistillationStatus,
     assemble_baseline_evidence,
@@ -328,6 +329,8 @@ async def run_skill_distillation(
         }
         if result.skill is not None:
             attempt["skill"] = serialize_skill(result.skill)
+        if result.response is not None:
+            attempt["response"] = result.response.as_dict()
         attempts.append(attempt)
         latest_by_id[item.candidate_id] = attempt
         _write_report(
@@ -492,6 +495,20 @@ def _load_previous(
             raise ValueError(
                 f"existing non-generated distillation carries a skill: {path}"
             )
+        response = raw.get("response")
+        if response is not None:
+            _validate_response_record(response, status, path)
+        if (
+            status
+            in {
+                SkillDistillationStatus.GENERATED,
+                SkillDistillationStatus.FAILED,
+            }
+            and "response" in raw
+        ):
+            raise ValueError(
+                f"existing distillation output retains redundant response text: {path}"
+            )
         reason = raw.get("reason")
         tokens = raw.get("tokens")
         if (
@@ -536,6 +553,34 @@ def _load_previous(
         if status is not SkillDistillationStatus.FAILED:
             terminal_candidates.add(candidate_id)
     return attempts
+
+
+def _validate_response_record(
+    response: object, status: SkillDistillationStatus, path: Path
+) -> None:
+    if status not in {
+        SkillDistillationStatus.DECLINED,
+        SkillDistillationStatus.MALFORMED,
+    } or not isinstance(response, Mapping):
+        raise ValueError(
+            f"existing distillation output has invalid response evidence: {path}"
+        )
+    try:
+        normalized = SkillDistillationResponse(
+            excerpt=response.get("excerpt"),  # type: ignore[arg-type]
+            original_characters=response.get("original_characters"),  # type: ignore[arg-type]
+            retained_characters=response.get("retained_characters"),  # type: ignore[arg-type]
+            dropped_characters=response.get("dropped_characters"),  # type: ignore[arg-type]
+            truncated=response.get("truncated"),  # type: ignore[arg-type]
+        ).as_dict()
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"existing distillation output has invalid response evidence: {path}"
+        ) from None
+    if dict(response) != normalized:
+        raise ValueError(
+            f"existing distillation output has invalid response evidence: {path}"
+        )
 
 
 def _usage_snapshot(reader: Callable[[], ReplayUsage]) -> ReplayUsage:
@@ -723,6 +768,7 @@ def _write_report(path: Path, report: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     temporary.replace(path)

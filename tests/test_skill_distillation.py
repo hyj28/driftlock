@@ -17,6 +17,7 @@ from driftlock.models import (
     RunStatus,
 )
 from driftlock.skill_distillation import (
+    DISTILLATION_RESPONSE_CHARACTER_LIMIT,
     EVIDENCE_CHARACTER_LIMIT,
     EVIDENCE_END,
     EVIDENCE_START,
@@ -195,6 +196,47 @@ def test_skill_schema_names_each_missing_section(section: str) -> None:
         SkillValidationError, match=f"missing required section: {section}"
     ):
         parse_skill(document)
+
+
+@pytest.mark.parametrize(
+    ("document", "expected_reason"),
+    [
+        (
+            "The evidence is inconclusive, so no skill was produced.",
+            "skill has no recognizable required section headings",
+        ),
+        (
+            "**activation**\nWhen parsing.\n\n**execution**\nInspect first.",
+            (
+                "skill has no recognizable required section headings; section names "
+                "appear without the required Markdown heading syntax: activation, "
+                "execution"
+            ),
+        ),
+        (
+            "## activation\n\nWhen parsing.\n\n## execution\n\nInspect first.",
+            "skill is missing required section: termination",
+        ),
+        (
+            "## execution\n\nInspect first.\n\n## activation\n\nWhen parsing.\n\n"
+            "## termination\n\nStop after validation.",
+            ("skill sections must appear in activation, execution, termination order"),
+        ),
+        (
+            "## activation\n\nWhen parsing.\n\n## activation\n\nStill parsing.\n\n"
+            "## execution\n\nInspect first.\n\n## termination\n\n"
+            "Stop after validation.",
+            "skill has duplicate section: activation",
+        ),
+    ],
+)
+def test_skill_schema_classifies_malformed_document_shape(
+    document: str, expected_reason: str
+) -> None:
+    with pytest.raises(SkillValidationError) as raised:
+        parse_skill(document)
+
+    assert str(raised.value) == expected_reason
 
 
 def test_localized_evidence_uses_nonzero_phase_offset_and_real_workspace_diff(
@@ -435,9 +477,71 @@ async def test_callable_distiller_distinguishes_malformed_from_declined() -> Non
     assert malformed.status is SkillDistillationStatus.MALFORMED
     assert malformed.status.value == "malformed"
     assert "missing required section: termination" in malformed.reason
+    assert malformed.response is not None
+    assert malformed.response.as_dict() == {
+        "excerpt": (
+            "## activation\n\nWhen offsets differ.\n\n## execution\n\nVerify counts."
+        ),
+        "original_characters": 65,
+        "retained_characters": 65,
+        "retained_character_limit": 16_384,
+        "dropped_characters": 0,
+        "truncated": False,
+    }
     assert declined.status is SkillDistillationStatus.DECLINED
     assert declined.status.value == "declined"
     assert declined.reason == "the evidence shows no repeatable failure"
+    assert declined.response is not None
+    assert declined.response.excerpt == (
+        "DECLINE: the evidence shows no repeatable failure"
+    )
+    assert declined.response.truncated is False
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_reason", "expected_characters"),
+    [
+        (
+            "The evidence did not yield a procedural skill.",
+            "no recognizable required section headings",
+            46,
+        ),
+        (
+            "## activation\n\nWhen offsets differ.\n\n## execution\n\nVerify counts.",
+            "missing required section: termination",
+            65,
+        ),
+        (
+            "## execution\n\nVerify counts.\n\n## activation\n\n"
+            "When offsets differ.\n\n"
+            "## termination\n\nStop after validation.",
+            "sections must appear in activation, execution, termination order",
+            105,
+        ),
+        (
+            "## activation\n\nWhen offsets differ.\n\n## activation\n\nAgain.\n\n"
+            "## execution\n\nVerify counts.\n\n## termination\n\n"
+            "Stop after validation.",
+            "duplicate section: activation",
+            128,
+        ),
+    ],
+)
+async def test_callable_distiller_retains_each_malformed_shape(
+    response: str, expected_reason: str, expected_characters: int
+) -> None:
+    async def complete(_prompt: str) -> str:
+        return response
+
+    result = await CallableSkillDistiller(complete).distill({"trajectory": []})
+
+    assert result.status is SkillDistillationStatus.MALFORMED
+    assert expected_reason in result.reason
+    assert result.response is not None
+    assert result.response.excerpt == response
+    assert result.response.original_characters == expected_characters
+    assert result.response.dropped_characters == 0
+    assert result.response.truncated is False
 
 
 async def test_callable_distiller_requires_no_credentials(
@@ -453,6 +557,39 @@ async def test_callable_distiller_requires_no_credentials(
     result = await CallableSkillDistiller(complete).distill({"trajectory": []})
 
     assert result.status is SkillDistillationStatus.DECLINED
+
+
+async def test_callable_distiller_does_not_retain_a_generated_response() -> None:
+    async def complete(_prompt: str) -> str:
+        return (
+            "## activation\n\nWhen offsets differ.\n\n"
+            "## execution\n\nVerify counts.\n\n"
+            "## termination\n\nStop after validation."
+        )
+
+    result = await CallableSkillDistiller(complete).distill({"trajectory": []})
+
+    assert result.status is SkillDistillationStatus.GENERATED
+    assert result.response is None
+    assert DISTILLATION_RESPONSE_CHARACTER_LIMIT == 16_384
+
+
+async def test_callable_distiller_bounds_a_long_decline_and_its_reason() -> None:
+    async def complete(_prompt: str) -> str:
+        return "DECLINE: " + ("d" * 20_000)
+
+    result = await CallableSkillDistiller(complete).distill({"trajectory": []})
+
+    assert result.status is SkillDistillationStatus.DECLINED
+    assert len(result.reason) == 1_086
+    assert result.reason.endswith(
+        " [... 18976 response characters omitted; see response excerpt]"
+    )
+    assert result.response is not None
+    assert result.response.original_characters == 20_009
+    assert result.response.retained_characters == 16_384
+    assert result.response.dropped_characters == 3_625
+    assert result.response.truncated is True
 
 
 @pytest.mark.parametrize(
