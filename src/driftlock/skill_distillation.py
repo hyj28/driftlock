@@ -29,9 +29,20 @@ from driftlock.oracle import (
 SKILL_SECTIONS = ("activation", "execution", "termination")
 EVIDENCE_START = "<evidence>"
 EVIDENCE_END = "</evidence>"
+# A gloss is heading metadata, not skill content: accept only conventional,
+# explicit separators after the complete section name, then discard that bounded
+# same-line label.  Requiring a whitespace-delimited dash, colon, or one non-nested
+# parenthetical keeps phrases such as "activation and termination notes" from
+# silently becoming activation, while still admitting the labels models commonly
+# add.  Procedural meaning belongs in the required non-empty body, where it
+# survives serialization.
 _SECTION_HEADING = re.compile(
-    r"^#{1,6}[ \t]+(activation|execution|termination)[ \t]*$",
-    re.MULTILINE,
+    r"^#{1,6}[ \t]+(activation|execution|termination)"
+    r"(?:[ \t]+[-\N{EN DASH}—][ \t]+[^\r\n]{1,120}"
+    r"|[ \t]*:[ \t]+[^\r\n]{1,120}"
+    r"|[ \t]+\([^()\r\n]{1,120}\))?"
+    r"[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 _DECLINE = re.compile(r"^DECLINE:[ \t]*(.+)$", re.IGNORECASE | re.DOTALL)
 _MAX_TEXT_FILE_BYTES = 256 * 1024
@@ -95,7 +106,7 @@ def parse_skill(document: str) -> Skill:
         raise SkillValidationError("skill document must be text")
     text = _unwrap_markdown_fence(document.strip())
     matches = list(_SECTION_HEADING.finditer(text))
-    present = [match.group(1) for match in matches]
+    present = [match.group(1).lower() for match in matches]
     if not present:
         if not text:
             raise SkillValidationError(
@@ -139,7 +150,7 @@ def parse_skill(document: str) -> Skill:
     values: dict[str, str] = {}
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        values[match.group(1)] = text[match.end() : end].strip()
+        values[match.group(1).lower()] = text[match.end() : end].strip()
     return Skill(**values)
 
 
