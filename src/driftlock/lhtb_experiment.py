@@ -918,6 +918,8 @@ def _build_skill_distiller(
             cost_usd=client.cost_usd,
         )
 
+    usage_reader.driftlock_accounting_reader = client.accounting_snapshot  # type: ignore[attr-defined]
+
     return (
         CallableSkillDistiller(complete),
         usage_reader,
@@ -1274,6 +1276,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{summary['evidence_refusal_count']} evidence-refused "
                     "segment(s)"
                 )
+                for segment in plan.evidence_sizes:
+                    rendered_arms = []
+                    for arm in DISTILLATION_ARMS:
+                        size = segment["arms"][arm]
+                        if size["characters"] is None:
+                            rendered = "unavailable"
+                        else:
+                            rendered = f"{size['characters']:,} chars"
+                            if size["status"] == "at_or_over_bound":
+                                rendered += " [AT/OVER BOUND]"
+                        rendered_arms.append(f"{arm}={rendered}")
+                    print(
+                        f"  {segment['task_name']} segment "
+                        f"{segment['segment_index']} evidence: "
+                        + "; ".join(rendered_arms)
+                    )
             else:
                 print(
                     f"completed {summary['completed_call_count']} model call(s); "

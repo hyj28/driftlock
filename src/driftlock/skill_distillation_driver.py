@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from driftlock.skill_distillation import (
+    EVIDENCE_CHARACTER_LIMIT,
     SkillDistillationResult,
     SkillDistillationStatus,
     assemble_baseline_evidence,
     assemble_localized_evidence,
+    build_distillation_prompt,
     parse_skill,
     serialize_skill,
 )
@@ -67,6 +69,7 @@ class DistillationPlan:
     work_items: tuple[DistillationWorkItem, ...]
     refused_tasks: tuple[dict[str, Any], ...]
     evidence_refusals: tuple[dict[str, Any], ...]
+    evidence_sizes: tuple[dict[str, Any], ...]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +80,8 @@ class DistillationPlan:
             "callable_segment_count": len(self.work_items) // len(DISTILLATION_ARMS),
             "evidence_refusal_count": len(self.evidence_refusals),
             "evidence_refusals": list(self.evidence_refusals),
+            "evidence_character_limit": EVIDENCE_CHARACTER_LIMIT,
+            "evidence_sizes": list(self.evidence_sizes),
             "call_count": len(self.work_items),
             "work_items": [item.identity() for item in self.work_items],
         }
@@ -91,6 +96,7 @@ def plan_skill_distillation(localization_report: Path | str) -> DistillationPlan
     tasks = data["tasks"]
     refused_tasks: list[dict[str, Any]] = []
     evidence_refusals: list[dict[str, Any]] = []
+    evidence_sizes: list[dict[str, Any]] = []
     work_items: list[DistillationWorkItem] = []
     seen_task_names: set[str] = set()
     localized_segment_count = 0
@@ -133,6 +139,17 @@ def plan_skill_distillation(localization_report: Path | str) -> DistillationPlan
                 "localized": assemble_localized_evidence(trial_dir, segment),
                 "baseline": assemble_baseline_evidence(trial_dir),
             }
+            evidence_sizes.append(
+                {
+                    "task_name": task_name,
+                    "trial_name": trial_name,
+                    "segment_index": segment_index,
+                    "arms": {
+                        arm: _evidence_size(evidence)
+                        for arm, evidence in evidence_by_arm.items()
+                    },
+                }
+            )
             refused = {
                 arm: _refusal(evidence.get("refusal"), f"{arm} evidence")
                 for arm, evidence in evidence_by_arm.items()
@@ -149,6 +166,16 @@ def plan_skill_distillation(localization_report: Path | str) -> DistillationPlan
                     f"invalid status for: {', '.join(malformed)}"
                 )
             if refused:
+                refused_arms = ", ".join(sorted(refused))
+                for arm in DISTILLATION_ARMS:
+                    if arm not in refused:
+                        refused[arm] = {
+                            "reason": "paired_arm_refused",
+                            "detail": (
+                                f"{arm} evidence was skipped because the paired "
+                                f"{refused_arms} arm was refused"
+                            ),
+                        }
                 evidence_refusals.append(
                     {
                         "task_name": task_name,
@@ -188,7 +215,27 @@ def plan_skill_distillation(localization_report: Path | str) -> DistillationPlan
         work_items=tuple(work_items),
         refused_tasks=tuple(refused_tasks),
         evidence_refusals=tuple(evidence_refusals),
+        evidence_sizes=tuple(evidence_sizes),
     )
+
+
+def _evidence_size(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    characters = evidence.get("evidence_characters")
+    if not isinstance(characters, int) or isinstance(characters, bool):
+        return {
+            "status": "unavailable",
+            "characters": None,
+            "character_limit": EVIDENCE_CHARACTER_LIMIT,
+        }
+    return {
+        "status": (
+            "at_or_over_bound"
+            if characters >= EVIDENCE_CHARACTER_LIMIT
+            else "within_bound"
+        ),
+        "characters": characters,
+        "character_limit": EVIDENCE_CHARACTER_LIMIT,
+    }
 
 
 async def run_skill_distillation(
@@ -243,6 +290,7 @@ async def run_skill_distillation(
         if item.candidate_id in reused_ids:
             continue
         before = _usage_snapshot(usage_reader)
+        accounting_before = _accounting_snapshot(usage_reader)
         try:
             result = await distiller.distill(item.evidence)
             if not isinstance(result, SkillDistillationResult):
@@ -253,7 +301,9 @@ async def run_skill_distillation(
                 reason=f"skill distiller call failed: {error}",
             )
         after = _usage_snapshot(usage_reader)
+        accounting_after = _accounting_snapshot(usage_reader)
         usage = _usage_delta(after, before)
+        prompt = build_distillation_prompt(item.evidence)
         attempt = {
             **item.identity(),
             "attempt_number": 1
@@ -264,6 +314,16 @@ async def run_skill_distillation(
             "reason": result.reason,
             "tokens": result.tokens,
             "usage": usage.as_dict(),
+            "prompt_characters": len(prompt),
+            "prompt_utf8_bytes": len(prompt.encode("utf-8")),
+            "usage_accounting": _accounting_delta(accounting_after, accounting_before),
+            "token_reconciliation": {
+                "result_tokens": result.tokens,
+                "usage_input_plus_output_tokens": (
+                    usage.input_tokens + usage.output_tokens
+                ),
+                "matches": result.tokens == usage.input_tokens + usage.output_tokens,
+            },
             "reused": False,
         }
         if result.skill is not None:
@@ -451,6 +511,27 @@ def _load_previous(
             )
         normalized = dict(raw)
         normalized["attempt_number"] = attempt_number
+        prompt = build_distillation_prompt(item.evidence)
+        normalized.setdefault("prompt_characters", len(prompt))
+        normalized.setdefault("prompt_utf8_bytes", len(prompt.encode("utf-8")))
+        normalized.setdefault(
+            "usage_accounting",
+            {
+                "status": "unavailable",
+                "reason": "attempt predates per-attempt accounting provenance",
+            },
+        )
+        usage = ReplayUsage.from_mapping(raw.get("usage"))
+        normalized.setdefault(
+            "token_reconciliation",
+            {
+                "result_tokens": tokens,
+                "usage_input_plus_output_tokens": (
+                    usage.input_tokens + usage.output_tokens
+                ),
+                "matches": tokens == usage.input_tokens + usage.output_tokens,
+            },
+        )
         attempts.append(normalized)
         if status is not SkillDistillationStatus.FAILED:
             terminal_candidates.add(candidate_id)
@@ -462,6 +543,43 @@ def _usage_snapshot(reader: Callable[[], ReplayUsage]) -> ReplayUsage:
     if not isinstance(usage, ReplayUsage):
         raise TypeError("usage reader must return ReplayUsage")
     return usage
+
+
+def _accounting_snapshot(
+    reader: Callable[[], ReplayUsage],
+) -> dict[str, int] | None:
+    accounting_reader = getattr(reader, "driftlock_accounting_reader", None)
+    if accounting_reader is None:
+        return None
+    value = accounting_reader()
+    if not isinstance(value, Mapping) or not value:
+        raise TypeError("distillation accounting reader must return a non-empty object")
+    snapshot: dict[str, int] = {}
+    for key, count in value.items():
+        if not isinstance(key, str) or not key:
+            raise TypeError("distillation accounting keys must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise TypeError(
+                "distillation accounting values must be nonnegative integers"
+            )
+        snapshot[key] = count
+    return snapshot
+
+
+def _accounting_delta(
+    after: dict[str, int] | None, before: dict[str, int] | None
+) -> dict[str, Any]:
+    if after is None and before is None:
+        return {
+            "status": "unavailable",
+            "reason": "usage reader exposes no per-attempt accounting provenance",
+        }
+    if after is None or before is None or set(after) != set(before):
+        raise RuntimeError("distillation accounting fields changed during a call")
+    delta = {key: after[key] - before[key] for key in after}
+    if any(value < 0 for value in delta.values()):
+        raise RuntimeError("distillation accounting moved backwards")
+    return {"status": "recorded", **delta}
 
 
 def _usage_delta(after: ReplayUsage, before: ReplayUsage) -> ReplayUsage:

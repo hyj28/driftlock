@@ -70,6 +70,22 @@ def _checkpoint(trial: Path, *, step: int, checkpoint_id: str, source: str) -> N
     )
 
 
+def _replace_checkpoint_with_checkout(trial: Path, checkpoint_id: str) -> None:
+    directory = (
+        trial / ".driftlock-checkpoints" / "phase-0" / "checkpoints" / checkpoint_id
+    )
+    files = {f"vendor/{index:04d}-{'x' * 340}.py": "x\n" for index in range(2_500)}
+    archive = _archive(files)
+    state = (directory / "state.json").read_bytes()
+    digest = hashlib.sha256(archive)
+    digest.update(b"\0state\0")
+    digest.update(state)
+    (directory / "workspace.tar.gz").write_bytes(archive)
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    manifest["digest"] = digest.hexdigest()
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def _trial(source_job: Path) -> Path:
     trial = source_job / "synthetic__trial"
     agent = trial / "agent"
@@ -348,6 +364,66 @@ async def test_real_run_records_each_arms_exact_usage_and_admission_shape(
     loaded = load_admission_candidates(output)
     assert [candidate.arm for candidate in loaded] == ["localized", "baseline"]
     assert [candidate.paired_deltas for candidate in loaded] == [(), ()]
+
+
+async def test_attempt_records_per_call_accounting_provenance(
+    tmp_path: Path,
+) -> None:
+    report_path = _report(tmp_path)
+    plan = plan_skill_distillation(report_path)
+    meter = _Meter()
+    accounting = {
+        "physical_request_count": 0,
+        "provider_reported_token_count": 0,
+        "provider_reported_cost_count": 0,
+        "reported_tokens_priced_count": 0,
+        "successful_response_fallback_count": 0,
+        "missing_reported_usage_count": 0,
+        "invalid_reported_usage_count": 0,
+        "error_without_usage_count": 0,
+        "conservative_usage_fallbacks": 0,
+    }
+
+    async def complete(_prompt: str) -> JudgeCompletion:
+        meter.charge(input_tokens=120, cache_tokens=20, output_tokens=10)
+        accounting["physical_request_count"] += 1
+        accounting["provider_reported_token_count"] += 1
+        accounting["reported_tokens_priced_count"] += 1
+        accounting["conservative_usage_fallbacks"] += 1
+        return JudgeCompletion(_SKILL, tokens=130)
+
+    def usage_reader() -> ReplayUsage:
+        return meter.read()
+
+    usage_reader.driftlock_accounting_reader = lambda: dict(accounting)  # type: ignore[attr-defined]
+
+    result = await run_skill_distillation(
+        plan,
+        tmp_path / "candidates.json",
+        distiller=CallableSkillDistiller(complete),
+        usage_reader=usage_reader,
+    )
+
+    attempt = result["attempts"][0]
+    assert attempt["usage_accounting"] == {
+        "status": "recorded",
+        "physical_request_count": 1,
+        "provider_reported_token_count": 1,
+        "provider_reported_cost_count": 0,
+        "reported_tokens_priced_count": 1,
+        "successful_response_fallback_count": 0,
+        "missing_reported_usage_count": 0,
+        "invalid_reported_usage_count": 0,
+        "error_without_usage_count": 0,
+        "conservative_usage_fallbacks": 1,
+    }
+    assert attempt["token_reconciliation"] == {
+        "result_tokens": 130,
+        "usage_input_plus_output_tokens": 130,
+        "matches": True,
+    }
+    assert attempt["prompt_characters"] == 2_459
+    assert attempt["prompt_utf8_bytes"] == 2_465
 
 
 async def test_distillation_keeps_declined_malformed_and_failed_distinct(
@@ -790,6 +866,47 @@ def test_distill_skills_dry_run_surfaces_missing_archive_and_nonzero_status(
     empty_process = _run_console(report_path, output, dry_run=True)
     assert empty_process.returncode == 0
     assert "0 evidence-refused segment(s)" in empty_process.stdout
+    assert not output.exists()
+
+
+def test_distill_skills_dry_run_reports_oversized_evidence_and_pairs_refusal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = _report(tmp_path)
+    output = tmp_path / "candidates.json"
+    _replace_checkpoint_with_checkout(
+        tmp_path / "source-job" / "synthetic__trial", "b" * 32
+    )
+
+    def provider_forbidden(**kwargs: object) -> object:
+        del kwargs
+        raise AssertionError("dry run initialized the provider")
+
+    monkeypatch.setattr(experiment, "_build_skill_distiller", provider_forbidden)
+
+    assert (
+        main(
+            [
+                "distill-skills",
+                str(report_path),
+                "--output",
+                str(output),
+                "--dry-run",
+            ]
+        )
+        == 1
+    )
+
+    printed = capsys.readouterr().out
+    assert "task-a segment 0 evidence: localized=" in printed
+    assert "[AT/OVER BOUND]" in printed
+    assert "baseline=" in printed
+    assert "localized (evidence_size_limit_exceeded)" in printed
+    assert "baseline (paired_arm_refused)" in printed
+    assert "0 model call(s) to make" in printed
+    assert "dry run; no provider calls made and no output written" in printed
     assert not output.exists()
 
 
