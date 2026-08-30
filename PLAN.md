@@ -571,6 +571,18 @@ rate should sit visibly above it. That is now the project's central bet: §2.3a 
 what rollback is worth, and nothing yet shows a scored segment distils better than a
 whole trajectory.
 
+**One caveat the pass rate has to carry.** The no-skill control for a validation task is
+measured **once** and paired into every candidate's delta for that task. That is what keeps
+the bill at one control per task rather than one per candidate — 150 trials instead of 290 —
+and it is what makes the two arms comparable, since both draw the same controls. But it means
+control-trial noise is a **correlated** error source across candidates: a task whose control
+happened to score low makes every candidate look better on that task at once. The admission
+rule's null bound assumes independent task-level signs *within* a candidate, which this does
+not disturb; what it does disturb is treating the candidates as independent tests of one
+another. A pass rate computed over a cohort sharing controls is not the same object as 388
+independent trials, and the write-up should say so rather than let the comparison to 14.2%
+imply otherwise.
+
 ### 3.5 The two questions this has to survive
 
 > *"How is checkpoint-and-rollback different from just retrying on failure? Aren't you

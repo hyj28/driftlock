@@ -71,6 +71,15 @@ from driftlock.skill_distillation_driver import (
     plan_skill_distillation,
     run_skill_distillation,
 )
+from driftlock.skill_validation import (
+    DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
+    VALIDATION_REPORT_NAME,
+    ValidationTrial,
+    ValidationTrialResult,
+    ValidationTrialStatus,
+    plan_skill_validation,
+    run_skill_validation,
+)
 from driftlock.usage import ReplayUsage
 
 # Both identifiers carry an explicit dated build. An unversioned alias such as
@@ -950,6 +959,145 @@ def _skill_distillation_metadata(
     }
 
 
+class _HarborSkillValidationRunner:
+    """Run one isolated validation trial and verify its injection provenance."""
+
+    def __init__(
+        self,
+        *,
+        lhtb_dir: Path,
+        work_dir: Path,
+        skill_embedder_import_path: str,
+        model: str,
+        provider: str,
+        api_base: str,
+        judge_api_base: str | None,
+        judge_provider: str,
+        timeout_sec: int,
+        max_total_tokens: int,
+    ) -> None:
+        self.lhtb_dir = lhtb_dir.expanduser().resolve()
+        self.work_dir = work_dir.expanduser().resolve()
+        self.skill_embedder_import_path = skill_embedder_import_path
+        self.model = model
+        self.provider = provider
+        self.api_base = api_base
+        self.judge_api_base = judge_api_base
+        self.judge_provider = judge_provider
+        self.timeout_sec = timeout_sec
+        self.max_total_tokens = max_total_tokens
+
+    async def run(self, trial: ValidationTrial) -> ValidationTrialResult:
+        configs_dir = self.work_dir / "configs"
+        jobs_dir = self.work_dir / "jobs"
+        configs_dir.mkdir(parents=True, exist_ok=True)
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        config_path = configs_dir / f"{trial.job_name}.json"
+        job_dir = jobs_dir / trial.job_name
+        config = build_job_config(
+            lhtb_dir=self.lhtb_dir,
+            jobs_dir=jobs_dir,
+            job_name=trial.job_name,
+            arm=f"skill-{trial.distillation_arm}",
+            tasks=[trial.task_name],
+            model=self.model,
+            provider=self.provider,
+            api_base=self.api_base,
+            n_concurrent_trials=1,
+            timeout_sec=self.timeout_sec,
+            max_total_tokens=self.max_total_tokens,
+            judge_api_base=self.judge_api_base,
+            judge_provider=self.judge_provider,
+            skill_library_dir=trial.library_dir,
+            skill_embedder_import_path=self.skill_embedder_import_path,
+        )
+        config_path.write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        recovered = (job_dir / "result.json").is_file()
+        exit_code: int | None = None
+        if not recovered:
+            child_env = os.environ.copy()
+            child_env.pop("HB_PROCESS_REWARD", None)
+            child_env["HB_CONTINUE_MODE"] = "same_conversation"
+            completed = subprocess.run(
+                [*_pinned_harbor_command(), "run", "-c", str(config_path)],
+                cwd=self.lhtb_dir,
+                check=False,
+                env=child_env,
+            )
+            exit_code = completed.returncode
+        audit: dict[str, Any] = {
+            "job_name": trial.job_name,
+            "job_dir": str(job_dir),
+            "config": str(config_path),
+            "recovered_existing_job": recovered,
+            "process_exit_code": exit_code,
+        }
+        try:
+            reward = (
+                single_job_reward(job_dir)
+                if (job_dir / "result.json").is_file()
+                else None
+            )
+            injected_ids, injection_audit = _validation_injection_evidence(job_dir)
+            audit["skill_injection"] = injection_audit
+        except (FileNotFoundError, OSError, ValueError) as error:
+            return ValidationTrialResult(
+                status=ValidationTrialStatus.FAILED,
+                reason=f"validation job evidence is unusable: {error}",
+                audit=audit,
+            )
+        if reward is None:
+            detail = (
+                f"process exited {exit_code}"
+                if exit_code is not None
+                else "job recovered"
+            )
+            return ValidationTrialResult(
+                status=ValidationTrialStatus.FAILED,
+                reason=f"validation job produced no reward ({detail})",
+                injected_candidate_ids=injected_ids,
+                audit=audit,
+            )
+        return ValidationTrialResult(
+            status=ValidationTrialStatus.MEASURED,
+            reward=reward,
+            injected_candidate_ids=injected_ids,
+            audit=audit,
+        )
+
+
+def _validation_injection_evidence(
+    job_dir: Path,
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    records = sorted(job_dir.glob("*/agent/driftlock-result.json"))
+    if len(records) != 1:
+        raise ValueError(
+            f"validation job has {len(records)} skill-injection records; expected one"
+        )
+    path = records[0]
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid skill-injection record: {path}") from error
+    skill_layer = record.get("skill_layer") if isinstance(record, dict) else None
+    injection = skill_layer.get("injection") if isinstance(skill_layer, dict) else None
+    candidate_ids = (
+        injection.get("candidate_ids") if isinstance(injection, dict) else None
+    )
+    if not isinstance(candidate_ids, list) or any(
+        not isinstance(candidate_id, str) for candidate_id in candidate_ids
+    ):
+        raise ValueError(f"skill-injection record has invalid candidate ids: {path}")
+    return tuple(candidate_ids), {
+        "record": str(path),
+        "status": injection.get("status"),
+        "candidate_ids": candidate_ids,
+        "distillation_arm": skill_layer.get("distillation_arm"),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -1353,6 +1501,118 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 1 if invalid_cohort else 0
+        if args.command == "validate-skills":
+            plan = plan_skill_validation(
+                args.candidate_file,
+                args.validation_tasks,
+                estimated_cost_per_trial_usd=args.estimated_cost_per_trial,
+            )
+            output = args.output.expanduser().resolve()
+            work_dir = (
+                args.work_dir.expanduser().resolve()
+                if args.work_dir is not None
+                else output.with_name(f"{output.stem}-work")
+            )
+            validation_run_metadata = {
+                "model": args.model,
+                "provider": args.provider,
+                "api_base": args.api_base,
+                "judge_model": DEFAULT_JUDGE_MODEL,
+                "judge_provider": args.judge_provider,
+                "judge_api_base": args.judge_api_base or args.api_base,
+                "skill_embedder_import_path": args.skill_embedder,
+                "timeout_sec": args.timeout_sec,
+                "max_total_tokens": args.max_total_tokens,
+            }
+
+            class _UncallableValidationRunner:
+                async def run(self, trial: ValidationTrial) -> ValidationTrialResult:
+                    del trial
+                    raise AssertionError("dry run must not invoke the trial runner")
+
+            if args.dry_run:
+                runner: Any = _UncallableValidationRunner()
+            else:
+                if not args.skill_embedder:
+                    raise ValueError("a paid validation run requires --skill-embedder")
+                preflight(args.lhtb_dir, credential_env=args.credential_env)
+                if not args.no_provider_probe:
+                    probe_provider(
+                        model=args.model,
+                        provider=args.provider,
+                        api_base=args.api_base,
+                        credential_env=args.credential_env,
+                    )
+                    probe_provider(
+                        model=DEFAULT_JUDGE_MODEL,
+                        provider=args.judge_provider,
+                        api_base=args.judge_api_base or args.api_base,
+                        credential_env=args.credential_env,
+                    )
+                runner = _HarborSkillValidationRunner(
+                    lhtb_dir=args.lhtb_dir,
+                    work_dir=work_dir,
+                    skill_embedder_import_path=args.skill_embedder,
+                    model=args.model,
+                    provider=args.provider,
+                    api_base=args.api_base,
+                    judge_api_base=args.judge_api_base,
+                    judge_provider=args.judge_provider,
+                    timeout_sec=args.timeout_sec,
+                    max_total_tokens=args.max_total_tokens,
+                )
+            report = asyncio.run(
+                run_skill_validation(
+                    plan,
+                    output,
+                    runner=runner,
+                    work_dir=work_dir,
+                    run_metadata=validation_run_metadata,
+                    dry_run=args.dry_run,
+                )
+            )
+            summary = report["validation"]["summary"]
+            print(
+                f"{summary['planned_trial_count']} trial(s) planned: "
+                f"{summary['shared_control_trial_count']} shared no-skill + "
+                f"{summary['treatment_trial_count']} with-skill; estimated "
+                f"${summary['estimated_planned_cost_usd']:.3f} at "
+                f"${summary['estimated_cost_per_trial_usd']:.3f}/trial; "
+                f"{summary['pending_trial_count']} pending, "
+                f"{summary['reused_trial_count']} reused"
+            )
+            print("  shared no-skill controls:")
+            for task in plan.tasks:
+                print(
+                    f"    {task}: 1 trial, estimated "
+                    f"${plan.estimated_cost_per_trial_usd:.3f}"
+                )
+            for candidate in plan.candidates:
+                print(f"  {candidate.candidate_id} [{candidate.arm}]:")
+                for task in plan.tasks:
+                    print(
+                        f"    {task}: 1 with-skill trial, estimated "
+                        f"${plan.estimated_cost_per_trial_usd:.3f}"
+                    )
+            if args.dry_run:
+                print("dry run; no trials run and no files written")
+                return 0
+            latest = {
+                attempt["trial_id"]: attempt
+                for attempt in report["validation"]["attempts"]
+            }
+            for trial in plan.work_items(work_dir):
+                attempt = latest.get(trial.trial_id)
+                if attempt is None:
+                    disposition = "pending"
+                else:
+                    disposition = attempt["status"]
+                    if attempt["reused"]:
+                        disposition += " (reused)"
+                label = trial.candidate_id or "shared no-skill"
+                print(f"  {label} / {trial.task_name}: {disposition}")
+            print(f"wrote {output}")
+            return 1 if summary["pending_trial_count"] else 0
         if args.command == "admit-skills":
             candidates = load_admission_candidates(args.validation_results)
             library = SkillLibrary(args.library_dir)
@@ -1471,6 +1731,34 @@ def _parser() -> argparse.ArgumentParser:
     )
     distillation.add_argument("--timeout-sec", type=float, default=120.0)
     distillation.add_argument("--dry-run", action="store_true")
+    validation = sub.add_parser(
+        "validate-skills",
+        help="measure resumable held-out paired deltas for skill candidates",
+    )
+    validation.add_argument("candidate_file", type=Path)
+    validation.add_argument("validation_tasks", type=Path)
+    validation.add_argument("--lhtb-dir", type=Path, default=Path.cwd())
+    validation.add_argument("--output", type=Path, default=Path(VALIDATION_REPORT_NAME))
+    validation.add_argument("--work-dir", type=Path)
+    validation.add_argument(
+        "--skill-embedder",
+        help="local embedding callable as module:callable (required for paid runs)",
+    )
+    validation.add_argument("--model", default=DEFAULT_MODEL)
+    validation.add_argument("--provider", default=DEFAULT_PROVIDER)
+    validation.add_argument("--api-base", default=DEFAULT_API_BASE)
+    validation.add_argument("--judge-api-base")
+    validation.add_argument("--judge-provider", default=DEFAULT_JUDGE_PROVIDER)
+    validation.add_argument("--credential-env", default=DEFAULT_CREDENTIAL_ENV)
+    validation.add_argument("--no-provider-probe", action="store_true")
+    validation.add_argument("--timeout-sec", type=int, default=5400)
+    validation.add_argument("--max-total-tokens", type=int, default=10_000_000)
+    validation.add_argument(
+        "--estimated-cost-per-trial",
+        type=float,
+        default=DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
+    )
+    validation.add_argument("--dry-run", action="store_true")
     admission = sub.add_parser(
         "admit-skills",
         help="apply the paired validation rule and update a skill library",
