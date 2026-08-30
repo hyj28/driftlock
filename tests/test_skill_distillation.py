@@ -183,6 +183,229 @@ def test_skill_schema_parses_validates_and_round_trips() -> None:
     assert parse_skill(serialize_skill(skill)) == skill
 
 
+def test_skill_schema_excludes_glosses_from_section_bodies() -> None:
+    document = (
+        "## activation — when the skill applies\n"
+        "When a cached simulator may be stale.\n\n"
+        "## execution: what to do instead\n"
+        "Rebuild the simulator before rerunning the focused test.\n\n"
+        "## termination (when to stop)\n"
+        "Stop when the rebuilt model passes the focused test."
+    )
+
+    assert parse_skill(document) == Skill(
+        activation="When a cached simulator may be stale.",
+        execution="Rebuild the simulator before rerunning the focused test.",
+        termination="Stop when the rebuilt model passes the focused test.",
+    )
+
+
+def test_skill_schema_normalizes_heading_case_and_canonical_serialization() -> None:
+    capitalized = (
+        "## Activation\n\nWhen parsing a cached result.\n\n"
+        "## EXECUTION\n\nRebuild before retrying.\n\n"
+        "## Termination\n\nStop after the rebuilt test passes."
+    )
+    lowercase = (
+        "## activation\n\nWhen parsing a cached result.\n\n"
+        "## execution\n\nRebuild before retrying.\n\n"
+        "## termination\n\nStop after the rebuilt test passes."
+    )
+    expected = Skill(
+        activation="When parsing a cached result.",
+        execution="Rebuild before retrying.",
+        termination="Stop after the rebuilt test passes.",
+    )
+
+    assert parse_skill(capitalized) == expected
+    assert parse_skill(lowercase) == expected
+    assert serialize_skill(parse_skill(capitalized)) == lowercase
+    assert serialize_skill(parse_skill(capitalized)) == serialize_skill(
+        parse_skill(lowercase)
+    )
+
+
+@pytest.mark.parametrize(
+    "activation_heading",
+    [
+        "## activation - when to use",
+        "## activation \N{EN DASH} when to use",
+    ],
+)
+def test_skill_schema_accepts_spaced_keyboard_dash_glosses(
+    activation_heading: str,
+) -> None:
+    document = (
+        f"{activation_heading}\nWhen parsing a cached result.\n\n"
+        "## execution\n\nRebuild before retrying.\n\n"
+        "## termination\n\nStop after the rebuilt test passes."
+    )
+
+    assert parse_skill(document) == Skill(
+        activation="When parsing a cached result.",
+        execution="Rebuild before retrying.",
+        termination="Stop after the rebuilt test passes.",
+    )
+
+
+@pytest.mark.parametrize("separator", ["*", "=", "/", "|"])
+def test_skill_schema_rejects_punctuation_outside_the_separator_set(
+    separator: str,
+) -> None:
+    document = (
+        f"## activation {separator} when to use\n\nWhen parsing a cached result.\n\n"
+        "## execution\n\nRebuild before retrying.\n\n"
+        "## termination\n\nStop after the rebuilt test passes."
+    )
+
+    with pytest.raises(SkillValidationError) as raised:
+        parse_skill(document)
+
+    assert str(raised.value) == "skill is missing required section: activation"
+
+
+def test_skill_schema_parses_retained_rtl_response() -> None:
+    document = (
+        "## activation — when the skill applies\n"
+        "When you are debugging RISC-V RTL failures with `runsim`/Verilator/cocotb "
+        "and have just edited SystemVerilog source files such as "
+        "`branch_jump_unit.sv` ...\n\n"
+        "## execution — what to do, including what failed action to avoid and what "
+        "to do instead\n"
+        "When a patched RTL test still fails after editing the RTL, do **not** "
+        "assume `runsim --test ...` automatically rebuilds the Verilator model. "
+        "The simulator build is cached under `tests/sim_build`, and later runs can "
+        "reuse the stale compiled model ...\n\n"
+        "## termination — how to know the procedure is complete\n"
+        "Stop after rebuilding and confirming the focused test exercises the "
+        "patched RTL."
+    )
+
+    assert parse_skill(document) == Skill(
+        activation=(
+            "When you are debugging RISC-V RTL failures with "
+            "`runsim`/Verilator/cocotb and have just edited SystemVerilog source "
+            "files such as `branch_jump_unit.sv` ..."
+        ),
+        execution=(
+            "When a patched RTL test still fails after editing the RTL, do "
+            "**not** assume `runsim --test ...` automatically rebuilds the "
+            "Verilator model. The simulator build is cached under "
+            "`tests/sim_build`, and later runs can reuse the stale compiled model "
+            "..."
+        ),
+        termination=(
+            "Stop after rebuilding and confirming the focused test exercises the "
+            "patched RTL."
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("heading", "expected_reason"),
+    [
+        (
+            "## activation and termination notes",
+            (
+                "skill has no recognizable required section headings; section "
+                "names appear without the required Markdown heading syntax: "
+                "activation, termination"
+            ),
+        ),
+        (
+            "## when to activate",
+            "skill has no recognizable required section headings",
+        ),
+        (
+            "## activation, execution, termination",
+            (
+                "skill has no recognizable required section headings; section "
+                "names appear without the required Markdown heading syntax: "
+                "activation, execution, termination"
+            ),
+        ),
+        (
+            "## activationX — no word boundary",
+            "skill has no recognizable required section headings",
+        ),
+        (
+            "## activation when this applies",
+            (
+                "skill has no recognizable required section headings; section "
+                "names appear without the required Markdown heading syntax: "
+                "activation"
+            ),
+        ),
+        (
+            "##activation",
+            (
+                "skill has no recognizable required section headings; section "
+                "names appear without the required Markdown heading syntax: "
+                "activation"
+            ),
+        ),
+        (
+            "## activation-when-to-use",
+            (
+                "skill has no recognizable required section headings; section "
+                "names appear without the required Markdown heading syntax: "
+                "activation"
+            ),
+        ),
+    ],
+)
+def test_skill_schema_does_not_promote_a_different_phrase_to_a_section(
+    heading: str, expected_reason: str
+) -> None:
+    with pytest.raises(SkillValidationError) as raised:
+        parse_skill(f"{heading}\n\nThis is not a recognized section body.")
+
+    assert str(raised.value) == expected_reason
+
+
+def test_skill_schema_rejects_duplicate_glossed_activation_headings() -> None:
+    document = (
+        "## activation — first label\n\nWhen parsing.\n\n"
+        "## activation: second label\n\nStill parsing.\n\n"
+        "## execution (procedure)\n\nInspect first.\n\n"
+        "## termination — completion\n\nStop after validation."
+    )
+
+    with pytest.raises(SkillValidationError) as raised:
+        parse_skill(document)
+
+    assert str(raised.value) == "skill has duplicate section: activation"
+
+
+def test_skill_schema_rejects_duplicate_sections_across_heading_case() -> None:
+    document = (
+        "## Activation\n\nWhen parsing.\n\n"
+        "## activation\n\nStill parsing.\n\n"
+        "## execution\n\nInspect first.\n\n"
+        "## termination\n\nStop after validation."
+    )
+
+    with pytest.raises(SkillValidationError) as raised:
+        parse_skill(document)
+
+    assert str(raised.value) == "skill has duplicate section: activation"
+
+
+def test_skill_schema_rejects_glossed_headings_out_of_order() -> None:
+    document = (
+        "## execution — procedure\n\nInspect first.\n\n"
+        "## activation: trigger\n\nWhen parsing.\n\n"
+        "## termination (completion)\n\nStop after validation."
+    )
+
+    with pytest.raises(SkillValidationError) as raised:
+        parse_skill(document)
+
+    assert str(raised.value) == (
+        "skill sections must appear in activation, execution, termination order"
+    )
+
+
 @pytest.mark.parametrize("section", ["activation", "execution", "termination"])
 def test_skill_schema_names_each_missing_section(section: str) -> None:
     parts = {
@@ -457,6 +680,48 @@ async def test_callable_distiller_parses_valid_skill_and_preserves_tokens() -> N
     assert result.skill is not None
     assert result.skill.activation == "When offsets differ."
     assert result.tokens == 19
+
+
+async def test_callable_distiller_generates_from_retained_glossed_response() -> None:
+    async def complete(_prompt: str) -> str:
+        return (
+            "## activation — when the skill applies\n"
+            "When you are debugging RISC-V RTL failures with "
+            "`runsim`/Verilator/cocotb and have just edited SystemVerilog source "
+            "files such as `branch_jump_unit.sv` ...\n\n"
+            "## execution — what to do, including what failed action to avoid and "
+            "what to do instead\n"
+            "When a patched RTL test still fails after editing the RTL, do **not** "
+            "assume `runsim --test ...` automatically rebuilds the Verilator model. "
+            "The simulator build is cached under `tests/sim_build`, and later runs "
+            "can reuse the stale compiled model ...\n\n"
+            "## termination — how to know the procedure is complete\n"
+            "Stop after rebuilding and confirming the focused test exercises the "
+            "patched RTL."
+        )
+
+    result = await CallableSkillDistiller(complete).distill({"trajectory": []})
+
+    assert result.status is SkillDistillationStatus.GENERATED
+    assert result.skill == Skill(
+        activation=(
+            "When you are debugging RISC-V RTL failures with "
+            "`runsim`/Verilator/cocotb and have just edited SystemVerilog source "
+            "files such as `branch_jump_unit.sv` ..."
+        ),
+        execution=(
+            "When a patched RTL test still fails after editing the RTL, do "
+            "**not** assume `runsim --test ...` automatically rebuilds the "
+            "Verilator model. The simulator build is cached under "
+            "`tests/sim_build`, and later runs can reuse the stale compiled model "
+            "..."
+        ),
+        termination=(
+            "Stop after rebuilding and confirming the focused test exercises the "
+            "patched RTL."
+        ),
+    )
+    assert result.response is None
 
 
 async def test_callable_distiller_distinguishes_malformed_from_declined() -> None:
