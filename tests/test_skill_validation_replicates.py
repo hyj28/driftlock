@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from collections import Counter
+from pathlib import Path
+
+import pytest
+
+from driftlock.lhtb_experiment import main
+from driftlock.skill_admission import SkillLibrary, load_admission_candidates
+from driftlock.skill_distillation import Skill, serialize_skill
+from driftlock.skill_validation import (
+    VALIDATION_PROCEDURE_ID,
+    ValidationTrial,
+    ValidationTrialResult,
+    ValidationTrialStatus,
+    plan_skill_validation,
+    run_skill_validation,
+)
+
+_V1_PROCEDURE_ID = "shared-single-candidate-paired-v1"
+
+
+def _candidate_file(tmp_path: Path, count: int) -> Path:
+    path = tmp_path / "candidates.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "skill-distillation",
+                "candidates": [
+                    {
+                        "candidate_id": f"candidate-{index}",
+                        "arm": "localized" if index % 2 == 0 else "baseline",
+                        "skill": serialize_skill(
+                            Skill(
+                                activation=f"When candidate {index} applies.",
+                                execution=f"Use candidate {index} only.",
+                                termination="Stop after the verifier returns.",
+                            )
+                        ),
+                        "paired_deltas": [],
+                    }
+                    for index in range(count)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _task_file(tmp_path: Path, task_count: int, replicate_count: int) -> Path:
+    path = tmp_path / "tasks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "selected_tasks": [f"task-{index}" for index in range(task_count)],
+                "replicate_count": replicate_count,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class _ReplicateRunner:
+    def __init__(
+        self,
+        rewards: dict[tuple[str | None, str, int], float],
+        *,
+        failures: set[tuple[str | None, str, int]] | None = None,
+    ) -> None:
+        self.rewards = rewards
+        self.failures = failures or set()
+        self.calls: list[ValidationTrial] = []
+
+    async def run(self, trial: ValidationTrial) -> ValidationTrialResult:
+        self.calls.append(trial)
+        key = (trial.candidate_id, trial.task_name, trial.replicate_index)
+        injected = SkillLibrary(trial.library_dir).admitted_skill_ids()
+        if key in self.failures:
+            return ValidationTrialResult(
+                status=ValidationTrialStatus.FAILED,
+                reason="synthetic failure",
+                injected_candidate_ids=injected,
+            )
+        return ValidationTrialResult(
+            status=ValidationTrialStatus.MEASURED,
+            reward=self.rewards[key],
+            injected_candidate_ids=injected,
+        )
+
+
+def test_validation_procedure_id_pins_replicated_trial_semantics() -> None:
+    assert VALIDATION_PROCEDURE_ID == "shared-replicated-single-candidate-paired-v2"
+
+
+def test_five_tasks_two_replicates_plan_ten_shared_controls_and_twenty_treatments(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(
+        _candidate_file(tmp_path, 2), _task_file(tmp_path, 5, 2)
+    )
+
+    work = plan.work_items(tmp_path / "work")
+
+    assert plan.replicate_count == 2
+    assert plan.observation_count == 10
+    assert plan.planned_trial_count == 30
+    assert Counter(item.condition for item in work) == {
+        "without_skill": 10,
+        "with_skill": 20,
+    }
+    controls = [item for item in work if item.condition == "without_skill"]
+    assert Counter((item.task_name, item.replicate_index) for item in controls) == {
+        ("task-0", 1): 1,
+        ("task-0", 2): 1,
+        ("task-1", 1): 1,
+        ("task-1", 2): 1,
+        ("task-2", 1): 1,
+        ("task-2", 2): 1,
+        ("task-3", 1): 1,
+        ("task-3", 2): 1,
+        ("task-4", 1): 1,
+        ("task-4", 2): 1,
+    }
+    assert len({item.trial_id for item in controls}) == 10
+
+
+def test_fourteen_candidate_dry_run_reports_replicate_breakdown_and_22_65_cost(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "validated.json"
+    work_dir = tmp_path / "work"
+
+    assert (
+        main(
+            [
+                "validate-skills",
+                str(_candidate_file(tmp_path, 14)),
+                str(_task_file(tmp_path, 5, 2)),
+                "--output",
+                str(output),
+                "--work-dir",
+                str(work_dir),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    printed = capsys.readouterr().out
+    assert (
+        "150 trial(s) planned: 10 shared no-skill + 140 with-skill; estimated "
+        "$22.650 at $0.151/trial; 5 task(s) x 2 replicate(s) = 10 paired "
+        "observation(s)" in printed
+    )
+    assert "task-0 replicate 1: 1 trial" in printed
+    assert "task-0 replicate 2: 1 trial" in printed
+    assert not output.exists()
+    assert not work_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_same_task_replicates_have_distinct_controls_and_observations(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(
+        _candidate_file(tmp_path, 1), _task_file(tmp_path, 1, 2)
+    )
+    runner = _ReplicateRunner(
+        {
+            (None, "task-0", 1): 0.2,
+            (None, "task-0", 2): 0.7,
+            ("candidate-0", "task-0", 1): 0.5,
+            ("candidate-0", "task-0", 2): 0.6,
+        }
+    )
+
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=tmp_path / "work",
+    )
+
+    controls = [call for call in runner.calls if call.candidate_id is None]
+    assert [call.replicate_index for call in controls] == [1, 2]
+    assert controls[0].trial_id != controls[1].trial_id
+    assert controls[0].job_name != controls[1].job_name
+    assert report["candidates"][0]["paired_deltas"] == pytest.approx([0.3, -0.1])
+    measurements = report["validation"]["paired_measurements"]
+    assert [item["replicate_index"] for item in measurements] == [1, 2]
+    assert [item["task_name"] for item in measurements] == ["task-0", "task-0"]
+    assert measurements[0]["control_trial_id"] != measurements[1]["control_trial_id"]
+
+
+@pytest.mark.asyncio
+async def test_failed_treatment_replicate_leaves_other_replicate_measured(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(
+        _candidate_file(tmp_path, 1), _task_file(tmp_path, 1, 2)
+    )
+    runner = _ReplicateRunner(
+        {
+            (None, "task-0", 1): 0.2,
+            (None, "task-0", 2): 0.4,
+            ("candidate-0", "task-0", 1): 0.9,
+            ("candidate-0", "task-0", 2): 0.7,
+        },
+        failures={("candidate-0", "task-0", 1)},
+    )
+
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=tmp_path / "work",
+    )
+
+    assert report["candidates"][0]["paired_deltas"] == pytest.approx([None, 0.3])
+    measurements = report["validation"]["paired_measurements"]
+    assert [item["measured"] for item in measurements] == [False, True]
+    assert report["validation"]["summary"]["pending_trial_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_control_is_shared_by_candidates_within_each_task_replicate(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(
+        _candidate_file(tmp_path, 2), _task_file(tmp_path, 1, 2)
+    )
+    runner = _ReplicateRunner(
+        {
+            (None, "task-0", 1): 0.2,
+            (None, "task-0", 2): 0.4,
+            ("candidate-0", "task-0", 1): 0.3,
+            ("candidate-0", "task-0", 2): 0.5,
+            ("candidate-1", "task-0", 1): 0.6,
+            ("candidate-1", "task-0", 2): 0.7,
+        }
+    )
+
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=tmp_path / "work",
+    )
+
+    assert Counter(call.condition for call in runner.calls) == {
+        "without_skill": 2,
+        "with_skill": 4,
+    }
+    measurements = report["validation"]["paired_measurements"]
+    assert measurements[0]["control_trial_id"] == measurements[2]["control_trial_id"]
+    assert measurements[1]["control_trial_id"] == measurements[3]["control_trial_id"]
+
+
+@pytest.mark.asyncio
+async def test_replicated_run_resumes_without_repaying_completed_trials(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(
+        _candidate_file(tmp_path, 2), _task_file(tmp_path, 1, 2)
+    )
+    rewards = {
+        (None, "task-0", 1): 0.2,
+        (None, "task-0", 2): 0.4,
+        ("candidate-0", "task-0", 1): 0.3,
+        ("candidate-0", "task-0", 2): 0.5,
+        ("candidate-1", "task-0", 1): 0.6,
+        ("candidate-1", "task-0", 2): 0.7,
+    }
+    first = _ReplicateRunner(rewards)
+    original_run = first.run
+
+    async def interrupt_on_fourth(trial: ValidationTrial) -> ValidationTrialResult:
+        if len(first.calls) == 3:
+            raise KeyboardInterrupt
+        return await original_run(trial)
+
+    first.run = interrupt_on_fourth  # type: ignore[method-assign]
+    output = tmp_path / "validated.json"
+    work_dir = tmp_path / "work"
+    with pytest.raises(KeyboardInterrupt):
+        await run_skill_validation(plan, output, runner=first, work_dir=work_dir)
+
+    resumed = _ReplicateRunner(rewards)
+    report = await run_skill_validation(plan, output, runner=resumed, work_dir=work_dir)
+
+    assert len(first.calls) == 3
+    assert len(resumed.calls) == 3
+    assert {call.trial_id for call in first.calls}.isdisjoint(
+        call.trial_id for call in resumed.calls
+    )
+    assert report["validation"]["summary"]["reused_trial_count"] == 3
+    assert report["validation"]["summary"]["new_attempt_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_changed_replicate_count_refuses_existing_cohort(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidate_file(tmp_path, 1)
+    tasks = _task_file(tmp_path, 1, 1)
+    first_plan = plan_skill_validation(candidates, tasks)
+    first_runner = _ReplicateRunner(
+        {(None, "task-0", 1): 0.2, ("candidate-0", "task-0", 1): 0.3}
+    )
+    output = tmp_path / "validated.json"
+
+    await run_skill_validation(
+        first_plan,
+        output,
+        runner=first_runner,
+        work_dir=tmp_path / "work",
+    )
+    tasks.write_text(
+        json.dumps({"selected_tasks": ["task-0"], "replicate_count": 2}),
+        encoding="utf-8",
+    )
+    changed_plan = plan_skill_validation(candidates, tasks)
+    changed_runner = _ReplicateRunner({})
+
+    with pytest.raises(ValueError, match="different run"):
+        await run_skill_validation(
+            changed_plan,
+            output,
+            runner=changed_runner,
+            work_dir=tmp_path / "work",
+        )
+    assert changed_runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_v1_procedure_output_before_reusing_trials(
+    tmp_path: Path,
+) -> None:
+    candidates = _candidate_file(tmp_path, 1)
+    plan = plan_skill_validation(candidates, _task_file(tmp_path, 1, 1))
+    output = tmp_path / "validated.json"
+    work_dir = tmp_path / "work"
+    first_runner = _ReplicateRunner(
+        {(None, "task-0", 1): 0.2, ("candidate-0", "task-0", 1): 0.3}
+    )
+    report = await run_skill_validation(
+        plan, output, runner=first_runner, work_dir=work_dir
+    )
+
+    old_ids: dict[tuple[str, str | None, str], str] = {}
+    for identity in report["validation"]["plan"]["work_items"]:
+        old_identity = json.dumps(
+            [
+                _V1_PROCEDURE_ID,
+                identity["condition"],
+                identity["candidate_id"],
+                identity["task_name"],
+            ],
+            separators=(",", ":"),
+        )
+        old_trial_id = hashlib.sha256(old_identity.encode()).hexdigest()[:24]
+        key = (
+            identity["condition"],
+            identity["candidate_id"],
+            identity["task_name"],
+        )
+        old_ids[key] = old_trial_id
+        identity["trial_id"] = old_trial_id
+        identity["procedure_id"] = _V1_PROCEDURE_ID
+        del identity["replicate_index"]
+    old_plan = report["validation"]["plan"]
+    old_plan["procedure_id"] = _V1_PROCEDURE_ID
+    del old_plan["replicate_count"]
+    del old_plan["observation_count"]
+    for attempt in report["validation"]["attempts"]:
+        key = (
+            attempt["condition"],
+            attempt["candidate_id"],
+            attempt["task_name"],
+        )
+        attempt["trial_id"] = old_ids[key]
+        attempt["procedure_id"] = _V1_PROCEDURE_ID
+        del attempt["replicate_index"]
+    for measurement in report["validation"]["paired_measurements"]:
+        measurement["control_trial_id"] = old_ids[
+            ("without_skill", None, measurement["task_name"])
+        ]
+        measurement["treatment_trial_id"] = old_ids[
+            ("with_skill", measurement["candidate_id"], measurement["task_name"])
+        ]
+        del measurement["replicate_index"]
+    report["validation"]["control_rewards"] = {"task-0": 0.2}
+    del report["validation"]["control_measurements"]
+    output.write_text(json.dumps(report), encoding="utf-8")
+    resumed = _ReplicateRunner({})
+
+    with pytest.raises(ValueError, match="different run"):
+        await run_skill_validation(
+            plan,
+            output,
+            runner=resumed,
+            work_dir=work_dir,
+        )
+    assert resumed.calls == []
+
+
+@pytest.mark.asyncio
+async def test_five_by_two_output_is_accepted_directly_by_admit_skills(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(
+        _candidate_file(tmp_path, 2), _task_file(tmp_path, 5, 2)
+    )
+    rewards: dict[tuple[str | None, str, int], float] = {}
+    observation_index = 0
+    for task_index in range(5):
+        task = f"task-{task_index}"
+        for replicate_index in (1, 2):
+            rewards[(None, task, replicate_index)] = 0.4
+            rewards[("candidate-0", task, replicate_index)] = (
+                0.5 if observation_index < 9 else 0.4
+            )
+            rewards[("candidate-1", task, replicate_index)] = (
+                0.5 if observation_index < 8 else 0.4
+            )
+            observation_index += 1
+    output = tmp_path / "validated.json"
+
+    await run_skill_validation(
+        plan,
+        output,
+        runner=_ReplicateRunner(rewards),
+        work_dir=tmp_path / "work",
+    )
+
+    loaded = load_admission_candidates(output)
+    assert len(loaded[0].paired_deltas) == 10
+    admission_output = tmp_path / "admission.json"
+    assert (
+        main(
+            [
+                "admit-skills",
+                str(output),
+                "--library-dir",
+                str(tmp_path / "library"),
+                "--output",
+                str(admission_output),
+            ]
+        )
+        == 0
+    )
+    admission = json.loads(admission_output.read_text(encoding="utf-8"))
+    assert admission["admitted_candidate_count"] == 1
+    assert admission["rejected_candidate_count"] == 1

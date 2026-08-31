@@ -561,9 +561,38 @@ An unfiltered skill library **makes the agent worse**. This is measured, not
 hypothetical: in the 2026-08 study, GPT-5.5 on LiveMath gained +5.7 validation points
 and lost **−6.6** on the released test.
 
-So every candidate skill must earn its place by measured improvement on a held-out
-validation split before entering the library. This is budget-neutral — it only
-requires splitting the training side three ways (see §4.3).
+So every candidate skill must earn its place by measured improvement before entering
+the library.  The original ten-task held-out plan assumed the validation tasks shared
+a distribution with the distillation tasks.  That is true of the SWE-bench split in
+§4.3, but not of the deliberately heterogeneous LHTB pool: the 14 current candidates
+were distilled from only `alp-paper-reproduction`, `riscv-core-debug`, and
+`spice-ephemeris-regression`.  Testing a repository-debugging procedure on chess or a
+platform game would mostly test retrieval mismatch.
+
+The LHTB gate therefore measures **same task, fresh trial**.  Its ten observations are
+five tasks × two replicates: the three source tasks plus `commit0-multilib-tdd` and
+`unknown-config-semantics`.  The latter two are measured-eligible partial-credit
+repository/debugging workloads, so they test procedural activation beyond the exact
+source failure without changing to an unrelated game-state domain.  `2048` and
+`sudoku-recovery` would still produce valid final-reward deltas, but their intermediate
+checkpoints score uniformly zero by construction and their game-state mechanics make
+them weaker probes of transfer from repository-oriented localized evidence.  They are
+excluded for relevance, not because final-reward pairing cannot measure them.
+
+Each replicate gets a fresh treatment and its own fresh control.  The control remains
+shared across all candidates only within that `(task, replicate)` pair:
+
+```
+5 tasks × 2 replicates             =  10 shared controls
+14 candidates × 10 observations   = 140 treatments
+                                      150 trials, $22.65
+```
+
+This preserves the ten-delta admission rule and its arithmetic threshold.  It changes
+the sampling claim: two fresh stochastic runs on one task measure within-task run
+variation, but they do not supply the task diversity of two different tasks.  Any
+null-bound interpretation must name independent trial-level signs as an assumption and
+must not describe the ten deltas as ten independently sampled tasks.
 
 The field's own pass rate, **14.2%**, becomes a second independent piece of evidence:
 if checkpoint localization genuinely makes distillation sharper, our candidate pass
@@ -571,17 +600,16 @@ rate should sit visibly above it. That is now the project's central bet: §2.3a 
 what rollback is worth, and nothing yet shows a scored segment distils better than a
 whole trajectory.
 
-**One caveat the pass rate has to carry.** The no-skill control for a validation task is
-measured **once** and paired into every candidate's delta for that task. That is what keeps
-the bill at one control per task rather than one per candidate — 150 trials instead of 290 —
-and it is what makes the two arms comparable, since both draw the same controls. But it means
-control-trial noise is a **correlated** error source across candidates: a task whose control
-happened to score low makes every candidate look better on that task at once. The admission
-rule's null bound assumes independent task-level signs *within* a candidate, which this does
-not disturb; what it does disturb is treating the candidates as independent tests of one
-another. A pass rate computed over a cohort sharing controls is not the same object as 388
-independent trials, and the write-up should say so rather than let the comparison to 14.2%
-imply otherwise.
+**One caveat the pass rate has to carry.** The no-skill control for a validation
+`(task, replicate)` is measured **once** and paired into every candidate's delta for
+that observation. That is what keeps the bill at one control per observation rather
+than one per candidate — 150 trials instead of 290 — and it is what makes the two arms
+comparable, since both draw the same controls. But it means control-trial noise is a
+**correlated** error source across candidates: an observation whose control happened to
+score low makes every candidate look better on that observation at once. A pass rate
+computed over a cohort sharing controls is not the same object as 388 independent
+trials, and the write-up should say so rather than let the comparison to 14.2% imply
+otherwise.
 
 ### 3.5 The two questions this has to survive
 
