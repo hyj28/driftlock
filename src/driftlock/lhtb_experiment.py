@@ -1504,7 +1504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "validate-skills":
             plan = plan_skill_validation(
                 args.candidate_file,
-                args.validation_tasks,
+                args.lhtb_dir,
                 estimated_cost_per_trial_usd=args.estimated_cost_per_trial,
             )
             output = args.output.expanduser().resolve()
@@ -1578,9 +1578,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{summary['treatment_trial_count']} with-skill; estimated "
                 f"${summary['estimated_planned_cost_usd']:.3f} at "
                 f"${summary['estimated_cost_per_trial_usd']:.3f}/trial; "
-                f"{len(plan.tasks)} task(s) x "
+                f"{len(plan.tasks)} distinct source task(s) x "
                 f"{plan.replicate_count} replicate(s) = "
-                f"{plan.observation_count} paired observation(s); "
+                f"{plan.shared_control_trial_count} shared control trial(s); "
+                f"{len(plan.candidates)} candidate(s) x "
+                f"{plan.observation_count} own-task observation(s) = "
+                f"{plan.paired_observation_count} paired observation(s); "
                 f"{summary['pending_trial_count']} pending, "
                 f"{summary['reused_trial_count']} reused"
             )
@@ -1597,18 +1600,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"${plan.estimated_cost_per_trial_usd:.3f}"
                     )
             for candidate in plan.candidates:
-                print(f"  {candidate.candidate_id} [{candidate.arm}]:")
-                for task in plan.tasks:
-                    for replicate_index in range(1, plan.replicate_count + 1):
-                        replicate = (
-                            ""
-                            if plan.replicate_count == 1
-                            else f" replicate {replicate_index}"
-                        )
-                        print(
-                            f"    {task}{replicate}: 1 with-skill trial, estimated "
-                            f"${plan.estimated_cost_per_trial_usd:.3f}"
-                        )
+                print(
+                    f"  {candidate.candidate_id} [{candidate.arm}] from "
+                    f"{candidate.source_task_name}:"
+                )
+                for replicate_index in range(1, plan.replicate_count + 1):
+                    replicate = f" replicate {replicate_index}"
+                    print(
+                        f"    {candidate.task_name}{replicate}: 1 with-skill trial, "
+                        f"estimated ${plan.estimated_cost_per_trial_usd:.3f}"
+                    )
             if args.dry_run:
                 print("dry run; no trials run and no files written")
                 return 0
@@ -1751,10 +1752,9 @@ def _parser() -> argparse.ArgumentParser:
     distillation.add_argument("--dry-run", action="store_true")
     validation = sub.add_parser(
         "validate-skills",
-        help="measure resumable held-out paired deltas for skill candidates",
+        help="measure resumable own-task paired deltas for skill candidates",
     )
     validation.add_argument("candidate_file", type=Path)
-    validation.add_argument("validation_tasks", type=Path)
     validation.add_argument("--lhtb-dir", type=Path, default=Path.cwd())
     validation.add_argument("--output", type=Path, default=Path(VALIDATION_REPORT_NAME))
     validation.add_argument("--work-dir", type=Path)

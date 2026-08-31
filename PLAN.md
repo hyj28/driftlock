@@ -569,23 +569,19 @@ were distilled from only `alp-paper-reproduction`, `riscv-core-debug`, and
 `spice-ephemeris-regression`.  Testing a repository-debugging procedure on chess or a
 platform game would mostly test retrieval mismatch.
 
-The LHTB gate therefore measures **same task, fresh trial**.  Its ten observations are
-five tasks × two replicates: the three source tasks plus `commit0-multilib-tdd` and
-`unknown-config-semantics`.  The latter two are measured-eligible partial-credit
-repository/debugging workloads, so they test procedural activation beyond the exact
-source failure without changing to an unrelated game-state domain.  `2048` and
-`sudoku-recovery` would still produce valid final-reward deltas, but their intermediate
-checkpoints score uniformly zero by construction and their game-state mechanics make
-them weaker probes of transfer from repository-oriented localized evidence.  They are
-excluded for relevance, not because final-reward pairing cannot measure them.
+The LHTB gate therefore measures **same task, fresh trial**. Each candidate's ten
+observations are ten independent attempts at the task named in that candidate's
+distillation provenance. A candidate that was distilled from
+`alp-paper-reproduction` is tested only on fresh `alp-paper-reproduction` attempts;
+retrieval on an unrelated task neither helps nor special-cases its validation record.
 
 Each replicate gets a fresh treatment and its own fresh control.  The control remains
 shared across all candidates only within that `(task, replicate)` pair:
 
 ```
-5 tasks × 2 replicates             =  10 shared controls
-14 candidates × 10 observations   = 140 treatments
-                                      150 trials, $22.65
+3 distinct source tasks × 10 replicates =  30 shared controls
+14 candidates × 10 observations         = 140 treatments
+                                            170 trials, $25.67
 ```
 
 This preserves the ten-delta admission rule and its arithmetic threshold.  It changes
@@ -601,10 +597,10 @@ what rollback is worth, and nothing yet shows a scored segment distils better th
 whole trajectory.
 
 **One caveat the pass rate has to carry.** The no-skill control for a validation
-`(task, replicate)` is measured **once** and paired into every candidate's delta for
-that observation. That is what keeps the bill at one control per observation rather
-than one per candidate — 150 trials instead of 290 — and it is what makes the two arms
-comparable, since both draw the same controls. But it means control-trial noise is a
+`(task, replicate)` is measured **once** and paired into every candidate from that
+source task. That is what keeps the bill at 30 controls rather than 140 — 170 total
+trials instead of 280 — and it is what makes the two arms comparable, since both draw
+the same controls. But it means control-trial noise is a
 **correlated** error source across candidates: an observation whose control happened to
 score low makes every candidate look better on that observation at once. A pass rate
 computed over a cohort sharing controls is not the same object as 388 independent
