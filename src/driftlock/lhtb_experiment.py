@@ -74,6 +74,7 @@ from driftlock.skill_distillation_driver import (
 from driftlock.skill_validation import (
     DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
     VALIDATION_REPORT_NAME,
+    ValidationFailureKind,
     ValidationTrial,
     ValidationTrialResult,
     ValidationTrialStatus,
@@ -1035,17 +1036,25 @@ class _HarborSkillValidationRunner:
             "process_exit_code": exit_code,
         }
         try:
+            run_record = _validation_run_record(job_dir)
+        except _ValidationJobEvidenceError as error:
+            return ValidationTrialResult(
+                status=ValidationTrialStatus.FAILED,
+                reason=str(error),
+                failure_kind=error.failure_kind,
+                audit=audit,
+            )
+        try:
             reward = (
                 single_job_reward(job_dir)
                 if (job_dir / "result.json").is_file()
                 else None
             )
-            injected_ids, injection_audit = _validation_injection_evidence(job_dir)
-            audit["skill_injection"] = injection_audit
         except (FileNotFoundError, OSError, ValueError) as error:
             return ValidationTrialResult(
                 status=ValidationTrialStatus.FAILED,
-                reason=f"validation job evidence is unusable: {error}",
+                reason=f"validation reward evidence is unusable: {error}",
+                failure_kind=ValidationFailureKind.REWARD_EVIDENCE,
                 audit=audit,
             )
         if reward is None:
@@ -1057,7 +1066,19 @@ class _HarborSkillValidationRunner:
             return ValidationTrialResult(
                 status=ValidationTrialStatus.FAILED,
                 reason=f"validation job produced no reward ({detail})",
-                injected_candidate_ids=injected_ids,
+                failure_kind=ValidationFailureKind.NO_REWARD,
+                audit=audit,
+            )
+        try:
+            injected_ids, injection_audit = _validation_injection_evidence(
+                job_dir, run_record=run_record
+            )
+            audit["skill_injection"] = injection_audit
+        except (OSError, ValueError) as error:
+            return ValidationTrialResult(
+                status=ValidationTrialStatus.FAILED,
+                reason=f"validation skill-layer evidence is unusable: {error}",
+                failure_kind=ValidationFailureKind.SKILL_LAYER_EVIDENCE,
                 audit=audit,
             )
         return ValidationTrialResult(
@@ -1068,15 +1089,35 @@ class _HarborSkillValidationRunner:
         )
 
 
+class _ValidationJobEvidenceError(ValueError):
+    """A job-level result-cardinality failure with stable attribution."""
+
+    def __init__(self, message: str, failure_kind: ValidationFailureKind) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+def _validation_run_record(job_dir: Path) -> Path:
+    records = sorted(job_dir.glob("*/agent/driftlock-result.json"))
+    if not records:
+        raise _ValidationJobEvidenceError(
+            "validation trial did not produce a result: no run record was found",
+            ValidationFailureKind.DID_NOT_PRODUCE_RESULT,
+        )
+    if len(records) != 1:
+        raise _ValidationJobEvidenceError(
+            f"validation job has {len(records)} run records; expected one",
+            ValidationFailureKind.AMBIGUOUS_RESULT,
+        )
+    return records[0]
+
+
 def _validation_injection_evidence(
     job_dir: Path,
+    *,
+    run_record: Path | None = None,
 ) -> tuple[tuple[str, ...], dict[str, Any]]:
-    records = sorted(job_dir.glob("*/agent/driftlock-result.json"))
-    if len(records) != 1:
-        raise ValueError(
-            f"validation job has {len(records)} skill-injection records; expected one"
-        )
-    path = records[0]
+    path = run_record if run_record is not None else _validation_run_record(job_dir)
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:

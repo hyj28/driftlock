@@ -52,6 +52,18 @@ class ValidationTrialStatus(StrEnum):
     FAILED = "failed"
 
 
+class ValidationFailureKind(StrEnum):
+    """Machine-readable attribution for an unusable validation attempt."""
+
+    TRIAL_RUNNER = "trial_runner"
+    DID_NOT_PRODUCE_RESULT = "did_not_produce_result"
+    AMBIGUOUS_RESULT = "ambiguous_result"
+    NO_REWARD = "no_reward"
+    REWARD_EVIDENCE = "reward_evidence"
+    SKILL_LAYER_EVIDENCE = "skill_layer_evidence"
+    SKILL_INJECTION_MISMATCH = "skill_injection_mismatch"
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationCandidate:
     """The immutable candidate identity used while validation is resumed."""
@@ -115,6 +127,7 @@ class ValidationTrialResult:
     status: ValidationTrialStatus
     reward: float | None = None
     reason: str = ""
+    failure_kind: ValidationFailureKind | None = None
     injected_candidate_ids: tuple[str, ...] | None = None
     audit: Mapping[str, Any] | None = None
 
@@ -134,6 +147,19 @@ class ValidationTrialResult:
             object.__setattr__(self, "reward", float(self.reward))
         elif self.reward is not None:
             raise ValueError("a failed validation trial cannot carry a reward")
+        if isinstance(self.failure_kind, str):
+            object.__setattr__(
+                self, "failure_kind", ValidationFailureKind(self.failure_kind)
+            )
+        elif self.failure_kind is not None and not isinstance(
+            self.failure_kind, ValidationFailureKind
+        ):
+            raise TypeError("validation trial failure kind must be recognized")
+        if (
+            self.status is ValidationTrialStatus.MEASURED
+            and self.failure_kind is not None
+        ):
+            raise ValueError("a measured validation trial cannot have a failure kind")
         if not isinstance(self.reason, str):
             raise TypeError("validation trial reason must be text")
         if self.audit is not None and not isinstance(self.audit, Mapping):
@@ -381,6 +407,7 @@ async def run_skill_validation(
                 reason=(
                     f"validation trial runner failed: {type(error).__name__}: {error}"
                 ),
+                failure_kind=ValidationFailureKind.TRIAL_RUNNER,
             )
         if (
             result.status is ValidationTrialStatus.MEASURED
@@ -393,6 +420,7 @@ async def run_skill_validation(
                     f"{list(trial.available_candidate_ids)!r}, observed "
                     f"{list(result.injected_candidate_ids or ())!r}"
                 ),
+                failure_kind=ValidationFailureKind.SKILL_INJECTION_MISMATCH,
                 audit=result.audit,
             )
         attempt = {
@@ -400,6 +428,9 @@ async def run_skill_validation(
             "attempt_number": attempt_number,
             "status": result.status.value,
             "reason": result.reason,
+            "failure_kind": (
+                result.failure_kind.value if result.failure_kind is not None else None
+            ),
             "reward": result.reward,
             "injected_candidate_ids": (
                 list(result.injected_candidate_ids)
@@ -595,6 +626,7 @@ def _load_previous(
                 status=status,
                 reward=raw.get("reward"),
                 reason=raw.get("reason"),
+                failure_kind=raw.get("failure_kind"),
                 injected_candidate_ids=(
                     tuple(raw["injected_candidate_ids"])
                     if raw.get("injected_candidate_ids") is not None
