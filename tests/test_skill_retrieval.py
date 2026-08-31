@@ -10,6 +10,8 @@ import pytest
 from driftlock.skill_admission import SkillAdmissionCandidate, SkillLibrary
 from driftlock.skill_distillation import Skill
 from driftlock.skill_retrieval import (
+    DEFAULT_MIN_SIMILARITY,
+    DEFAULT_MIN_SIMILARITY_CALIBRATION,
     ActivationSkillRetriever,
     SkillRetrievalConfig,
     SkillRetrievalStatus,
@@ -53,6 +55,100 @@ def _admit(
         )
     )
     assert decision["status"] == "admitted"
+
+
+def test_default_minimum_similarity_and_calibration_provenance_are_pinned() -> None:
+    assert DEFAULT_MIN_SIMILARITY == 0.35
+    assert DEFAULT_MIN_SIMILARITY_CALIBRATION["model"] == {
+        "name": "sentence-transformers/all-MiniLM-L6-v2",
+        "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "dimensions": 384,
+    }
+    assert DEFAULT_MIN_SIMILARITY_CALIBRATION["sample"] == {
+        "candidate_count": 14,
+        "task_count": 5,
+        "pair_count": 70,
+        "label_rule": (
+            "A candidate distilled from task T is labelled applicable to T and "
+            "inapplicable to each of the other four tasks."
+        ),
+        "applicable": {
+            "count": 14,
+            "minimum": 0.147,
+            "median": 0.415,
+            "maximum": 0.620,
+        },
+        "inapplicable": {
+            "count": 56,
+            "minimum": -0.013,
+            "median": 0.188,
+            "maximum": 0.330,
+        },
+    }
+    assert DEFAULT_MIN_SIMILARITY_CALIBRATION["threshold_sweep"] == (
+        {"threshold": 0.30, "recall_percent": 79, "false_retrieval_percent": 12},
+        {"threshold": 0.35, "recall_percent": 71, "false_retrieval_percent": 0},
+        {"threshold": 0.40, "recall_percent": 50, "false_retrieval_percent": 0},
+        {"threshold": 0.50, "recall_percent": 7, "false_retrieval_percent": 0},
+        {"threshold": 0.75, "recall_percent": 0, "false_retrieval_percent": 0},
+    )
+    assert DEFAULT_MIN_SIMILARITY_CALIBRATION["selection"] == {
+        "threshold": 0.35,
+        "recall_percent": 71,
+        "false_retrieval_percent": 0,
+        "rationale": (
+            "0.35 and 0.40 both measured zero false retrievals; choose 0.35 for "
+            "its higher measured recall."
+        ),
+    }
+
+
+def test_default_similarity_boundary_and_old_dead_zone(tmp_path: Path) -> None:
+    library = SkillLibrary(tmp_path / "library")
+    activations = {
+        "old-dead-zone": "activation at measured applicable maximum",
+        "just-above": "activation just above calibrated boundary",
+        "at-threshold": "activation exactly at calibrated boundary",
+        "just-below": "activation just below calibrated boundary",
+        "worst-inapplicable": "activation at measured inapplicable maximum",
+    }
+    for candidate_id, activation in activations.items():
+        _admit(library, candidate_id, activation)
+    query = "literal calibration query"
+    embedder = LiteralEmbedder(
+        {
+            # Each vector has an integer norm: the resulting cosines against the
+            # query are independently known literals 0.62, 0.36, 0.35, 0.34, 0.33.
+            activations["old-dead-zone"]: (31, 39, 3, 3, 0, 0),
+            activations["just-above"]: (9, 22, 7, 3, 1, 1),
+            activations["at-threshold"]: (7, 15, 11, 2, 1, 0),
+            activations["just-below"]: (17, 47, 1, 1, 0, 0),
+            activations["worst-inapplicable"]: (33, 94, 8, 3, 1, 1),
+            query: (1, 0, 0, 0, 0, 0),
+        }
+    )
+
+    result = ActivationSkillRetriever(library, embedder).retrieve(query)
+
+    assert result.config.minimum_similarity == 0.35
+    assert [match.candidate_id for match in result.matches] == [
+        "old-dead-zone",
+        "just-above",
+        "at-threshold",
+    ]
+    assert [match.similarity for match in result.matches] == [0.62, 0.36, 0.35]
+    assert [
+        candidate["candidate_id"] for candidate in result.near_threshold_candidates
+    ] == [
+        "just-below",
+        "worst-inapplicable",
+    ]
+    assert [
+        candidate["similarity"] for candidate in result.near_threshold_candidates
+    ] == [
+        0.34,
+        0.33,
+    ]
 
 
 def test_empty_library_is_a_usable_no_match_without_embedding(tmp_path: Path) -> None:
@@ -123,7 +219,7 @@ def test_many_applicable_skills_are_score_ordered_and_bounded(tmp_path: Path) ->
             "activation near a": (5.0, 1.0),
             "activation near b": (3.0, 1.0),
             "activation near c": (4.0, 3.0),
-            "activation irrelevant": (3.0, 4.0),
+            "activation irrelevant": (0.0, 1.0),
             query: (1.0, 0.0),
         }
     )
@@ -393,11 +489,11 @@ def test_threshold_diagnostics_record_nearest_misses_and_explicit_truncation(
     _admit(library, "orthogonal", orthogonal_activation)
     _admit(library, "opposite", opposite_activation)
     vectors = {
-        exact_activation: (1.0, 0.0),
-        near_activation: (3.0, 4.0),
-        orthogonal_activation: (0.0, 1.0),
-        opposite_activation: (-1.0, 0.0),
-        query: (1.0, 0.0),
+        exact_activation: (1.0, 0.0, 0.0, 0.0),
+        near_activation: (3.0, 9.0, 3.0, 1.0),
+        orthogonal_activation: (0.0, 1.0, 0.0, 0.0),
+        opposite_activation: (-1.0, 0.0, 0.0, 0.0),
+        query: (1.0, 0.0, 0.0, 0.0),
     }
 
     complete = ActivationSkillRetriever(
@@ -421,7 +517,7 @@ def test_threshold_diagnostics_record_nearest_misses_and_explicit_truncation(
             {
                 "similarity_rank": 2,
                 "candidate_id": "near",
-                "similarity": 0.6,
+                "similarity": 0.3,
                 "activation": near_activation,
             },
             {
@@ -448,7 +544,7 @@ def test_threshold_diagnostics_record_nearest_misses_and_explicit_truncation(
             {
                 "similarity_rank": 2,
                 "candidate_id": "near",
-                "similarity": 0.6,
+                "similarity": 0.3,
                 "activation": near_activation,
             },
             {

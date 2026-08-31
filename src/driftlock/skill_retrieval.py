@@ -41,17 +41,103 @@ RETRIEVAL_RULE_ID = "activation-cosine-threshold-v1"
 LIBRARY_GROWTH_POLICY = "fixed_at_first_retrieval"
 LIBRARY_REMOVAL_POLICY = "honor_immediately"
 
-# This is a provisional safety floor, not a derived semantic boundary.  Cosine 0.75
-# means an angle of at most about 41.4 degrees in the host model's vector space, but
-# it has no model-independent meaning for activation text.  There is not yet a real
-# embedding model plus labelled query/activation corpus in this repository from
-# which to estimate one.  Before held-out experiments, the host should label
-# applicable and inapplicable query-skill pairs for its pinned model, sweep this
-# threshold on validation, and freeze the value that controls false retrievals at
-# the declared tolerance (a false retrieval is worse than no skill).  Until then,
-# 0.75 is explicitly a conservative starting point, while the strictly positive
-# floor ensures that "best available" never means "applicable" by itself.
-DEFAULT_MIN_SIMILARITY = 0.75
+# This default is a measured boundary for one pinned model and task family, not a
+# model-independent semantic constant.  On
+# sentence-transformers/all-MiniLM-L6-v2 revision
+# c9745ed1d9f207416be6d2e6f8de32d1f16199bf (384 dimensions), 14 real candidates
+# were paired with five tasks: 14 source-task pairs were labelled applicable and
+# 56 cross-task pairs inapplicable.  Applicable similarities were min 0.147,
+# median 0.415, max 0.620; inapplicable similarities were min -0.013, median
+# 0.188, max 0.330.  The threshold sweep (threshold: recall, false retrieval) was
+# 0.30: 79%, 12%; 0.35: 71%, 0%; 0.40: 50%, 0%; 0.50: 7%, 0%; 0.75: 0%, 0%.
+# Because 0.35 and 0.40 tied at the declared zero measured false-retrieval rate,
+# 0.35 wins on recall.  The positive, inclusive gate remains a safety requirement.
+#
+# These 70 labels are provenance proxies, not human semantic judgements: a skill
+# distilled from task T was labelled applicable to T and inapplicable to the other
+# four tasks.  A procedure can genuinely transfer (for example, the same stale-cache
+# failure can recur elsewhere), so some of the 56 negatives may really be positives
+# and the measured false-retrieval rate may be biased downward.  The small,
+# single-family sample is not a law.  Recalibrate if the model or revision, query or
+# activation construction, task family, or label audit changes, and re-check on a
+# broader labelled set before inheriting this value elsewhere.  Original task
+# instruction remains the query source: its best observed similarity was 0.613,
+# versus 0.385/0.620/0.613 for the last 3/10/25 trajectory steps, so the best
+# alternative gained only 0.007.  Both distillation arms consume this same default
+# through one retrieval rule, so the calibrated change cannot favor either arm.
+DEFAULT_MIN_SIMILARITY = 0.35
+
+# Machine-readable provenance for the measurements summarized above.  Keep the
+# observed values as literals: this host cannot reproduce them because the pinned
+# embedding model is deliberately a host-local experiment dependency.
+DEFAULT_MIN_SIMILARITY_CALIBRATION: Mapping[str, Any] = {
+    "schema_version": 1,
+    "model": {
+        "name": "sentence-transformers/all-MiniLM-L6-v2",
+        "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        "dimensions": 384,
+    },
+    "sample": {
+        "candidate_count": 14,
+        "task_count": 5,
+        "pair_count": 70,
+        "label_rule": (
+            "A candidate distilled from task T is labelled applicable to T and "
+            "inapplicable to each of the other four tasks."
+        ),
+        "applicable": {
+            "count": 14,
+            "minimum": 0.147,
+            "median": 0.415,
+            "maximum": 0.620,
+        },
+        "inapplicable": {
+            "count": 56,
+            "minimum": -0.013,
+            "median": 0.188,
+            "maximum": 0.330,
+        },
+    },
+    "threshold_sweep": (
+        {"threshold": 0.30, "recall_percent": 79, "false_retrieval_percent": 12},
+        {"threshold": 0.35, "recall_percent": 71, "false_retrieval_percent": 0},
+        {"threshold": 0.40, "recall_percent": 50, "false_retrieval_percent": 0},
+        {"threshold": 0.50, "recall_percent": 7, "false_retrieval_percent": 0},
+        {"threshold": 0.75, "recall_percent": 0, "false_retrieval_percent": 0},
+    ),
+    "selection": {
+        "threshold": 0.35,
+        "recall_percent": 71,
+        "false_retrieval_percent": 0,
+        "rationale": (
+            "0.35 and 0.40 both measured zero false retrievals; choose 0.35 for "
+            "its higher measured recall."
+        ),
+    },
+    "query_source_check": {
+        "selected": "original_task_instruction",
+        "best_similarity": {
+            "original_task_instruction": 0.613,
+            "last_3_trajectory_steps": 0.385,
+            "last_10_trajectory_steps": 0.620,
+            "last_25_trajectory_steps": 0.613,
+        },
+        "best_alternative_gain": 0.007,
+    },
+    "limitations": (
+        "The 70 pairs come from one model and one task family.",
+        "Provenance labels are proxies rather than human semantic judgements.",
+        "Transferable cross-task skills can make the measured false-retrieval rate "
+        "optimistically low.",
+    ),
+    "recalibrate_if": (
+        "embedding model or revision changes",
+        "query or activation construction changes",
+        "task family changes",
+        "labels receive a semantic audit or the labelled sample is broadened",
+    ),
+    "arm_policy": "Both distillation arms use the identical retrieval rule.",
+}
 
 # §2.5's context-rot measurement falls from 98.1 in a clean prompt to 64.1 when
 # information is distributed through a multi-turn run.  It proves extra context has
