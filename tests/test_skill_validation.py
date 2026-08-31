@@ -32,9 +32,24 @@ def _skill(label: str) -> Skill:
     )
 
 
+def _lhtb_tree(tmp_path: Path, *tasks: str) -> Path:
+    root = tmp_path / "LHTB"
+    for task in tasks:
+        task_dir = root / "tasks" / task
+        task_dir.mkdir(parents=True)
+        (task_dir / "task.toml").write_text(
+            f"[task]\nname = 'long-horizon-terminal-bench/{task}'\n",
+            encoding="utf-8",
+        )
+    return root
+
+
 def _candidate_file(
-    tmp_path: Path, arms: tuple[str, ...] = ("localized", "baseline")
+    tmp_path: Path,
+    arms: tuple[str, ...] = ("localized", "baseline"),
+    task_names: tuple[str, ...] = ("task-0", "task-1"),
 ) -> Path:
+    assert len(arms) == len(task_names)
     path = tmp_path / "candidates.json"
     path.write_text(
         json.dumps(
@@ -47,6 +62,7 @@ def _candidate_file(
                         "arm": arm,
                         "skill": serialize_skill(_skill(f"candidate-{index}")),
                         "paired_deltas": [],
+                        "task_name": f"long-horizon-terminal-bench/{task_names[index]}",
                         "source_marker": f"source-{index}",
                     }
                     for index, arm in enumerate(arms)
@@ -58,21 +74,25 @@ def _candidate_file(
     return path
 
 
-def _task_file(tmp_path: Path, count: int) -> Path:
-    path = tmp_path / "tasks.json"
-    path.write_text(
-        json.dumps({"selected_tasks": [f"task-{index}" for index in range(count)]}),
-        encoding="utf-8",
-    )
-    return path
+def _rewards(
+    task_names: tuple[str, ...] = ("task-0", "task-1"),
+) -> dict[tuple[str | None, str, int], float]:
+    rewards: dict[tuple[str | None, str, int], float] = {}
+    for task_name in dict.fromkeys(task_names):
+        for replicate_index in range(1, 11):
+            rewards[(None, task_name, replicate_index)] = 0.4
+    for candidate_index, task_name in enumerate(task_names):
+        for replicate_index in range(1, 11):
+            rewards[(f"candidate-{candidate_index}", task_name, replicate_index)] = 0.5
+    return rewards
 
 
 class _FakeRunner:
     def __init__(
         self,
-        rewards: dict[tuple[str | None, str], float],
+        rewards: dict[tuple[str | None, str, int], float],
         *,
-        failures: set[tuple[str | None, str]] | None = None,
+        failures: set[tuple[str | None, str, int]] | None = None,
     ) -> None:
         self.rewards = rewards
         self.failures = failures or set()
@@ -80,7 +100,7 @@ class _FakeRunner:
 
     async def run(self, trial: ValidationTrial) -> ValidationTrialResult:
         self.calls.append(trial)
-        key = (trial.candidate_id, trial.task_name)
+        key = (trial.candidate_id, trial.task_name, trial.replicate_index)
         library_ids = SkillLibrary(trial.library_dir).admitted_skill_ids()
         if key in self.failures:
             return ValidationTrialResult(
@@ -97,25 +117,12 @@ class _FakeRunner:
         )
 
 
-def _three_task_rewards() -> dict[tuple[str | None, str], float]:
-    return {
-        (None, "task-0"): 0.2,
-        (None, "task-1"): 0.4,
-        (None, "task-2"): 0.6,
-        ("candidate-0", "task-0"): 0.3,
-        ("candidate-0", "task-1"): 0.35,
-        ("candidate-0", "task-2"): 0.9,
-        ("candidate-1", "task-0"): 0.2,
-        ("candidate-1", "task-1"): 0.8,
-        ("candidate-1", "task-2"): 0.1,
-    }
-
-
 @pytest.mark.asyncio
 async def test_dry_run_reports_exact_cost_and_breakdown_without_writes(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 3))
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
     output = tmp_path / "validated.json"
     work_dir = tmp_path / "work"
 
@@ -133,18 +140,21 @@ async def test_dry_run_reports_exact_cost_and_breakdown_without_writes(
     )
 
     assert report["validation"]["summary"] == {
-        "planned_trial_count": 9,
+        "planned_trial_count": 40,
         "completed_attempt_count": 0,
         "measured_trial_count": 0,
-        "pending_trial_count": 9,
-        "shared_control_trial_count": 3,
-        "treatment_trial_count": 6,
+        "pending_trial_count": 40,
+        "distinct_source_task_count": 2,
+        "observations_per_candidate": 10,
+        "paired_observation_count": 20,
+        "shared_control_trial_count": 20,
+        "treatment_trial_count": 20,
         "reused_trial_count": 0,
         "new_attempt_count": 0,
         "failed_attempt_count": 0,
         "estimated_cost_per_trial_usd": 0.151,
-        "estimated_planned_cost_usd": 1.359,
-        "estimated_pending_cost_usd": 1.359,
+        "estimated_planned_cost_usd": 6.04,
+        "estimated_pending_cost_usd": 6.04,
         "status_counts": {},
     }
     assert not output.exists()
@@ -154,8 +164,8 @@ async def test_dry_run_reports_exact_cost_and_breakdown_without_writes(
 def test_validate_skills_cli_dry_run_prints_candidate_task_costs_and_writes_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
     candidates = _candidate_file(tmp_path)
-    tasks = _task_file(tmp_path, 3)
     output = tmp_path / "validated.json"
     work_dir = tmp_path / "work"
 
@@ -164,7 +174,8 @@ def test_validate_skills_cli_dry_run_prints_candidate_task_costs_and_writes_noth
             [
                 "validate-skills",
                 str(candidates),
-                str(tasks),
+                "--lhtb-dir",
+                str(root),
                 "--output",
                 str(output),
                 "--work-dir",
@@ -177,12 +188,12 @@ def test_validate_skills_cli_dry_run_prints_candidate_task_costs_and_writes_noth
 
     printed = capsys.readouterr().out
     assert (
-        "9 trial(s) planned: 3 shared no-skill + 6 with-skill; estimated "
-        "$1.359 at $0.151/trial" in printed
+        "40 trial(s) planned: 20 shared no-skill + 20 with-skill; estimated "
+        "$6.040 at $0.151/trial" in printed
     )
-    assert "candidate-0 [localized]:" in printed
-    assert "candidate-1 [baseline]:" in printed
-    assert printed.count("task-2: 1") == 3
+    assert "candidate-0 [localized] from long-horizon-terminal-bench/task-0:" in printed
+    assert "candidate-1 [baseline] from long-horizon-terminal-bench/task-1:" in printed
+    assert "task-0 replicate 10: 1 with-skill trial" in printed
     assert "dry run; no trials run and no files written" in printed
     assert not output.exists()
     assert not work_dir.exists()
@@ -192,19 +203,28 @@ def test_validate_skills_cli_dry_run_prints_candidate_task_costs_and_writes_noth
 async def test_fake_rewards_produce_hand_computed_paired_delta_literals(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 3))
-    runner = _FakeRunner(_three_task_rewards())
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    rewards = _rewards()
+    rewards[("candidate-0", "task-0", 2)] = 0.35
+    rewards[("candidate-0", "task-0", 3)] = 0.7
+    rewards[("candidate-1", "task-1", 2)] = 0.8
+    rewards[("candidate-1", "task-1", 3)] = 0.1
     output = tmp_path / "validated.json"
 
     report = await run_skill_validation(
         plan,
         output,
-        runner=runner,
+        runner=_FakeRunner(rewards),
         work_dir=tmp_path / "work",
     )
 
-    assert report["candidates"][0]["paired_deltas"] == pytest.approx([0.1, -0.05, 0.3])
-    assert report["candidates"][1]["paired_deltas"] == pytest.approx([0.0, 0.4, -0.5])
+    assert report["candidates"][0]["paired_deltas"] == pytest.approx(
+        [0.1, -0.05, 0.3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    )
+    assert report["candidates"][1]["paired_deltas"] == pytest.approx(
+        [0.1, 0.4, -0.3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    )
     assert report["candidates"][0]["source_marker"] == "source-0"
     assert json.loads(output.read_text(encoding="utf-8")) == report
 
@@ -213,8 +233,9 @@ async def test_fake_rewards_produce_hand_computed_paired_delta_literals(
 async def test_shared_no_skill_baseline_runs_once_per_task_and_libraries_are_isolated(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 3))
-    runner = _FakeRunner(_three_task_rewards())
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    runner = _FakeRunner(_rewards())
 
     await run_skill_validation(
         plan,
@@ -224,8 +245,11 @@ async def test_shared_no_skill_baseline_runs_once_per_task_and_libraries_are_iso
     )
 
     controls = [trial for trial in runner.calls if trial.candidate_id is None]
-    assert [trial.task_name for trial in controls] == ["task-0", "task-1", "task-2"]
-    assert len(controls) == 3
+    assert Counter(trial.task_name for trial in controls) == {
+        "task-0": 10,
+        "task-1": 10,
+    }
+    assert len(controls) == 20
     for trial in runner.calls:
         assert SkillLibrary(trial.library_dir).admitted_skill_ids() == (
             (trial.candidate_id,) if trial.candidate_id is not None else ()
@@ -236,8 +260,9 @@ async def test_shared_no_skill_baseline_runs_once_per_task_and_libraries_are_iso
 async def test_failed_trial_is_null_and_candidate_is_incomplete_while_run_continues(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 3))
-    runner = _FakeRunner(_three_task_rewards(), failures={("candidate-0", "task-1")})
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    runner = _FakeRunner(_rewards(), failures={("candidate-0", "task-0", 2)})
     output = tmp_path / "validated.json"
 
     report = await run_skill_validation(
@@ -247,23 +272,27 @@ async def test_failed_trial_is_null_and_candidate_is_incomplete_while_run_contin
         work_dir=tmp_path / "work",
     )
 
-    assert report["candidates"][0]["paired_deltas"] == pytest.approx([0.1, None, 0.3])
-    assert report["candidates"][1]["paired_deltas"] == pytest.approx([0.0, 0.4, -0.5])
-    candidates = load_admission_candidates(output)
-    decision = decide_skill_admission(candidates[0])
+    assert report["candidates"][0]["paired_deltas"] == pytest.approx(
+        [0.1, None, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    )
+    assert report["candidates"][1]["paired_deltas"] == pytest.approx([0.1] * 10)
+    decision = decide_skill_admission(load_admission_candidates(output)[0])
     assert decision["status"] == "incomplete"
-    assert decision["measurement"]["measured_task_count"] == 2
-    assert decision["measurement"]["paired_deltas"] == pytest.approx([0.1, None, 0.3])
-    assert len(runner.calls) == 9
+    assert decision["measurement"]["measured_task_count"] == 9
+    assert decision["measurement"]["paired_deltas"] == pytest.approx(
+        [0.1, None, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    )
+    assert len(runner.calls) == 40
 
 
 @pytest.mark.asyncio
 async def test_all_treatments_for_one_candidate_can_fail_without_affecting_another(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 3))
-    failures = {("candidate-0", f"task-{index}") for index in range(3)}
-    runner = _FakeRunner(_three_task_rewards(), failures=failures)
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    failures = {("candidate-0", "task-0", index) for index in range(1, 11)}
+    runner = _FakeRunner(_rewards(), failures=failures)
 
     report = await run_skill_validation(
         plan,
@@ -272,19 +301,20 @@ async def test_all_treatments_for_one_candidate_can_fail_without_affecting_anoth
         work_dir=tmp_path / "work",
     )
 
-    assert report["candidates"][0]["paired_deltas"] == [None, None, None]
-    assert report["candidates"][1]["paired_deltas"] == pytest.approx([0.0, 0.4, -0.5])
-    assert report["validation"]["summary"]["pending_trial_count"] == 3
+    assert report["candidates"][0]["paired_deltas"] == [None] * 10
+    assert report["candidates"][1]["paired_deltas"] == pytest.approx([0.1] * 10)
+    assert report["validation"]["summary"]["pending_trial_count"] == 10
 
 
 @pytest.mark.asyncio
 async def test_interrupted_run_resumes_without_repeating_completed_trials(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 3))
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
     output = tmp_path / "validated.json"
     work_dir = tmp_path / "work"
-    first = _FakeRunner(_three_task_rewards())
+    first = _FakeRunner(_rewards())
     original_run = first.run
 
     async def interrupt_on_fourth(trial: ValidationTrial) -> ValidationTrialResult:
@@ -297,13 +327,15 @@ async def test_interrupted_run_resumes_without_repeating_completed_trials(
         await run_skill_validation(plan, output, runner=first, work_dir=work_dir)
     assert len(first.calls) == 3
 
-    resumed = _FakeRunner(_three_task_rewards())
+    resumed = _FakeRunner(_rewards())
     report = await run_skill_validation(plan, output, runner=resumed, work_dir=work_dir)
 
-    assert len(resumed.calls) == 6
-    assert all(trial.candidate_id is not None for trial in resumed.calls)
+    assert len(resumed.calls) == 37
+    assert {trial.trial_id for trial in first.calls}.isdisjoint(
+        trial.trial_id for trial in resumed.calls
+    )
     assert report["validation"]["summary"]["reused_trial_count"] == 3
-    assert report["validation"]["summary"]["new_attempt_count"] == 6
+    assert report["validation"]["summary"]["new_attempt_count"] == 37
     assert [attempt["reused"] for attempt in report["validation"]["attempts"][:3]] == [
         True,
         True,
@@ -315,13 +347,13 @@ async def test_interrupted_run_resumes_without_repeating_completed_trials(
 async def test_both_candidate_arms_use_one_validation_procedure(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 1))
-    rewards = {
-        (None, "task-0"): 0.2,
-        ("candidate-0", "task-0"): 0.3,
-        ("candidate-1", "task-0"): 0.4,
-    }
-    runner = _FakeRunner(rewards)
+    root = _lhtb_tree(tmp_path, "task-0")
+    candidates = _candidate_file(tmp_path, task_names=("task-0", "task-0"))
+    payload = json.loads(candidates.read_text(encoding="utf-8"))
+    payload["candidates"][1]["skill"] = payload["candidates"][0]["skill"]
+    candidates.write_text(json.dumps(payload), encoding="utf-8")
+    plan = plan_skill_validation(candidates, root)
+    runner = _FakeRunner(_rewards(("task-0", "task-0")))
 
     await run_skill_validation(
         plan,
@@ -333,18 +365,44 @@ async def test_both_candidate_arms_use_one_validation_procedure(
     treatments = [trial for trial in runner.calls if trial.candidate_id is not None]
     assert [trial.distillation_arm for trial in treatments] == [
         "localized",
+        "localized",
+        "localized",
+        "localized",
+        "localized",
+        "localized",
+        "localized",
+        "localized",
+        "localized",
+        "localized",
+        "baseline",
+        "baseline",
+        "baseline",
+        "baseline",
+        "baseline",
+        "baseline",
+        "baseline",
+        "baseline",
+        "baseline",
         "baseline",
     ]
     assert {trial.procedure_id for trial in treatments} == {VALIDATION_PROCEDURE_ID}
-    assert type(treatments[0]) is type(treatments[1]) is ValidationTrial
+    assert {type(trial) for trial in treatments} == {ValidationTrial}
+    assert [
+        (trial.task_name, trial.replicate_index, trial.condition, trial.procedure_id)
+        for trial in treatments[:10]
+    ] == [
+        (trial.task_name, trial.replicate_index, trial.condition, trial.procedure_id)
+        for trial in treatments[10:]
+    ]
 
 
 @pytest.mark.asyncio
 async def test_injection_mismatch_discards_reward_instead_of_measuring_wrong_skill(
     tmp_path: Path,
 ) -> None:
-    candidates = _candidate_file(tmp_path, arms=("localized",))
-    plan = plan_skill_validation(candidates, _task_file(tmp_path, 1))
+    root = _lhtb_tree(tmp_path, "task-0")
+    candidates = _candidate_file(tmp_path, arms=("localized",), task_names=("task-0",))
+    plan = plan_skill_validation(candidates, root)
 
     class MismatchRunner(_FakeRunner):
         async def run(self, trial: ValidationTrial) -> ValidationTrialResult:
@@ -357,7 +415,7 @@ async def test_injection_mismatch_discards_reward_instead_of_measuring_wrong_ski
                 )
             return result
 
-    runner = MismatchRunner({(None, "task-0"): 0.2, ("candidate-0", "task-0"): 0.5})
+    runner = MismatchRunner(_rewards(("task-0",)))
 
     report = await run_skill_validation(
         plan,
@@ -366,7 +424,7 @@ async def test_injection_mismatch_discards_reward_instead_of_measuring_wrong_ski
         work_dir=tmp_path / "work",
     )
 
-    assert report["candidates"][0]["paired_deltas"] == [None]
+    assert report["candidates"][0]["paired_deltas"] == [None] * 10
     attempt = report["validation"]["attempts"][-1]
     assert attempt["status"] == "failed"
     assert attempt["reward"] is None
@@ -377,13 +435,12 @@ async def test_injection_mismatch_discards_reward_instead_of_measuring_wrong_ski
 async def test_ten_task_output_feeds_admit_skills_without_transformation(
     tmp_path: Path,
 ) -> None:
-    plan = plan_skill_validation(_candidate_file(tmp_path), _task_file(tmp_path, 10))
-    rewards: dict[tuple[str | None, str], float] = {}
-    for index in range(10):
-        task = f"task-{index}"
-        rewards[(None, task)] = 0.4
-        rewards[("candidate-0", task)] = 0.5 if index < 9 else 0.4
-        rewards[("candidate-1", task)] = 0.5 if index < 8 else 0.4
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    rewards = _rewards()
+    rewards[("candidate-0", "task-0", 10)] = 0.4
+    rewards[("candidate-1", "task-1", 9)] = 0.4
+    rewards[("candidate-1", "task-1", 10)] = 0.4
     output = tmp_path / "validated.json"
     await run_skill_validation(
         plan,
@@ -417,8 +474,8 @@ async def test_ten_task_output_feeds_admit_skills_without_transformation(
 def test_real_cli_path_can_be_driven_with_offline_trial_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan_rewards = _three_task_rewards()
-    fake = _FakeRunner(plan_rewards)
+    root = _lhtb_tree(tmp_path, "task-0", "task-1")
+    fake = _FakeRunner(_rewards())
     preflight_calls = 0
     probe_calls = 0
 
@@ -443,7 +500,8 @@ def test_real_cli_path_can_be_driven_with_offline_trial_runner(
             [
                 "validate-skills",
                 str(_candidate_file(tmp_path)),
-                str(_task_file(tmp_path, 3)),
+                "--lhtb-dir",
+                str(root),
                 "--output",
                 str(output),
                 "--work-dir",
@@ -458,9 +516,9 @@ def test_real_cli_path_can_be_driven_with_offline_trial_runner(
     assert preflight_calls == 1
     assert probe_calls == 2
     assert Counter(trial.condition for trial in fake.calls) == {
-        "without_skill": 3,
-        "with_skill": 6,
+        "without_skill": 20,
+        "with_skill": 20,
     }
     assert load_admission_candidates(output)[0].paired_deltas == pytest.approx(
-        (0.1, -0.05, 0.3)
+        (0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1)
     )

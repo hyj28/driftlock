@@ -12,6 +12,7 @@ import json
 import math
 import re
 import shutil
+import tomllib
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -28,7 +29,7 @@ from driftlock.skill_distillation import parse_skill, serialize_skill
 
 VALIDATION_REPORT_NAME = "validated-skill-candidates.json"
 VALIDATION_MODE = "skill-paired-validation"
-VALIDATION_PROCEDURE_ID = "shared-replicated-single-candidate-paired-v2"
+VALIDATION_PROCEDURE_ID = "shared-own-task-replicated-single-candidate-paired-v3"
 
 # The most recent paid LHTB measurement supplied for this validation round was
 # $0.151 per trial (2026-08-30).  This is an operator-facing budget estimate,
@@ -58,6 +59,8 @@ class ValidationCandidate:
     candidate_id: str
     arm: str
     skill_document: str
+    source_task_name: str
+    task_name: str
 
     @property
     def skill_sha256(self) -> str:
@@ -68,6 +71,8 @@ class ValidationCandidate:
             "candidate_id": self.candidate_id,
             "arm": self.arm,
             "skill_sha256": self.skill_sha256,
+            "source_task_name": self.source_task_name,
+            "validation_task": self.task_name,
         }
 
 
@@ -82,7 +87,7 @@ class ValidationTrial:
     distillation_arm: str
     library_dir: Path
     candidate_id: str | None = None
-    expected_injected_candidate_ids: tuple[str, ...] = ()
+    available_candidate_ids: tuple[str, ...] = ()
     procedure_id: str = VALIDATION_PROCEDURE_ID
     attempt_number: int = 1
 
@@ -98,9 +103,7 @@ class ValidationTrial:
             "condition": self.condition,
             "candidate_id": self.candidate_id,
             "distillation_arm": self.distillation_arm,
-            "expected_injected_candidate_ids": list(
-                self.expected_injected_candidate_ids
-            ),
+            "available_candidate_ids": list(self.available_candidate_ids),
             "procedure_id": self.procedure_id,
         }
 
@@ -148,6 +151,7 @@ class SkillValidationPlan:
     """Validated candidates, replicated tasks, and the exact paid-work plan."""
 
     source_candidate_file: Path
+    task_root: Path
     source_payload: Mapping[str, Any]
     candidates: tuple[ValidationCandidate, ...]
     tasks: tuple[str, ...]
@@ -156,11 +160,25 @@ class SkillValidationPlan:
 
     @property
     def observation_count(self) -> int:
+        """Number of paired observations produced for each candidate."""
+
+        return self.replicate_count
+
+    @property
+    def shared_control_trial_count(self) -> int:
         return len(self.tasks) * self.replicate_count
 
     @property
+    def treatment_trial_count(self) -> int:
+        return len(self.candidates) * self.replicate_count
+
+    @property
+    def paired_observation_count(self) -> int:
+        return self.treatment_trial_count
+
+    @property
     def planned_trial_count(self) -> int:
-        return self.observation_count * (len(self.candidates) + 1)
+        return self.shared_control_trial_count + self.treatment_trial_count
 
     @property
     def estimated_cost_usd(self) -> float:
@@ -170,14 +188,16 @@ class SkillValidationPlan:
         return {
             "procedure_id": VALIDATION_PROCEDURE_ID,
             "source_candidate_file": str(self.source_candidate_file),
+            "task_root": str(self.task_root),
             "candidate_identities": [
                 candidate.identity() for candidate in self.candidates
             ],
-            "validation_tasks": list(self.tasks),
+            "distinct_source_tasks": list(self.tasks),
             "replicate_count": self.replicate_count,
-            "observation_count": self.observation_count,
-            "shared_control_trial_count": self.observation_count,
-            "treatment_trial_count": self.observation_count * len(self.candidates),
+            "observations_per_candidate": self.observation_count,
+            "paired_observation_count": self.paired_observation_count,
+            "shared_control_trial_count": self.shared_control_trial_count,
+            "treatment_trial_count": self.treatment_trial_count,
             "planned_trial_count": self.planned_trial_count,
             "estimated_cost_per_trial_usd": self.estimated_cost_per_trial_usd,
             "estimated_cost_usd": self.estimated_cost_usd,
@@ -199,14 +219,13 @@ class SkillValidationPlan:
         )
         treatments = tuple(
             _trial(
-                task_name=task,
+                task_name=candidate.task_name,
                 replicate_index=replicate_index,
                 condition="with_skill",
                 candidate=candidate,
                 library_dir=libraries / candidate.candidate_id,
             )
             for candidate in self.candidates
-            for task in self.tasks
             for replicate_index in range(1, self.replicate_count + 1)
         )
         return controls + treatments
@@ -214,11 +233,11 @@ class SkillValidationPlan:
 
 def plan_skill_validation(
     candidate_file: Path | str,
-    validation_tasks_file: Path | str,
+    lhtb_dir: Path | str,
     *,
     estimated_cost_per_trial_usd: float = DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
 ) -> SkillValidationPlan:
-    """Load candidates and tasks whose object form may set ``replicate_count``."""
+    """Plan ten own-task replicates per candidate without provider access."""
 
     if (
         isinstance(estimated_cost_per_trial_usd, bool)
@@ -234,6 +253,11 @@ def plan_skill_validation(
     raw_candidates = payload.get("candidates")
     if not isinstance(raw_candidates, list) or not raw_candidates:
         raise ValueError("skill candidate input candidates must be a non-empty list")
+
+    root = Path(lhtb_dir).expanduser().resolve()
+    task_root = root / "tasks"
+    if not task_root.is_dir():
+        raise FileNotFoundError(f"LHTB task directory does not exist: {task_root}")
 
     candidates: list[ValidationCandidate] = []
     candidate_ids: set[str] = set()
@@ -261,52 +285,29 @@ def plan_skill_validation(
             raise ValueError(
                 f"skill candidate {candidate_id!r} paired_deltas must be a list"
             )
+        source_task_name, task_name = _resolve_candidate_task(
+            task_root, raw.get("task_name"), candidate_id
+        )
         candidate_ids.add(candidate_id)
-        candidates.append(ValidationCandidate(candidate_id, arm, canonical_document))
+        candidates.append(
+            ValidationCandidate(
+                candidate_id,
+                arm,
+                canonical_document,
+                source_task_name,
+                task_name,
+            )
+        )
 
-    tasks_path = Path(validation_tasks_file).expanduser().resolve()
-    tasks_payload = _read_json(tasks_path, "validation task list")
-    if isinstance(tasks_payload, list):
-        raw_tasks = tasks_payload
-        replicate_count = 1
-    elif isinstance(tasks_payload, Mapping):
-        raw_tasks = tasks_payload.get("selected_tasks")
-        replicate_count = tasks_payload.get("replicate_count", 1)
-    else:
-        raw_tasks = None
-        replicate_count = None
-    if not isinstance(raw_tasks, list) or not raw_tasks:
-        raise ValueError(
-            "validation task list must be a non-empty array or an object with "
-            "selected_tasks"
-        )
-    if (
-        isinstance(replicate_count, bool)
-        or not isinstance(replicate_count, int)
-        or replicate_count <= 0
-    ):
-        raise ValueError("validation task replicate_count must be a positive integer")
-    tasks: list[str] = []
-    for index, task in enumerate(raw_tasks):
-        if not isinstance(task, str) or _SAFE_NAME.fullmatch(task) is None:
-            raise ValueError(f"validation task {index} has an unsafe name")
-        if task in tasks:
-            raise ValueError(f"duplicate validation task: {task}")
-        tasks.append(task)
-    observation_count = len(tasks) * replicate_count
-    if observation_count > VALIDATION_TASK_COUNT:
-        raise ValueError(
-            f"validation task list has {observation_count} observations "
-            f"({len(tasks)} tasks x {replicate_count} replicates); admission "
-            f"accepts at most {VALIDATION_TASK_COUNT} paired deltas"
-        )
+    tasks = tuple(dict.fromkeys(candidate.task_name for candidate in candidates))
 
     return SkillValidationPlan(
         source_candidate_file=source,
+        task_root=task_root,
         source_payload=payload,
         candidates=tuple(candidates),
-        tasks=tuple(tasks),
-        replicate_count=replicate_count,
+        tasks=tasks,
+        replicate_count=VALIDATION_TASK_COUNT,
         estimated_cost_per_trial_usd=float(estimated_cost_per_trial_usd),
     )
 
@@ -383,13 +384,13 @@ async def run_skill_validation(
             )
         if (
             result.status is ValidationTrialStatus.MEASURED
-            and result.injected_candidate_ids != trial.expected_injected_candidate_ids
+            and not _injection_matches_trial(trial, result.injected_candidate_ids)
         ):
             result = ValidationTrialResult(
                 status=ValidationTrialStatus.FAILED,
                 reason=(
-                    "skill injection mismatch: expected "
-                    f"{list(trial.expected_injected_candidate_ids)!r}, observed "
+                    "skill injection mismatch: available candidate ids were "
+                    f"{list(trial.available_candidate_ids)!r}, observed "
                     f"{list(result.injected_candidate_ids or ())!r}"
                 ),
                 audit=result.audit,
@@ -402,6 +403,11 @@ async def run_skill_validation(
             "reward": result.reward,
             "injected_candidate_ids": (
                 list(result.injected_candidate_ids)
+                if result.injected_candidate_ids is not None
+                else None
+            ),
+            "skill_injected": (
+                bool(result.injected_candidate_ids)
                 if result.injected_candidate_ids is not None
                 else None
             ),
@@ -430,6 +436,16 @@ async def run_skill_validation(
         run_metadata=run_metadata,
         dry_run=False,
     )
+
+
+def _injection_matches_trial(
+    trial: ValidationTrial, injected_candidate_ids: tuple[str, ...] | None
+) -> bool:
+    if injected_candidate_ids is None:
+        return False
+    if trial.condition == "without_skill":
+        return injected_candidate_ids == ()
+    return injected_candidate_ids in ((), trial.available_candidate_ids)
 
 
 def _trial(
@@ -467,7 +483,7 @@ def _trial(
             candidate.arm if candidate is not None else CONTROL_DISTILLATION_ARM
         ),
         library_dir=library_dir,
-        expected_injected_candidate_ids=(
+        available_candidate_ids=(
             (candidate.candidate_id,) if candidate is not None else ()
         ),
     )
@@ -590,9 +606,8 @@ def _load_previous(
             raise ValueError(
                 f"existing validation output has invalid completed work: {path}"
             ) from error
-        if (
-            status is ValidationTrialStatus.MEASURED
-            and result.injected_candidate_ids != trial.expected_injected_candidate_ids
+        if status is ValidationTrialStatus.MEASURED and not _injection_matches_trial(
+            trial, result.injected_candidate_ids
         ):
             raise ValueError(
                 f"existing validation output has invalid injection evidence: {path}"
@@ -601,6 +616,15 @@ def _load_previous(
         if raw.get("attempt_number") != counts[trial_id]:
             raise ValueError(
                 f"existing validation output has invalid attempt order: {path}"
+            )
+        expected_skill_injected = (
+            bool(result.injected_candidate_ids)
+            if result.injected_candidate_ids is not None
+            else None
+        )
+        if raw.get("skill_injected") != expected_skill_injected:
+            raise ValueError(
+                f"existing validation output has invalid injection evidence: {path}"
             )
         attempts.append(dict(raw))
         if status is ValidationTrialStatus.MEASURED:
@@ -669,40 +693,98 @@ def _report(
     for candidate in plan.candidates:
         raw = raw_by_id[candidate.candidate_id]
         deltas: list[float | None] = []
-        for task in plan.tasks:
-            for replicate_index in range(1, plan.replicate_count + 1):
-                observation_key = (task, replicate_index)
-                treatment_key = (
-                    candidate.candidate_id,
-                    task,
-                    replicate_index,
-                )
-                baseline = control_rewards.get(observation_key)
-                treatment = treatment_rewards.get(treatment_key)
-                delta = (
-                    treatment - baseline
-                    if treatment is not None and baseline is not None
-                    else None
-                )
-                deltas.append(delta)
-                control_trial = trial_by_key[(None, task, replicate_index)]
-                treatment_trial = trial_by_key[treatment_key]
-                paired_measurements.append(
-                    {
-                        "candidate_id": candidate.candidate_id,
-                        "arm": candidate.arm,
-                        "task_name": task,
-                        "replicate_index": replicate_index,
-                        "control_trial_id": control_trial.trial_id,
-                        "treatment_trial_id": treatment_trial.trial_id,
-                        "control_reward": baseline,
-                        "treatment_reward": treatment,
-                        "delta": delta,
-                        "measured": delta is not None,
-                    }
-                )
+        candidate_measurements: list[dict[str, Any]] = []
+        task = candidate.task_name
+        for replicate_index in range(1, plan.replicate_count + 1):
+            observation_key = (task, replicate_index)
+            treatment_key = (
+                candidate.candidate_id,
+                task,
+                replicate_index,
+            )
+            baseline = control_rewards.get(observation_key)
+            treatment = treatment_rewards.get(treatment_key)
+            delta = (
+                treatment - baseline
+                if treatment is not None and baseline is not None
+                else None
+            )
+            deltas.append(delta)
+            control_trial = trial_by_key[(None, task, replicate_index)]
+            treatment_trial = trial_by_key[treatment_key]
+            treatment_attempt = measured.get(treatment_trial.trial_id)
+            injected_candidate_ids = (
+                treatment_attempt["injected_candidate_ids"]
+                if treatment_attempt is not None
+                else None
+            )
+            skill_injected = (
+                bool(injected_candidate_ids) if treatment_attempt is not None else None
+            )
+            measurement = {
+                "candidate_id": candidate.candidate_id,
+                "arm": candidate.arm,
+                "source_task_name": candidate.source_task_name,
+                "task_name": task,
+                "replicate_index": replicate_index,
+                "control_trial_id": control_trial.trial_id,
+                "treatment_trial_id": treatment_trial.trial_id,
+                "control_reward": baseline,
+                "treatment_reward": treatment,
+                "delta": delta,
+                "measured": delta is not None,
+                "skill_injected": skill_injected,
+                "injected_candidate_ids": injected_candidate_ids,
+                "attribution": (
+                    "unmeasured"
+                    if delta is None
+                    else "skill_injected"
+                    if skill_injected
+                    else "no_skill_injected"
+                ),
+            }
+            paired_measurements.append(measurement)
+            candidate_measurements.append(measurement)
         raw["skill"] = candidate.skill_document
         raw["paired_deltas"] = deltas
+        injected_count = sum(
+            measurement["skill_injected"] is True
+            for measurement in candidate_measurements
+        )
+        no_injection_count = sum(
+            measurement["skill_injected"] is False
+            for measurement in candidate_measurements
+        )
+        unmeasured_pair_count = sum(
+            measurement["measured"] is False for measurement in candidate_measurements
+        )
+        unmeasured_treatment_count = (
+            plan.replicate_count - injected_count - no_injection_count
+        )
+        raw["validation_observation_summary"] = {
+            "source_task_name": candidate.source_task_name,
+            "task_name": candidate.task_name,
+            "expected_observation_count": plan.replicate_count,
+            "measured_observation_count": (
+                plan.replicate_count - unmeasured_pair_count
+            ),
+            "unmeasured_observation_count": unmeasured_pair_count,
+            "measured_treatment_count": (
+                plan.replicate_count - unmeasured_treatment_count
+            ),
+            "unmeasured_treatment_count": unmeasured_treatment_count,
+            "skill_injected_observation_count": injected_count,
+            "no_skill_injected_observation_count": no_injection_count,
+            "skill_application": (
+                "unmeasured"
+                if unmeasured_treatment_count == plan.replicate_count
+                else "never_injected"
+                if injected_count == 0
+                else "always_injected"
+                if no_injection_count == 0
+                else "mixed_injection"
+            ),
+        }
         rendered_candidates.append(raw)
     report["candidates"] = rendered_candidates
     pending = len(trials) - len(measured)
@@ -717,8 +799,11 @@ def _report(
             "completed_attempt_count": len(ordered_attempts),
             "measured_trial_count": len(measured),
             "pending_trial_count": pending,
-            "shared_control_trial_count": plan.observation_count,
-            "treatment_trial_count": plan.observation_count * len(plan.candidates),
+            "distinct_source_task_count": len(plan.tasks),
+            "observations_per_candidate": plan.observation_count,
+            "paired_observation_count": plan.paired_observation_count,
+            "shared_control_trial_count": plan.shared_control_trial_count,
+            "treatment_trial_count": plan.treatment_trial_count,
             "reused_trial_count": len(reused_ids),
             "new_attempt_count": len(ordered_attempts) - previous_attempt_count,
             "failed_attempt_count": status_counts[ValidationTrialStatus.FAILED.value],
@@ -755,6 +840,60 @@ def _read_json(path: Path, description: str) -> Any:
         raise FileNotFoundError(f"{description} does not exist: {path}") from None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{description} is invalid JSON: {path}") from error
+
+
+def _resolve_candidate_task(
+    task_root: Path, raw_task_name: object, candidate_id: str
+) -> tuple[str, str]:
+    if not isinstance(raw_task_name, str) or not raw_task_name:
+        raise ValueError(
+            f"skill candidate {candidate_id!r} refused (missing_task_name): "
+            "task_name must be non-empty text"
+        )
+    parts = raw_task_name.split("/")
+    if len(parts) == 1:
+        task_name = parts[0]
+    elif len(parts) == 2:
+        task_name = parts[1]
+    else:
+        task_name = ""
+    if _SAFE_NAME.fullmatch(task_name) is None:
+        raise ValueError(
+            f"skill candidate {candidate_id!r} refused "
+            f"(unresolvable_task_name): unsafe task_name {raw_task_name!r}"
+        )
+    task_file = task_root / task_name / "task.toml"
+    try:
+        metadata = tomllib.loads(task_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError(
+            f"skill candidate {candidate_id!r} refused "
+            f"(unresolvable_task_name): no task directory for {raw_task_name!r}"
+        ) from None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(
+            f"skill candidate {candidate_id!r} refused "
+            f"(unresolvable_task_name): invalid task metadata for "
+            f"{raw_task_name!r}"
+        ) from error
+    task = metadata.get("task")
+    canonical_name = task.get("name") if isinstance(task, Mapping) else None
+    if len(parts) == 2 and canonical_name != raw_task_name:
+        raise ValueError(
+            f"skill candidate {candidate_id!r} refused "
+            f"(unresolvable_task_name): task directory {task_name!r} does not "
+            f"declare {raw_task_name!r}"
+        )
+    if (
+        not isinstance(canonical_name, str)
+        or canonical_name.split("/")[-1] != task_name
+    ):
+        raise ValueError(
+            f"skill candidate {candidate_id!r} refused "
+            f"(unresolvable_task_name): task directory {task_name!r} has "
+            "inconsistent metadata"
+        )
+    return raw_task_name, task_name
 
 
 def _read_object(path: Path, description: str) -> dict[str, Any]:
