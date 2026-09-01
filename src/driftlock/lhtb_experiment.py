@@ -73,6 +73,7 @@ from driftlock.skill_distillation_driver import (
 )
 from driftlock.skill_validation import (
     DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
+    DEFAULT_MAX_CONCURRENT_TRIALS,
     VALIDATION_REPORT_NAME,
     ValidationFailureKind,
     ValidationTrial,
@@ -1609,6 +1610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     runner=runner,
                     work_dir=work_dir,
                     run_metadata=validation_run_metadata,
+                    max_concurrent_trials=args.max_concurrent_trials,
                     dry_run=args.dry_run,
                 )
             )
@@ -1626,7 +1628,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{plan.observation_count} own-task observation(s) = "
                 f"{plan.paired_observation_count} paired observation(s); "
                 f"{summary['pending_trial_count']} pending, "
-                f"{summary['reused_trial_count']} reused"
+                f"{summary['reused_trial_count']} reused; up to "
+                f"{args.max_concurrent_trials} concurrent trial(s)"
             )
             print("  shared no-skill controls:")
             for task in plan.tasks:
@@ -1816,6 +1819,15 @@ def _parser() -> argparse.ArgumentParser:
         "--estimated-cost-per-trial",
         type=float,
         default=DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
+    )
+    validation.add_argument(
+        "--max-concurrent-trials",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENT_TRIALS,
+        help=(
+            "maximum Harbor validation jobs in flight (default: 4; higher values "
+            "increase provider load and upstream 429 risk)"
+        ),
     )
     validation.add_argument("--dry-run", action="store_true")
     admission = sub.add_parser(

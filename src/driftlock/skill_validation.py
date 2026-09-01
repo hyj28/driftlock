@@ -7,6 +7,7 @@ Harbor-backed runner while tests inject a deterministic offline runner.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -35,6 +36,13 @@ VALIDATION_PROCEDURE_ID = "shared-own-task-replicated-single-candidate-paired-v3
 # $0.151 per trial (2026-08-30).  This is an operator-facing budget estimate,
 # not a spending limit; expose it as a CLI override when provider pricing changes.
 DEFAULT_ESTIMATED_COST_PER_TRIAL_USD = 0.151
+
+# Round five sustained four independent Harbor jobs on the target 8-core / 15 GB
+# host, so four is the evidence-backed default rather than an aspirational host
+# saturation target.  Keep this operator-controlled: raising it also increases
+# simultaneous provider pressure, and upstream 429s under load caused 28 of 32
+# trials to fail in round two.
+DEFAULT_MAX_CONCURRENT_TRIALS = 4
 
 # Retrieval fans one result out to both distillation-arm labels, and an empty
 # library invokes no embedder and preserves request bytes.  A shared control can
@@ -345,9 +353,17 @@ async def run_skill_validation(
     runner: SkillValidationTrialRunner,
     work_dir: Path | str,
     run_metadata: Mapping[str, Any] | None = None,
+    max_concurrent_trials: int = DEFAULT_MAX_CONCURRENT_TRIALS,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Run pending trials sequentially and checkpoint after every attempt."""
+    """Run bounded pending trials and checkpoint after every attempt."""
+
+    if (
+        isinstance(max_concurrent_trials, bool)
+        or not isinstance(max_concurrent_trials, int)
+        or max_concurrent_trials < 1
+    ):
+        raise ValueError("max concurrent validation trials must be a positive integer")
 
     destination = Path(output_path).expanduser().resolve()
     workspace = Path(work_dir).expanduser().resolve()
@@ -390,12 +406,13 @@ async def run_skill_validation(
             dry_run=False,
         ),
     )
-    for trial in trials:
-        if trial.trial_id in reused_ids:
-            continue
-        attempt_number = 1 + sum(
-            item["trial_id"] == trial.trial_id for item in attempts
-        )
+    attempt_numbers = {
+        trial.trial_id: 1 + sum(item["trial_id"] == trial.trial_id for item in attempts)
+        for trial in trials
+    }
+
+    async def run_trial(trial: ValidationTrial) -> None:
+        attempt_number = attempt_numbers[trial.trial_id]
         attempt_trial = replace(trial, attempt_number=attempt_number)
         try:
             result = await runner.run(attempt_trial)
@@ -445,6 +462,10 @@ async def run_skill_validation(
             "audit": dict(result.audit or {}),
             "reused": False,
         }
+        # There is deliberately no await between the runner completing and the
+        # atomic replace.  This synchronous critical section serializes writers
+        # on the event loop and prevents cancellation from losing a completed
+        # attempt while it waits for a checkpoint lock.
         attempts.append(attempt)
         _write_report(
             destination,
@@ -458,6 +479,45 @@ async def run_skill_validation(
                 dry_run=False,
             ),
         )
+
+    async def run_phase(phase_trials: Sequence[ValidationTrial]) -> None:
+        pending = iter(
+            trial for trial in phase_trials if trial.trial_id not in reused_ids
+        )
+
+        async def worker() -> None:
+            while True:
+                try:
+                    trial = next(pending)
+                except StopIteration:
+                    return
+                await run_trial(trial)
+
+        auxiliary_workers = [
+            asyncio.create_task(worker())
+            for _ in range(max(0, min(max_concurrent_trials, len(phase_trials)) - 1))
+        ]
+        try:
+            # Keep one worker in the caller task.  In addition to avoiding an
+            # unnecessary task at a bound of one, this preserves the sequential
+            # runner's BaseException/interrupt behavior on that path.
+            await worker()
+            await asyncio.gather(*auxiliary_workers)
+        except BaseException:
+            for worker_task in auxiliary_workers:
+                worker_task.cancel()
+            await asyncio.gather(*auxiliary_workers, return_exceptions=True)
+            raise
+
+    controls = tuple(trial for trial in trials if trial.condition == "without_skill")
+    treatments = tuple(trial for trial in trials if trial.condition == "with_skill")
+    # Controls are a complete first phase.  A partial paid run therefore cannot
+    # consume treatments that have no completed control attempt, and shared
+    # controls cannot race between candidates.  Dispatch order does not change a
+    # trial or observation, so VALIDATION_PROCEDURE_ID intentionally remains v3
+    # and prior measured trials remain reusable.
+    await run_phase(controls)
+    await run_phase(treatments)
     return _report(
         plan,
         trials,
