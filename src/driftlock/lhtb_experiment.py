@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tomllib
@@ -1022,13 +1023,11 @@ class _HarborSkillValidationRunner:
             child_env = os.environ.copy()
             child_env.pop("HB_PROCESS_REWARD", None)
             child_env["HB_CONTINUE_MODE"] = "same_conversation"
-            completed = subprocess.run(
+            exit_code = await _run_validation_process(
                 [*_pinned_harbor_command(), "run", "-c", str(config_path)],
                 cwd=self.lhtb_dir,
-                check=False,
                 env=child_env,
             )
-            exit_code = completed.returncode
         audit: dict[str, Any] = {
             "job_name": trial.job_name,
             "job_dir": str(job_dir),
@@ -1088,6 +1087,141 @@ class _HarborSkillValidationRunner:
             injected_candidate_ids=injected_ids,
             audit=audit,
         )
+
+
+_VALIDATION_PROCESS_INTERRUPT_GRACE_SEC = 10.0
+_VALIDATION_PROCESS_TERMINATE_GRACE_SEC = 5.0
+_VALIDATION_PROCESS_WRAPPER = """
+import os
+import sys
+
+pid_fd = int(sys.argv[1])
+os.setsid()
+os.write(pid_fd, f"{os.getpid()}\\n".encode())
+os.close(pid_fd)
+os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+"""
+
+
+async def _run_validation_process(
+    command: Sequence[str], *, cwd: Path, env: dict[str, str]
+) -> int:
+    """Run Harbor without blocking validation workers and reap it on cancellation."""
+
+    pid_reader, pid_writer = os.pipe()
+    os.set_blocking(pid_reader, False)
+
+    def run() -> subprocess.CompletedProcess[Any]:
+        try:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _VALIDATION_PROCESS_WRAPPER,
+                    str(pid_writer),
+                    *command,
+                ],
+                cwd=cwd,
+                check=False,
+                env=env,
+                pass_fds=(pid_writer,),
+            )
+        finally:
+            os.close(pid_writer)
+
+    run_task = asyncio.create_task(asyncio.to_thread(run))
+    pid_task = asyncio.create_task(_read_validation_process_pid(pid_reader, run_task))
+    process_group: int | None = None
+    try:
+        process_group = await asyncio.shield(pid_task)
+        completed = await asyncio.shield(run_task)
+        return completed.returncode
+    except BaseException:
+        if process_group is None:
+            process_group = await asyncio.shield(pid_task)
+        if process_group is not None:
+            await _stop_validation_process_group(process_group, run_task)
+        else:
+            await asyncio.shield(run_task)
+        raise
+    finally:
+        os.close(pid_reader)
+
+
+async def _stop_validation_process_group(
+    process_group: int,
+    run_task: asyncio.Task[subprocess.CompletedProcess[Any]],
+) -> None:
+    """Give Harbor its interrupt teardown, then ensure its process group is gone."""
+
+    if _signal_validation_process_group(
+        process_group, signal.SIGINT
+    ) and await _wait_for_validation_process(
+        process_group, run_task, _VALIDATION_PROCESS_INTERRUPT_GRACE_SEC
+    ):
+        return
+    if _signal_validation_process_group(
+        process_group, signal.SIGTERM
+    ) and await _wait_for_validation_process(
+        process_group, run_task, _VALIDATION_PROCESS_TERMINATE_GRACE_SEC
+    ):
+        return
+    _signal_validation_process_group(process_group, signal.SIGKILL)
+    await asyncio.shield(run_task)
+
+
+def _signal_validation_process_group(
+    process_group: int, process_signal: signal.Signals
+) -> bool:
+    try:
+        os.killpg(process_group, process_signal)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_for_validation_process(
+    process_group: int,
+    run_task: asyncio.Task[subprocess.CompletedProcess[Any]],
+    timeout_sec: float,
+) -> bool:
+    try:
+        async with asyncio.timeout(timeout_sec):
+            await asyncio.shield(run_task)
+            while _validation_process_group_exists(process_group):
+                await asyncio.sleep(0.05)
+    except TimeoutError:
+        return False
+    return True
+
+
+def _validation_process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _read_validation_process_pid(
+    pid_reader: int,
+    run_task: asyncio.Task[subprocess.CompletedProcess[Any]],
+) -> int | None:
+    payload = bytearray()
+    while b"\n" not in payload:
+        try:
+            chunk = os.read(pid_reader, 64)
+        except BlockingIOError:
+            chunk = None
+        if chunk:
+            payload.extend(chunk)
+            continue
+        if chunk == b"" or run_task.done():
+            return None
+        await asyncio.sleep(0)
+    return int(payload.partition(b"\n")[0])
 
 
 class _ValidationJobEvidenceError(ValueError):
