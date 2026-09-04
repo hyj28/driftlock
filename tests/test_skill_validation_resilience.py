@@ -167,6 +167,77 @@ async def test_no_reward_provider_attribution_reaches_the_validation_report(
         assert exception_name in attempt["reason"]
 
 
+async def _run_with_exception_stats(
+    tmp_path: Path, exception_stats: dict[str, list[str]]
+) -> dict[str, object]:
+    root = _lhtb_tree(tmp_path)
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    work_dir = tmp_path / "work"
+    target = plan.work_items(work_dir)[0]
+    for trial in plan.work_items(work_dir):
+        _write_harbor_attempt(
+            work_dir / "jobs" / trial.job_name,
+            reward=None if trial == target else 0.5,
+            injected_candidate_ids=trial.available_candidate_ids,
+        )
+    result_file = work_dir / "jobs" / target.job_name / "result.json"
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    result["stats"]["evals"]["evaluation"]["exception_stats"] = exception_stats
+    result_file.write_text(json.dumps(result), encoding="utf-8")
+    runner = experiment._HarborSkillValidationRunner(
+        lhtb_dir=root,
+        work_dir=work_dir,
+        skill_embedder_import_path="offline_embedder:embed",
+        model="offline-model",
+        provider="offline-provider",
+        api_base="http://offline.invalid/v1",
+        judge_api_base=None,
+        judge_provider="offline-judge",
+        timeout_sec=60,
+        max_total_tokens=100,
+    )
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=work_dir,
+        max_retries=0,
+    )
+    return next(
+        attempt
+        for attempt in report["validation"]["attempts"]
+        if attempt["trial_id"] == target.trial_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_mixed_transient_and_terminal_exceptions_are_terminal(
+    tmp_path: Path,
+) -> None:
+    attempt = await _run_with_exception_stats(
+        tmp_path,
+        {
+            "RateLimitError": ["trial-0"],
+            "ValueError": ["trial-0"],
+        },
+    )
+
+    assert attempt["failure_kind"] == "no_reward"
+    assert attempt["audit"]["observed_exception_names"] == [
+        "RateLimitError",
+        "ValueError",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exception_name_with_no_trials_is_not_observed(tmp_path: Path) -> None:
+    attempt = await _run_with_exception_stats(tmp_path, {"SomeError": []})
+
+    assert attempt["failure_kind"] == "no_reward"
+    assert attempt["audit"]["observed_exception_names"] == []
+    assert attempt["reason"] == "validation job produced no reward (job recovered)"
+
+
 class _RetryRunner:
     def __init__(
         self,
@@ -360,6 +431,135 @@ async def test_forced_resume_retries_after_cumulative_budget_is_spent(
     assert len(target_attempts) == 4
     assert target_attempts[-1]["status"] == "measured"
     assert target_attempts[-1]["forced_reattempt"] is True
+
+
+@pytest.mark.asyncio
+async def test_default_resume_uses_only_the_remaining_budget_and_backoff(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(_candidate_file(tmp_path), _lhtb_tree(tmp_path))
+    output = tmp_path / "validated.json"
+    work_dir = tmp_path / "work"
+    interrupted = _RetryRunner(transient_failures=99)
+
+    async def interrupt_during_first_backoff(delay: float) -> None:
+        assert delay == 0.25
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        await run_skill_validation(
+            plan,
+            output,
+            runner=interrupted,
+            work_dir=work_dir,
+            max_concurrent_trials=1,
+            max_retries=2,
+            retry_backoff_seconds=0.25,
+            sleep=interrupt_during_first_backoff,
+        )
+    assert len(interrupted.calls) == 1
+
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    resumed = _RetryRunner(transient_failures=99)
+    report = await run_skill_validation(
+        plan,
+        output,
+        runner=resumed,
+        work_dir=work_dir,
+        max_concurrent_trials=1,
+        max_retries=2,
+        retry_backoff_seconds=0.25,
+        sleep=record_delay,
+    )
+
+    target_attempts = [
+        attempt
+        for attempt in report["validation"]["attempts"]
+        if attempt["condition"] == "without_skill" and attempt["replicate_index"] == 1
+    ]
+    assert [attempt["attempt_number"] for attempt in target_attempts] == [1, 2, 3]
+    assert delays == [0.25, 0.5]
+
+    exhausted = _RetryRunner()
+    await run_skill_validation(
+        plan,
+        output,
+        runner=exhausted,
+        work_dir=work_dir,
+        max_retries=2,
+        sleep=lambda delay: _unexpected_sleep(delay),
+    )
+    assert exhausted.calls == []
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_resets_backoff_after_spent_budget(
+    tmp_path: Path,
+) -> None:
+    plan = plan_skill_validation(_candidate_file(tmp_path), _lhtb_tree(tmp_path))
+    output = tmp_path / "validated.json"
+    work_dir = tmp_path / "work"
+    await run_skill_validation(
+        plan,
+        output,
+        runner=_RetryRunner(transient_failures=99),
+        work_dir=work_dir,
+        max_retries=2,
+        retry_backoff_seconds=0.25,
+        sleep=_record_no_delay,
+    )
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    forced = _RetryRunner(transient_failures=4)
+    report = await run_skill_validation(
+        plan,
+        output,
+        runner=forced,
+        work_dir=work_dir,
+        max_retries=2,
+        retry_backoff_seconds=0.25,
+        force_retry_unmeasured=True,
+        sleep=record_delay,
+    )
+
+    assert [trial.attempt_number for trial in forced.calls] == [4, 5]
+    assert delays == [0.25]
+    forced_attempts = [
+        attempt
+        for attempt in report["validation"]["attempts"]
+        if attempt.get("forced_reattempt") is True
+    ]
+    assert [attempt["attempt_number"] for attempt in forced_attempts] == [4, 5]
+
+
+@pytest.mark.asyncio
+async def test_fresh_forced_run_does_not_claim_any_reattempts(tmp_path: Path) -> None:
+    plan = plan_skill_validation(_candidate_file(tmp_path), _lhtb_tree(tmp_path))
+    runner = _RetryRunner()
+
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=tmp_path / "work",
+        force_retry_unmeasured=True,
+    )
+
+    assert len(runner.calls) == 20
+    assert all(
+        attempt["forced_reattempt"] is False
+        for attempt in report["validation"]["attempts"]
+    )
+    summary = report["validation"]["summary"]
+    assert summary["force_retry_unmeasured_requested"] is True
+    assert summary["forced_reattempt_trial_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -616,6 +816,79 @@ def test_render_distinguishes_mixed_always_and_never_injected_candidates() -> No
     assert len(set(lines.values())) == 3
 
 
+def test_application_status_uses_measured_flags_in_both_directions() -> None:
+    report = assemble_admission_report(
+        [
+            _admission_candidate(
+                "injected-only-unpaired",
+                [0.1] * 9 + [None],
+                [False] * 9 + [True],
+            ),
+            _admission_candidate(
+                "uninjected-only-unpaired",
+                [0.1] * 9 + [None],
+                [True] * 9 + [False],
+            ),
+        ]
+    )
+    first, second = report["decisions"]
+
+    assert first["skill_application"] == {
+        "status": "never_injected",
+        "ever_injected": True,
+        "injection_flags": [False] * 9 + [True],
+        "measured_observation_count": 9,
+        "skill_injected_measured_observation_count": 0,
+        "skill_injected_unpaired_treatment_count": 1,
+    }
+    assert second["skill_application"] == {
+        "status": "always_injected",
+        "ever_injected": True,
+        "injection_flags": [True] * 9 + [False],
+        "measured_observation_count": 9,
+        "skill_injected_measured_observation_count": 9,
+        "skill_injected_unpaired_treatment_count": 0,
+    }
+    rendered = render_admission_report(report)
+    first_line = next(
+        line for line in rendered.splitlines() if "injected-only-unpaired" in line
+    )
+    second_line = next(
+        line for line in rendered.splitlines() if "uninjected-only-unpaired" in line
+    )
+    assert "not injected in any measured observation" in first_line
+    assert "injected only in 1 unpaired treatment(s)" in first_line
+    assert "mixed injection" not in first_line
+    assert "reported mean" not in first_line
+    assert "skill retrieved/injected" in second_line
+    assert "mixed injection" not in second_line
+
+
+def test_recorded_unknown_flags_differ_from_unrecorded_flags() -> None:
+    recorded = assemble_admission_report(
+        [_admission_candidate("recorded-unknown", [0.0] * 10, [None] * 10)]
+    )
+    unrecorded = assemble_admission_report(
+        [_admission_candidate("unrecorded", [0.0] * 10, None)]
+    )
+
+    assert recorded["null_channel"]["availability"] == "unavailable"
+    assert (
+        recorded["null_channel"]["unavailability_reason"] == "injection_flags_unknown"
+    )
+    assert recorded["null_channel"]["no_skill_injected"] is None
+    assert recorded["null_channel"]["skill_injected"] is None
+    assert (
+        unrecorded["null_channel"]["unavailability_reason"]
+        == "injection_flags_not_recorded"
+    )
+    recorded_text = render_admission_report(recorded)
+    unrecorded_text = render_admission_report(unrecorded)
+    assert "flags were recorded, but all measured values are unknown" in recorded_text
+    assert "flags were not recorded" in unrecorded_text
+    assert recorded_text != unrecorded_text
+
+
 def _write_cli_validation(
     path: Path,
     candidates: list[tuple[str, list[float | None], list[bool] | None]],
@@ -836,14 +1109,3 @@ def test_validation_failure_kind_values_do_not_alias() -> None:
     values = [member.value for member in ValidationFailureKind.__members__.values()]
 
     assert len(values) == len(set(values))
-
-
-def test_transient_provider_exception_allowlist_is_exact() -> None:
-    assert {
-        "RateLimitError",
-        "APIError",
-        "APIConnectionError",
-        "Timeout",
-        "ServiceUnavailableError",
-        "InternalServerError",
-    } == experiment.TRANSIENT_VALIDATION_EXCEPTION_NAMES

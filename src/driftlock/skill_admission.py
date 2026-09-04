@@ -340,10 +340,21 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
         not isinstance(null_channel, Mapping)
         or null_channel.get("availability") == "unavailable"
     ):
-        lines.append(
-            "null channel: unavailable (per-observation injection flags were not "
-            "recorded)"
+        reason = (
+            null_channel.get("unavailability_reason")
+            if isinstance(null_channel, Mapping)
+            else None
         )
+        if reason == "injection_flags_unknown":
+            lines.append(
+                "null channel: unavailable (per-observation injection flags were "
+                "recorded, but all measured values are unknown)"
+            )
+        else:
+            lines.append(
+                "null channel: unavailable (per-observation injection flags were "
+                "not recorded)"
+            )
     else:
         lines.append(f"null channel: {null_channel['rationale']}")
         for group_name, label in (
@@ -375,34 +386,52 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
         application = decision.get(
             "skill_application", {"status": "unavailable", "ever_injected": None}
         )
-        if application["ever_injected"] is False:
+        effect = decision["measurement"]["effect"]
+        application_status = application["status"]
+        if application_status == "never_injected":
+            if application["ever_injected"] is True:
+                application_text = (
+                    "skill was not injected in any measured observation; it was "
+                    "injected only in "
+                    f"{application['skill_injected_unpaired_treatment_count']} "
+                    "unpaired treatment(s)"
+                )
+            else:
+                application_text = (
+                    "skill never retrieved/injected (reporting only; admission rule "
+                    "unchanged)"
+                )
+        elif application_status == "mixed_injection":
+            application_text = (
+                "skill mixed injection: injected in "
+                f"{application['skill_injected_measured_observation_count']} "
+                f"of {application['measured_observation_count']} measured "
+                "observations; "
+            )
+            application_text += (
+                "reported mean mixes skill-injected effects with byte-identical "
+                "no-skill noise"
+                if effect is not None
+                else "measured deltas mix skill-injected effects with byte-identical "
+                "no-skill noise"
+            )
+            if decision["status"] == SkillAdmissionStatus.REJECTED.value:
+                application_text += (
+                    "; skill retrieved/injected but did not help enough for admission"
+                )
+        elif application_status == "always_injected":
+            application_text = (
+                "skill retrieved/injected but did not help enough for admission"
+                if decision["status"] == SkillAdmissionStatus.REJECTED.value
+                else "skill retrieved/injected"
+            )
+        elif application["ever_injected"] is False:
             application_text = (
                 "skill never retrieved/injected (reporting only; admission rule "
                 "unchanged)"
             )
-        elif application["ever_injected"] is True:
-            if application["status"] == "mixed_injection":
-                application_text = (
-                    "skill mixed injection: injected in "
-                    f"{application['skill_injected_measured_observation_count']} "
-                    f"of {application['measured_observation_count']} measured "
-                    "observations; reported mean mixes skill-injected effects "
-                    "with byte-identical no-skill noise"
-                )
-                if decision["status"] == SkillAdmissionStatus.REJECTED.value:
-                    application_text += (
-                        "; skill retrieved/injected but did not help enough for "
-                        "admission"
-                    )
-            else:
-                application_text = (
-                    "skill retrieved/injected but did not help enough for admission"
-                    if decision["status"] == SkillAdmissionStatus.REJECTED.value
-                    else "skill retrieved/injected"
-                )
         else:
             application_text = "skill retrieval/injection unavailable"
-        effect = decision["measurement"]["effect"]
         if effect is None:
             refusal = decision["refusal"]
             lines.append(
@@ -651,9 +680,15 @@ def build_null_channel_summary(
     unknown_count = sum(flag is None for _, flag in measured)
     known = [(float(delta), flag) for delta, flag in measured if flag is not None]
     if not injection_data_available or (not known and unknown_count):
+        unavailability_reason = (
+            "injection_flags_not_recorded"
+            if not injection_data_available
+            else "injection_flags_unknown"
+        )
         return {
             "schema_version": 1,
             "availability": "unavailable",
+            "unavailability_reason": unavailability_reason,
             "rationale": NULL_CHANNEL_RATIONALE,
             "unknown_injection_observation_count": unknown_count,
             "no_skill_injected": None,
@@ -700,22 +735,22 @@ def _skill_application_report(
                 delta is not None for delta in paired_deltas
             ),
             "skill_injected_measured_observation_count": None,
+            "skill_injected_unpaired_treatment_count": None,
         }
-    observed = tuple(flag for flag in injection_flags if flag is not None)
-    if not observed:
-        status = "unmeasured"
-        ever_injected = None
-    elif any(observed):
-        status = "always_injected" if all(observed) else "mixed_injection"
-        ever_injected = True
-    else:
-        status = "never_injected"
-        ever_injected = False
     measured_flags = tuple(
         flag
         for delta, flag in zip(paired_deltas, injection_flags, strict=True)
         if delta is not None
     )
+    measured_observed = tuple(flag for flag in measured_flags if flag is not None)
+    all_observed = tuple(flag for flag in injection_flags if flag is not None)
+    if not measured_observed:
+        status = "unmeasured"
+    elif any(measured_observed):
+        status = "always_injected" if all(measured_observed) else "mixed_injection"
+    else:
+        status = "never_injected"
+    ever_injected = True if any(all_observed) else False if all_observed else None
     return {
         "status": status,
         "ever_injected": ever_injected,
@@ -723,6 +758,10 @@ def _skill_application_report(
         "measured_observation_count": len(measured_flags),
         "skill_injected_measured_observation_count": sum(
             flag is True for flag in measured_flags
+        ),
+        "skill_injected_unpaired_treatment_count": sum(
+            delta is None and flag is True
+            for delta, flag in zip(paired_deltas, injection_flags, strict=True)
         ),
     }
 
