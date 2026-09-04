@@ -75,6 +75,7 @@ from driftlock.skill_distillation_driver import (
 from driftlock.skill_validation import (
     DEFAULT_ESTIMATED_COST_PER_TRIAL_USD,
     DEFAULT_MAX_CONCURRENT_TRIALS,
+    DEFAULT_MAX_RETRIES,
     VALIDATION_REPORT_NAME,
     ValidationFailureKind,
     ValidationTrial,
@@ -107,6 +108,19 @@ _FINE_JUDGE_ARMS = frozenset(
 )
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_CREDENTIAL_ENV = "OPENROUTER_API_KEY"
+
+# These provider/transport exceptions describe weather before a reward existed;
+# generic runtime and integrity failures are deliberately excluded from retries.
+TRANSIENT_VALIDATION_EXCEPTION_NAMES = frozenset(
+    {
+        "RateLimitError",
+        "APIError",
+        "APIConnectionError",
+        "Timeout",
+        "ServiceUnavailableError",
+        "InternalServerError",
+    }
+)
 RUNNABLE_ARMS = (
     "stock",
     "retry",
@@ -333,6 +347,9 @@ def build_job_config(
         "n_attempts": 1,
         "n_concurrent_trials": n_concurrent_trials,
         "timeout_multiplier": 1.0,
+        # Callers such as run_skill_validation own retries so each provider call
+        # gets a distinct job name and report attempt instead of being hidden
+        # inside one Harbor result.
         "retry": {"max_retries": 0},
         "environment": {"type": "docker", "force_build": True, "delete": True},
         "agents": [agent],
@@ -1063,10 +1080,37 @@ class _HarborSkillValidationRunner:
                 if exit_code is not None
                 else "job recovered"
             )
+            try:
+                exception_names = _validation_exception_names(job_dir)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as error:
+                exception_names = ()
+                audit["exception_evidence_error"] = f"{type(error).__name__}: {error}"
+            audit["observed_exception_names"] = list(exception_names)
+            exception_detail = (
+                f"; observed exceptions: {', '.join(exception_names)}"
+                if exception_names
+                else ""
+            )
+            failure_kind = (
+                ValidationFailureKind.TRANSIENT_INFRASTRUCTURE
+                if exception_names
+                and all(
+                    name in TRANSIENT_VALIDATION_EXCEPTION_NAMES
+                    for name in exception_names
+                )
+                else ValidationFailureKind.NO_REWARD
+            )
             return ValidationTrialResult(
                 status=ValidationTrialStatus.FAILED,
-                reason=f"validation job produced no reward ({detail})",
-                failure_kind=ValidationFailureKind.NO_REWARD,
+                reason=(
+                    f"validation job produced no reward ({detail}){exception_detail}"
+                ),
+                failure_kind=failure_kind,
                 audit=audit,
             )
         try:
@@ -1245,6 +1289,32 @@ def _validation_run_record(job_dir: Path) -> Path:
             ValidationFailureKind.AMBIGUOUS_RESULT,
         )
     return records[0]
+
+
+def _validation_exception_names(job_dir: Path) -> tuple[str, ...]:
+    """Read Harbor's job-level exception names for a no-reward attempt."""
+
+    result_file = job_dir / "result.json"
+    data = json.loads(result_file.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Harbor job result must be an object: {result_file}")
+    stats = data.get("stats")
+    evals = stats.get("evals") if isinstance(stats, dict) else None
+    if not isinstance(evals, dict):
+        return ()
+    names = {
+        name
+        for evaluation in evals.values()
+        if isinstance(evaluation, dict)
+        for exception_stats in [evaluation.get("exception_stats")]
+        if isinstance(exception_stats, dict)
+        for name, trial_names in exception_stats.items()
+        if isinstance(name, str)
+        and name
+        and isinstance(trial_names, list)
+        and trial_names
+    }
+    return tuple(sorted(names))
 
 
 def _validation_injection_evidence(
@@ -1699,6 +1769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "skill_embedder_import_path": args.skill_embedder,
                 "timeout_sec": args.timeout_sec,
                 "max_total_tokens": args.max_total_tokens,
+                "max_retries": args.max_retries,
             }
 
             class _UncallableValidationRunner:
@@ -1745,6 +1816,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     work_dir=work_dir,
                     run_metadata=validation_run_metadata,
                     max_concurrent_trials=args.max_concurrent_trials,
+                    max_retries=args.max_retries,
+                    force_retry_unmeasured=args.force_retry_unmeasured,
                     dry_run=args.dry_run,
                 )
             )
@@ -1763,8 +1836,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{plan.paired_observation_count} paired observation(s); "
                 f"{summary['pending_trial_count']} pending, "
                 f"{summary['reused_trial_count']} reused; up to "
-                f"{args.max_concurrent_trials} concurrent trial(s)"
+                f"{args.max_concurrent_trials} concurrent trial(s), up to "
+                f"{args.max_retries} transient retry/retries per trial"
             )
+            if args.force_retry_unmeasured:
+                print("operator-forced re-attempt enabled for every unmeasured trial")
             print("  shared no-skill controls:")
             for task in plan.tasks:
                 for replicate_index in range(1, plan.replicate_count + 1):
@@ -1961,6 +2037,20 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "maximum Harbor validation jobs in flight (default: 4; higher values "
             "increase provider load and upstream 429 risk)"
+        ),
+    )
+    validation.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="maximum recorded retries for transient infrastructure failures",
+    )
+    validation.add_argument(
+        "--force-retry-unmeasured",
+        action="store_true",
+        help=(
+            "operator override to re-attempt every unmeasured trial regardless "
+            "of its prior failure or exhausted retry budget"
         ),
     )
     validation.add_argument("--dry-run", action="store_true")
