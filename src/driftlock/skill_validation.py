@@ -15,7 +15,7 @@ import re
 import shutil
 import tomllib
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -25,6 +25,7 @@ from driftlock.skill_admission import (
     DISTILLATION_ARMS,
     VALIDATION_TASK_COUNT,
     SkillLibrary,
+    build_null_channel_summary,
 )
 from driftlock.skill_distillation import parse_skill, serialize_skill
 
@@ -43,6 +44,14 @@ DEFAULT_ESTIMATED_COST_PER_TRIAL_USD = 0.151
 # simultaneous provider pressure, and upstream 429s under load caused 28 of 32
 # trials to fail in round two.
 DEFAULT_MAX_CONCURRENT_TRIALS = 4
+
+# Two retries cap a transiently interrupted paid observation at three provider
+# calls while giving isolated 429s and transport failures two chances to clear.
+DEFAULT_MAX_RETRIES = 2
+
+# One second keeps operator feedback responsive while exponential growth spaces
+# consecutive provider failures without creating a long blind wait.
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 
 # Retrieval fans one result out to both distillation-arm labels, and an empty
 # library invokes no embedder and preserves request bytes.  A shared control can
@@ -66,6 +75,7 @@ class ValidationFailureKind(StrEnum):
     TRIAL_RUNNER = "trial_runner"
     DID_NOT_PRODUCE_RESULT = "did_not_produce_result"
     AMBIGUOUS_RESULT = "ambiguous_result"
+    TRANSIENT_INFRASTRUCTURE = "transient_infrastructure"
     NO_REWARD = "no_reward"
     REWARD_EVIDENCE = "reward_evidence"
     SKILL_LAYER_EVIDENCE = "skill_layer_evidence"
@@ -354,6 +364,10 @@ async def run_skill_validation(
     work_dir: Path | str,
     run_metadata: Mapping[str, Any] | None = None,
     max_concurrent_trials: int = DEFAULT_MAX_CONCURRENT_TRIALS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    force_retry_unmeasured: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Run bounded pending trials and checkpoint after every attempt."""
@@ -364,6 +378,21 @@ async def run_skill_validation(
         or max_concurrent_trials < 1
     ):
         raise ValueError("max concurrent validation trials must be a positive integer")
+    if (
+        isinstance(max_retries, bool)
+        or not isinstance(max_retries, int)
+        or max_retries < 0
+    ):
+        raise ValueError("max validation retries must be a nonnegative integer")
+    if (
+        isinstance(retry_backoff_seconds, bool)
+        or not isinstance(retry_backoff_seconds, (int, float))
+        or not math.isfinite(float(retry_backoff_seconds))
+        or retry_backoff_seconds < 0
+    ):
+        raise ValueError("validation retry backoff must be finite and nonnegative")
+    if not isinstance(force_retry_unmeasured, bool):
+        raise TypeError("force retry unmeasured must be a boolean")
 
     destination = Path(output_path).expanduser().resolve()
     workspace = Path(work_dir).expanduser().resolve()
@@ -390,6 +419,8 @@ async def run_skill_validation(
             reused_ids=reused_ids,
             previous_attempt_count=previous_attempt_count,
             run_metadata=run_metadata,
+            max_retries=max_retries,
+            force_retry_unmeasured=force_retry_unmeasured,
             dry_run=True,
         )
 
@@ -403,87 +434,133 @@ async def run_skill_validation(
             reused_ids=reused_ids,
             previous_attempt_count=previous_attempt_count,
             run_metadata=run_metadata,
+            max_retries=max_retries,
+            force_retry_unmeasured=force_retry_unmeasured,
             dry_run=False,
         ),
     )
-    attempt_numbers = {
-        trial.trial_id: 1 + sum(item["trial_id"] == trial.trial_id for item in attempts)
-        for trial in trials
-    }
+    maximum_attempts = 1 + max_retries
+    attempt_counts = Counter(attempt["trial_id"] for attempt in attempts)
+
+    def should_run(trial: ValidationTrial) -> bool:
+        previous_attempt = latest.get(trial.trial_id)
+        if previous_attempt is None:
+            return True
+        if previous_attempt["status"] == ValidationTrialStatus.MEASURED.value:
+            return False
+        if force_retry_unmeasured:
+            return True
+        return (
+            previous_attempt["failure_kind"]
+            == ValidationFailureKind.TRANSIENT_INFRASTRUCTURE.value
+            and attempt_counts[trial.trial_id] < maximum_attempts
+        )
 
     async def run_trial(trial: ValidationTrial) -> None:
-        attempt_number = attempt_numbers[trial.trial_id]
-        attempt_trial = replace(trial, attempt_number=attempt_number)
-        try:
-            result = await runner.run(attempt_trial)
-            if not isinstance(result, ValidationTrialResult):
-                raise TypeError("validation runner must return ValidationTrialResult")
-        except Exception as error:
-            result = ValidationTrialResult(
-                status=ValidationTrialStatus.FAILED,
-                reason=(
-                    f"validation trial runner failed: {type(error).__name__}: {error}"
-                ),
-                failure_kind=ValidationFailureKind.TRIAL_RUNNER,
-            )
-        if (
-            result.status is ValidationTrialStatus.MEASURED
-            and not _injection_matches_trial(trial, result.injected_candidate_ids)
-        ):
-            result = ValidationTrialResult(
-                status=ValidationTrialStatus.FAILED,
-                reason=(
-                    "skill injection mismatch: available candidate ids were "
-                    f"{list(trial.available_candidate_ids)!r}, observed "
-                    f"{list(result.injected_candidate_ids or ())!r}"
-                ),
-                failure_kind=ValidationFailureKind.SKILL_INJECTION_MISMATCH,
-                audit=result.audit,
-            )
-        attempt = {
-            **trial.identity(),
-            "attempt_number": attempt_number,
-            "status": result.status.value,
-            "reason": result.reason,
-            "failure_kind": (
-                result.failure_kind.value if result.failure_kind is not None else None
-            ),
-            "reward": result.reward,
-            "injected_candidate_ids": (
-                list(result.injected_candidate_ids)
-                if result.injected_candidate_ids is not None
-                else None
-            ),
-            "skill_injected": (
-                bool(result.injected_candidate_ids)
-                if result.injected_candidate_ids is not None
-                else None
-            ),
-            "audit": dict(result.audit or {}),
-            "reused": False,
-        }
-        # There is deliberately no await between the runner completing and the
-        # atomic replace.  This synchronous critical section serializes writers
-        # on the event loop and prevents cancellation from losing a completed
-        # attempt while it waits for a checkpoint lock.
-        attempts.append(attempt)
-        _write_report(
-            destination,
-            _report(
-                plan,
-                trials,
-                attempts,
-                reused_ids=reused_ids,
-                previous_attempt_count=previous_attempt_count,
-                run_metadata=run_metadata,
-                dry_run=False,
-            ),
+        completed_attempts = attempt_counts[trial.trial_id]
+        forced_reattempt = force_retry_unmeasured and completed_attempts > 0
+        allowed_new_attempts = (
+            maximum_attempts
+            if forced_reattempt
+            else maximum_attempts - completed_attempts
         )
+        new_attempts = 0
+        if completed_attempts and not forced_reattempt:
+            await sleep(float(retry_backoff_seconds) * 2 ** (completed_attempts - 1))
+        while new_attempts < allowed_new_attempts:
+            attempt_number = completed_attempts + 1
+            attempt_trial = replace(trial, attempt_number=attempt_number)
+            try:
+                result = await runner.run(attempt_trial)
+                if not isinstance(result, ValidationTrialResult):
+                    raise TypeError(
+                        "validation runner must return ValidationTrialResult"
+                    )
+            except Exception as error:
+                result = ValidationTrialResult(
+                    status=ValidationTrialStatus.FAILED,
+                    reason=(
+                        "validation trial runner failed: "
+                        f"{type(error).__name__}: {error}"
+                    ),
+                    failure_kind=ValidationFailureKind.TRIAL_RUNNER,
+                )
+            if (
+                result.status is ValidationTrialStatus.MEASURED
+                and not _injection_matches_trial(trial, result.injected_candidate_ids)
+            ):
+                result = ValidationTrialResult(
+                    status=ValidationTrialStatus.FAILED,
+                    reason=(
+                        "skill injection mismatch: available candidate ids were "
+                        f"{list(trial.available_candidate_ids)!r}, observed "
+                        f"{list(result.injected_candidate_ids or ())!r}"
+                    ),
+                    failure_kind=ValidationFailureKind.SKILL_INJECTION_MISMATCH,
+                    audit=result.audit,
+                )
+            attempt_audit = dict(result.audit or {})
+            attempt_audit["forced_reattempt"] = forced_reattempt
+            attempt = {
+                **trial.identity(),
+                "attempt_number": attempt_number,
+                "status": result.status.value,
+                "reason": result.reason,
+                "failure_kind": (
+                    result.failure_kind.value
+                    if result.failure_kind is not None
+                    else None
+                ),
+                "reward": result.reward,
+                "injected_candidate_ids": (
+                    list(result.injected_candidate_ids)
+                    if result.injected_candidate_ids is not None
+                    else None
+                ),
+                "skill_injected": (
+                    bool(result.injected_candidate_ids)
+                    if result.injected_candidate_ids is not None
+                    else None
+                ),
+                "audit": attempt_audit,
+                "reused": False,
+                "forced_reattempt": forced_reattempt,
+            }
+            # There is deliberately no await between the runner completing and
+            # the atomic replace.  This synchronous critical section serializes
+            # writers on the event loop and prevents cancellation from losing a
+            # completed attempt while it waits for a checkpoint lock.
+            attempts.append(attempt)
+            attempt_counts[trial.trial_id] += 1
+            completed_attempts += 1
+            new_attempts += 1
+            _write_report(
+                destination,
+                _report(
+                    plan,
+                    trials,
+                    attempts,
+                    reused_ids=reused_ids,
+                    previous_attempt_count=previous_attempt_count,
+                    run_metadata=run_metadata,
+                    max_retries=max_retries,
+                    force_retry_unmeasured=force_retry_unmeasured,
+                    dry_run=False,
+                ),
+            )
+            # A measured reward is final regardless of its value.  Retrying is
+            # reserved for infrastructure failures that prevented a measurement.
+            if (
+                result.failure_kind
+                is not ValidationFailureKind.TRANSIENT_INFRASTRUCTURE
+                or new_attempts >= allowed_new_attempts
+            ):
+                return
+            retry_ordinal = new_attempts if forced_reattempt else completed_attempts
+            await sleep(float(retry_backoff_seconds) * 2 ** (retry_ordinal - 1))
 
     async def run_phase(phase_trials: Sequence[ValidationTrial]) -> None:
-        pending = iter(
-            trial for trial in phase_trials if trial.trial_id not in reused_ids
-        )
+        pending = iter(trial for trial in phase_trials if should_run(trial))
 
         async def worker() -> None:
             while True:
@@ -525,6 +602,8 @@ async def run_skill_validation(
         reused_ids=reused_ids,
         previous_attempt_count=previous_attempt_count,
         run_metadata=run_metadata,
+        max_retries=max_retries,
+        force_retry_unmeasured=force_retry_unmeasured,
         dry_run=False,
     )
 
@@ -654,10 +733,22 @@ def _load_previous(
         or validation.get("plan") != plan.as_dict()
     ):
         raise ValueError(f"existing validation output is for a different run: {path}")
-    if run_metadata is not None and validation.get("run") != dict(run_metadata):
-        raise ValueError(
-            f"existing validation output used different run settings: {path}"
+    if run_metadata is not None:
+        recorded_run = validation.get("run")
+        comparable_requested = {
+            key: value for key, value in run_metadata.items() if key != "max_retries"
+        }
+        comparable_recorded = (
+            {key: value for key, value in recorded_run.items() if key != "max_retries"}
+            if isinstance(recorded_run, Mapping)
+            else recorded_run
         )
+        # Retry policy changes how an unmeasured trial is resumed, not the trial
+        # identity.  Older paid reports also predate this operational field.
+        if comparable_recorded != comparable_requested:
+            raise ValueError(
+                f"existing validation output used different run settings: {path}"
+            )
     raw_attempts = validation.get("attempts")
     if not isinstance(raw_attempts, list):
         raise ValueError(f"existing validation output has invalid attempts: {path}")
@@ -741,6 +832,8 @@ def _report(
     reused_ids: set[str],
     previous_attempt_count: int,
     run_metadata: Mapping[str, Any] | None,
+    max_retries: int,
+    force_retry_unmeasured: bool,
     dry_run: bool,
 ) -> dict[str, Any]:
     attempts_by_id: dict[str, list[dict[str, Any]]] = {
@@ -839,6 +932,9 @@ def _report(
             candidate_measurements.append(measurement)
         raw["skill"] = candidate.skill_document
         raw["paired_deltas"] = deltas
+        raw["injection_flags"] = [
+            measurement["skill_injected"] for measurement in candidate_measurements
+        ]
         injected_count = sum(
             measurement["skill_injected"] is True
             for measurement in candidate_measurements
@@ -881,29 +977,90 @@ def _report(
     report["candidates"] = rendered_candidates
     pending = len(trials) - len(measured)
     status_counts = Counter(attempt["status"] for attempt in ordered_attempts)
+    failed_attempts = [
+        attempt
+        for attempt in ordered_attempts
+        if attempt["status"] == ValidationTrialStatus.FAILED.value
+    ]
+    failure_kind_counts = Counter(
+        attempt["failure_kind"] or "unattributed" for attempt in failed_attempts
+    )
+    exception_name_counts: Counter[str] = Counter()
+    for attempt in failed_attempts:
+        exception_names = attempt["audit"].get("observed_exception_names", [])
+        if isinstance(exception_names, list):
+            exception_name_counts.update(
+                {
+                    exception_name
+                    for exception_name in exception_names
+                    if isinstance(exception_name, str)
+                }
+            )
+    retried_trial_count = sum(
+        len(trial_attempts) > 1 for trial_attempts in attempts_by_id.values()
+    )
+    forced_reattempt_trial_count = sum(
+        any(attempt.get("forced_reattempt") is True for attempt in trial_attempts)
+        for trial_attempts in attempts_by_id.values()
+    )
+    rescued_by_retry_trial_count = sum(
+        bool(trial_attempts)
+        and trial_attempts[-1]["status"] == ValidationTrialStatus.MEASURED.value
+        and any(
+            attempt["failure_kind"]
+            == ValidationFailureKind.TRANSIENT_INFRASTRUCTURE.value
+            for attempt in trial_attempts[:-1]
+        )
+        for trial_attempts in attempts_by_id.values()
+    )
+    null_channel = build_null_channel_summary(
+        [
+            (measurement["delta"], measurement["skill_injected"])
+            for measurement in paired_measurements
+        ],
+        injection_data_available=True,
+    )
+    summary = {
+        "planned_trial_count": len(trials),
+        "completed_attempt_count": len(ordered_attempts),
+        "measured_trial_count": len(measured),
+        "pending_trial_count": pending,
+        "distinct_source_task_count": len(plan.tasks),
+        "observations_per_candidate": plan.observation_count,
+        "paired_observation_count": plan.paired_observation_count,
+        "shared_control_trial_count": plan.shared_control_trial_count,
+        "treatment_trial_count": plan.treatment_trial_count,
+        "reused_trial_count": len(reused_ids),
+        "new_attempt_count": len(ordered_attempts) - previous_attempt_count,
+        "failed_attempt_count": status_counts[ValidationTrialStatus.FAILED.value],
+        "estimated_cost_per_trial_usd": plan.estimated_cost_per_trial_usd,
+        "estimated_planned_cost_usd": plan.estimated_cost_usd,
+        "estimated_pending_cost_usd": pending * plan.estimated_cost_per_trial_usd,
+        "status_counts": dict(sorted(status_counts.items())),
+    }
+    if not dry_run:
+        summary.update(
+            {
+                "failed_attempt_counts_by_failure_kind": dict(
+                    sorted(failure_kind_counts.items())
+                ),
+                "failed_attempt_counts_by_exception_name": dict(
+                    sorted(exception_name_counts.items())
+                ),
+                "retried_trial_count": retried_trial_count,
+                "rescued_by_retry_trial_count": rescued_by_retry_trial_count,
+                "configured_max_retries": max_retries,
+                "force_retry_unmeasured_requested": force_retry_unmeasured,
+                "forced_reattempt_trial_count": forced_reattempt_trial_count,
+                "null_channel": null_channel,
+            }
+        )
     report["validation"] = {
         "schema_version": 1,
         "mode": VALIDATION_MODE,
         "dry_run": dry_run,
         "plan": plan.as_dict(),
-        "summary": {
-            "planned_trial_count": len(trials),
-            "completed_attempt_count": len(ordered_attempts),
-            "measured_trial_count": len(measured),
-            "pending_trial_count": pending,
-            "distinct_source_task_count": len(plan.tasks),
-            "observations_per_candidate": plan.observation_count,
-            "paired_observation_count": plan.paired_observation_count,
-            "shared_control_trial_count": plan.shared_control_trial_count,
-            "treatment_trial_count": plan.treatment_trial_count,
-            "reused_trial_count": len(reused_ids),
-            "new_attempt_count": len(ordered_attempts) - previous_attempt_count,
-            "failed_attempt_count": status_counts[ValidationTrialStatus.FAILED.value],
-            "estimated_cost_per_trial_usd": plan.estimated_cost_per_trial_usd,
-            "estimated_planned_cost_usd": plan.estimated_cost_usd,
-            "estimated_pending_cost_usd": (pending * plan.estimated_cost_per_trial_usd),
-            "status_counts": dict(sorted(status_counts.items())),
-        },
+        "summary": summary,
         "control_measurements": [
             {
                 "task_name": trial.task_name,

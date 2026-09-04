@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from statistics import median
+from statistics import median, stdev
 from typing import Any
 
 from driftlock.skill_distillation import (
@@ -56,6 +56,15 @@ NULL_ADMISSION_PROBABILITY_UPPER_BOUND = sum(
 # suppresses representation noise without reclassifying the measured effect.
 DELTA_ABS_TOLERANCE = 1e-12
 
+# An uninjected treatment is byte-identical to its paired control, so its delta
+# measures run-to-run noise rather than skill effect.  Keep this explanation in
+# both machine-readable reports instead of relying on operator interpretation.
+NULL_CHANNEL_RATIONALE = (
+    "No-skill-injected treatments were byte-identical to their controls, so "
+    "their measured deltas are a run-to-run noise floor. Skill-injected effects "
+    "must be read against that noise floor, not against zero."
+)
+
 _SAFE_CANDIDATE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -75,6 +84,7 @@ class SkillAdmissionCandidate:
     arm: str
     skill: Skill
     paired_deltas: tuple[float | None, ...]
+    injection_flags: tuple[bool | None, ...] | None = None
 
     def __post_init__(self) -> None:
         _validate_candidate_id(self.candidate_id)
@@ -94,6 +104,18 @@ class SkillAdmissionCandidate:
                 f"deltas; validation split has {VALIDATION_TASK_COUNT} tasks"
             )
         object.__setattr__(self, "paired_deltas", normalized)
+        if self.injection_flags is not None:
+            normalized_flags = tuple(
+                _optional_injection_flag(value, self.candidate_id, index)
+                for index, value in enumerate(self.injection_flags)
+            )
+            if len(normalized_flags) != len(normalized):
+                raise ValueError(
+                    f"candidate {self.candidate_id!r} has "
+                    f"{len(normalized_flags)} injection flags for "
+                    f"{len(normalized)} paired deltas"
+                )
+            object.__setattr__(self, "injection_flags", normalized_flags)
 
 
 def decide_skill_admission(candidate: SkillAdmissionCandidate) -> dict[str, Any]:
@@ -107,6 +129,9 @@ def decide_skill_admission(candidate: SkillAdmissionCandidate) -> dict[str, Any]
         "arm": candidate.arm,
         "status": SkillAdmissionStatus.INCOMPLETE.value,
         "rule_id": ADMISSION_RULE_ID,
+        "skill_application": _skill_application_report(
+            candidate.injection_flags, candidate.paired_deltas
+        ),
         "measurement": {
             "expected_task_count": VALIDATION_TASK_COUNT,
             "measured_task_count": measured,
@@ -205,6 +230,23 @@ def assemble_admission_report(
         decision["refusal"]["reason"] for decision in decisions if "refusal" in decision
     )
     expected_chance = tested * NULL_ADMISSION_PROBABILITY_UPPER_BOUND
+    null_observations = [
+        (delta, flag)
+        for candidate in candidates
+        for delta, flag in zip(
+            candidate.paired_deltas,
+            candidate.injection_flags
+            if candidate.injection_flags is not None
+            else (None,) * len(candidate.paired_deltas),
+            strict=True,
+        )
+    ]
+    null_channel = build_null_channel_summary(
+        null_observations,
+        injection_data_available=any(
+            candidate.injection_flags is not None for candidate in candidates
+        ),
+    )
     cohort_context = {
         "tested_candidate_count": tested,
         "observed_admitted_candidate_count": admitted,
@@ -229,6 +271,7 @@ def assemble_admission_report(
         "rejected_candidate_count": statuses[SkillAdmissionStatus.REJECTED.value],
         "pass_rate": admitted / tested if tested else None,
         "refusal_reason_counts": dict(sorted(reasons.items())),
+        "null_channel": null_channel,
         "multiple_comparisons": {
             "candidate_tests": tested,
             "single_candidate_null_admission_probability_upper_bound": (
@@ -292,13 +335,79 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
             "significance claim"
         ),
     ]
+    null_channel = report.get("null_channel")
+    if (
+        not isinstance(null_channel, Mapping)
+        or null_channel.get("availability") == "unavailable"
+    ):
+        lines.append(
+            "null channel: unavailable (per-observation injection flags were not "
+            "recorded)"
+        )
+    else:
+        lines.append(f"null channel: {null_channel['rationale']}")
+        for group_name, label in (
+            ("no_skill_injected", "no skill injected (noise floor)"),
+            ("skill_injected", "skill injected"),
+        ):
+            group = null_channel[group_name]
+            mean = (
+                "unavailable"
+                if group["mean_delta"] is None
+                else f"{group['mean_delta']:+.6g}"
+            )
+            sample_sd = (
+                "null"
+                if group["sample_standard_deviation"] is None
+                else f"{group['sample_standard_deviation']:.6g}"
+            )
+            lines.append(
+                f"  {label}: n={group['n']}, mean={mean}, sample sd={sample_sd}, "
+                f"signs +{group['positive_count']} / 0:{group['zero_count']} / "
+                f"-{group['negative_count']}"
+            )
+        if null_channel["unknown_injection_observation_count"]:
+            lines.append(
+                "  measured observations with unknown injection: "
+                f"{null_channel['unknown_injection_observation_count']}"
+            )
     for decision in report["decisions"]:
+        application = decision.get(
+            "skill_application", {"status": "unavailable", "ever_injected": None}
+        )
+        if application["ever_injected"] is False:
+            application_text = (
+                "skill never retrieved/injected (reporting only; admission rule "
+                "unchanged)"
+            )
+        elif application["ever_injected"] is True:
+            if application["status"] == "mixed_injection":
+                application_text = (
+                    "skill mixed injection: injected in "
+                    f"{application['skill_injected_measured_observation_count']} "
+                    f"of {application['measured_observation_count']} measured "
+                    "observations; reported mean mixes skill-injected effects "
+                    "with byte-identical no-skill noise"
+                )
+                if decision["status"] == SkillAdmissionStatus.REJECTED.value:
+                    application_text += (
+                        "; skill retrieved/injected but did not help enough for "
+                        "admission"
+                    )
+            else:
+                application_text = (
+                    "skill retrieved/injected but did not help enough for admission"
+                    if decision["status"] == SkillAdmissionStatus.REJECTED.value
+                    else "skill retrieved/injected"
+                )
+        else:
+            application_text = "skill retrieval/injection unavailable"
         effect = decision["measurement"]["effect"]
         if effect is None:
             refusal = decision["refusal"]
             lines.append(
                 f"  {decision['candidate_id']} [{decision['arm']}]: incomplete "
-                f"({refusal['reason']}): {refusal['detail']}"
+                f"({refusal['reason']}): {refusal['detail']}; {application_text}"
             )
             continue
         line = (
@@ -307,7 +416,8 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
             f"median {effect['median_delta']:+.6g}, range "
             f"{effect['minimum_delta']:+.6g}..{effect['maximum_delta']:+.6g}, "
             f"signs +{effect['positive_task_count']} "
-            f"/ 0:{effect['zero_task_count']} / -{effect['negative_task_count']}"
+            f"/ 0:{effect['zero_task_count']} / -{effect['negative_task_count']}; "
+            f"{application_text}"
         )
         if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
             context = decision["admission_context"]
@@ -463,6 +573,7 @@ def load_admission_candidates(path: Path | str) -> list[SkillAdmissionCandidate]
         arm = raw.get("arm")
         document = raw.get("skill")
         deltas = raw.get("paired_deltas")
+        raw_injection_flags = raw.get("injection_flags")
         if not isinstance(candidate_id, str) or not isinstance(arm, str):
             raise ValueError(f"skill admission candidate {index} needs text id and arm")
         if not isinstance(document, str):
@@ -474,12 +585,24 @@ def load_admission_candidates(path: Path | str) -> list[SkillAdmissionCandidate]
                 f"skill admission candidate {candidate_id!r} paired_deltas must "
                 "be a list"
             )
+        if raw_injection_flags is not None and not isinstance(
+            raw_injection_flags, list
+        ):
+            raise ValueError(
+                f"skill admission candidate {candidate_id!r} injection_flags "
+                "must be a list or null"
+            )
         candidates.append(
             SkillAdmissionCandidate(
                 candidate_id=candidate_id,
                 arm=arm,
                 skill=parse_skill(document),
                 paired_deltas=tuple(deltas),
+                injection_flags=(
+                    tuple(raw_injection_flags)
+                    if raw_injection_flags is not None
+                    else None
+                ),
             )
         )
     return candidates
@@ -517,6 +640,93 @@ def _rule_report() -> dict[str, Any]:
     }
 
 
+def build_null_channel_summary(
+    observations: Sequence[tuple[float | None, bool | None]],
+    *,
+    injection_data_available: bool,
+) -> dict[str, Any]:
+    """Summarize measured deltas by injection without influencing admission."""
+
+    measured = [(delta, flag) for delta, flag in observations if delta is not None]
+    unknown_count = sum(flag is None for _, flag in measured)
+    known = [(float(delta), flag) for delta, flag in measured if flag is not None]
+    if not injection_data_available or (not known and unknown_count):
+        return {
+            "schema_version": 1,
+            "availability": "unavailable",
+            "rationale": NULL_CHANNEL_RATIONALE,
+            "unknown_injection_observation_count": unknown_count,
+            "no_skill_injected": None,
+            "skill_injected": None,
+        }
+    return {
+        "schema_version": 1,
+        "availability": "partial" if unknown_count else "available",
+        "rationale": NULL_CHANNEL_RATIONALE,
+        "unknown_injection_observation_count": unknown_count,
+        "no_skill_injected": _delta_group_summary(
+            [delta for delta, flag in known if flag is False]
+        ),
+        "skill_injected": _delta_group_summary(
+            [delta for delta, flag in known if flag is True]
+        ),
+    }
+
+
+def _delta_group_summary(deltas: Sequence[float]) -> dict[str, Any]:
+    count = len(deltas)
+    positive = sum(delta > DELTA_ABS_TOLERANCE for delta in deltas)
+    negative = sum(delta < -DELTA_ABS_TOLERANCE for delta in deltas)
+    return {
+        "n": count,
+        "mean_delta": math.fsum(deltas) / count if count else None,
+        "sample_standard_deviation": stdev(deltas) if count >= 2 else None,
+        "positive_count": positive,
+        "negative_count": negative,
+        "zero_count": count - positive - negative,
+    }
+
+
+def _skill_application_report(
+    injection_flags: tuple[bool | None, ...] | None,
+    paired_deltas: tuple[float | None, ...],
+) -> dict[str, Any]:
+    if injection_flags is None:
+        return {
+            "status": "unavailable",
+            "ever_injected": None,
+            "injection_flags": None,
+            "measured_observation_count": sum(
+                delta is not None for delta in paired_deltas
+            ),
+            "skill_injected_measured_observation_count": None,
+        }
+    observed = tuple(flag for flag in injection_flags if flag is not None)
+    if not observed:
+        status = "unmeasured"
+        ever_injected = None
+    elif any(observed):
+        status = "always_injected" if all(observed) else "mixed_injection"
+        ever_injected = True
+    else:
+        status = "never_injected"
+        ever_injected = False
+    measured_flags = tuple(
+        flag
+        for delta, flag in zip(paired_deltas, injection_flags, strict=True)
+        if delta is not None
+    )
+    return {
+        "status": status,
+        "ever_injected": ever_injected,
+        "injection_flags": list(injection_flags),
+        "measured_observation_count": len(measured_flags),
+        "skill_injected_measured_observation_count": sum(
+            flag is True for flag in measured_flags
+        ),
+    }
+
+
 def _validate_candidate_id(candidate_id: str) -> None:
     if (
         not isinstance(candidate_id, str)
@@ -538,3 +748,13 @@ def _optional_delta(value: object, candidate_id: str, index: int) -> float | Non
             f"candidate {candidate_id!r} paired delta {index} must be finite"
         )
     return delta
+
+
+def _optional_injection_flag(
+    value: object, candidate_id: str, index: int
+) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"candidate {candidate_id!r} injection flag {index} must be boolean or null"
+    )
