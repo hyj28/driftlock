@@ -164,6 +164,59 @@ async def test_validation_summary_counts_uncheckpointable_boundaries(
     assert report["validation"]["summary"]["uncheckpointable_boundary_count"] == 3
 
 
+@pytest.mark.asyncio
+async def test_validation_summary_counts_non_restorable_checkpoints(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path)
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    work_dir = tmp_path / "work"
+    target = plan.work_items(work_dir)[0]
+    for trial in plan.work_items(work_dir):
+        job_dir = work_dir / "jobs" / trial.job_name
+        _write_harbor_attempt(
+            job_dir,
+            reward=0.5,
+            injected_candidate_ids=trial.available_candidate_ids,
+        )
+        if trial == target:
+            run_record = job_dir / "trial-0" / "agent" / "driftlock-result.json"
+            record = json.loads(run_record.read_text(encoding="utf-8"))
+            record["phases"] = [
+                {"non_restorable_checkpoint_count": 2},
+                {"non_restorable_checkpoint_count": 1},
+            ]
+            run_record.write_text(json.dumps(record), encoding="utf-8")
+    runner = experiment._HarborSkillValidationRunner(
+        lhtb_dir=root,
+        work_dir=work_dir,
+        skill_embedder_import_path="offline_embedder:embed",
+        model="offline-model",
+        provider="offline-provider",
+        api_base="http://offline.invalid/v1",
+        judge_api_base=None,
+        judge_provider="offline-judge",
+        timeout_sec=60,
+        max_total_tokens=100,
+    )
+
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=work_dir,
+        max_retries=0,
+    )
+
+    attempt = next(
+        item
+        for item in report["validation"]["attempts"]
+        if item["trial_id"] == target.trial_id
+    )
+    assert attempt["audit"]["non_restorable_checkpoint_count"] == 3
+    assert report["validation"]["summary"]["non_restorable_checkpoint_count"] == 3
+
+
 @pytest.mark.parametrize(
     ("exception_name", "expected_kind"),
     [

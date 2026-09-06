@@ -46,6 +46,13 @@ class FineJudgeStatus(StrEnum):
     NOT_INVOKED = "not_invoked"
 
 
+class CheckpointRestoreStatus(StrEnum):
+    """Whether a checkpoint archive is eligible to mutate a workspace."""
+
+    ELIGIBLE = "eligible"
+    INELIGIBLE = "ineligible"
+
+
 class DriftTriggerOutcome(StrEnum):
     """What happened after the coarse detector fired."""
 
@@ -73,6 +80,31 @@ class Checkpoint:
     parent_id: str | None = None
     label: str | None = None
     unstable_paths: tuple[str, ...] = ()
+    restore_status: CheckpointRestoreStatus = CheckpointRestoreStatus.ELIGIBLE
+    unaccounted_archive_output: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.restore_status, CheckpointRestoreStatus):
+            raise TypeError("restore_status must be a CheckpointRestoreStatus")
+        if self.unaccounted_archive_output is not None and not isinstance(
+            self.unaccounted_archive_output, str
+        ):
+            raise TypeError("unaccounted_archive_output must be a string or None")
+        if self.restore_status is CheckpointRestoreStatus.ELIGIBLE:
+            if self.unaccounted_archive_output is not None:
+                raise ValueError(
+                    "a restorable checkpoint cannot have unaccounted archive output"
+                )
+        elif not self.unaccounted_archive_output:
+            raise ValueError(
+                "a non-restorable checkpoint needs unaccounted archive output"
+            )
+
+    @property
+    def restorable(self) -> bool:
+        """Whether restoring this checkpoint is safe enough to attempt."""
+
+        return self.restore_status is CheckpointRestoreStatus.ELIGIBLE
 
 
 @dataclass(frozen=True, slots=True)

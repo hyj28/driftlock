@@ -351,7 +351,7 @@ def fake_harbor_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
 def _runtime(
     responses: list[FakeResponse | BaseException],
     *,
-    observer: FakeObserver | None = None,
+    observer: Any | None = None,
     rate_limit_retries: int = 0,
 ) -> tuple[LHTBTerminusRuntime, FakeAgent, FakeLLM, Any]:
     llm = FakeLLM(responses)
@@ -592,6 +592,260 @@ async def test_runtime_observes_later_boundary_after_missed_handshake(
     assert second.workspace_delta_observed is True
     assert second.workspace_observation_error is None
     assert len(observer.snapshots) == 1
+
+
+async def test_manifest_race_records_an_unobserved_boundary_and_continues(
+    fake_harbor_symbols: None,
+) -> None:
+    diagnostic = (
+        "Traceback (most recent call last):\n"
+        "FileNotFoundError: [Errno 2] No such file or directory: './gone.log'"
+    )
+    observer_environment = FakeEnvironment(
+        [
+            RemoteResult(stdout=diagnostic, stderr="", return_code=1),
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(stdout=""),
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(
+        observer_environment, remote_workspace="/app"
+    )
+    runtime, _, llm, _ = _runtime(
+        [FakeResponse("continued", FakeUsage(12, 8))], observer=observer
+    )
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert len(llm.calls) == 1
+    assert boundary.workspace_delta_observed is False
+    assert boundary.workspace_observation_error == (
+        "failed to hash remote workspace with exit code 1: "
+        "workspace changed during observation: "
+        "Traceback (most recent call last):\n"
+        "FileNotFoundError: [Errno 2] No such file or directory: './gone.log'"
+    )
+    assert boundary.changed_paths == ()
+    assert boundary.diff == ""
+    assert len(observer_environment.results) == 2
+
+
+async def test_git_view_race_records_an_unobserved_boundary_and_continues(
+    fake_harbor_symbols: None,
+) -> None:
+    observer_environment = FakeEnvironment(
+        [
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(stdout=""),
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(
+                stdout="",
+                stderr=("fatal: cannot stat './gone.py': No such file or directory"),
+                return_code=1,
+            ),
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(
+        observer_environment, remote_workspace="/app"
+    )
+    runtime, _, llm, _ = _runtime(
+        [FakeResponse("continued", FakeUsage(12, 8))], observer=observer
+    )
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert len(llm.calls) == 1
+    assert boundary.workspace_delta_observed is False
+    assert boundary.workspace_observation_error == (
+        "failed to capture remote Git view with exit code 1: "
+        "workspace changed during observation: "
+        "fatal: cannot stat './gone.py': No such file or directory"
+    )
+    assert boundary.changed_paths == ()
+    assert boundary.diff == ""
+
+
+async def test_unaccounted_snapshot_failure_records_its_uncertainty(
+    fake_harbor_symbols: None,
+) -> None:
+    observer_environment = FakeEnvironment(
+        [
+            RemoteResult(
+                stdout="",
+                stderr="python3: internal hashing failure",
+                return_code=7,
+            )
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(
+        observer_environment, remote_workspace="/app"
+    )
+    runtime, _, llm, _ = _runtime(
+        [FakeResponse("continued", FakeUsage(12, 8))], observer=observer
+    )
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert len(llm.calls) == 1
+    assert boundary.workspace_delta_observed is False
+    assert boundary.workspace_observation_error == (
+        "failed to hash remote workspace with exit code 7: "
+        "cause was not accounted for: "
+        "python3: internal hashing failure"
+    )
+    assert boundary.changed_paths == ()
+    assert boundary.diff == ""
+
+
+async def test_malformed_successful_manifest_records_an_unobserved_boundary(
+    fake_harbor_symbols: None,
+) -> None:
+    observer_environment = FakeEnvironment(
+        [
+            RemoteResult(stdout="truncated-manifest", return_code=0),
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(stdout="unchanged\n"),
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(
+        observer_environment, remote_workspace="/app"
+    )
+    runtime, _, llm, _ = _runtime(
+        [FakeResponse("continued", FakeUsage(12, 8))], observer=observer
+    )
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert len(llm.calls) == 1
+    assert boundary.workspace_delta_observed is False
+    assert boundary.workspace_observation_error == (
+        "failed to hash remote workspace: manifest could not be parsed: "
+        "remote workspace returned an invalid manifest"
+    )
+    assert boundary.changed_paths == ()
+    assert boundary.diff == ""
+    assert len(observer_environment.results) == 2
+
+
+async def test_root_only_workspace_manifest_is_a_valid_empty_snapshot() -> None:
+    environment = FakeEnvironment(
+        [
+            RemoteResult(stdout="d\0.\0metadata:\0", return_code=0),
+            RemoteResult(stdout="", return_code=0),
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(environment, remote_workspace="/app")
+
+    snapshot = await observer.snapshot()
+
+    assert snapshot.files == {".": "d:metadata:"}
+    assert snapshot.git_view == ""
+
+
+async def test_git_unable_to_read_file_is_classified_as_concurrent_change(
+    fake_harbor_symbols: None,
+) -> None:
+    observer_environment = FakeEnvironment(
+        [
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(
+                stdout="error: unable to read file ./build/tmp.o",
+                stderr="",
+                return_code=1,
+            ),
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(
+        observer_environment, remote_workspace="/app"
+    )
+    runtime, _, llm, _ = _runtime(
+        [FakeResponse("continued", FakeUsage(12, 8))], observer=observer
+    )
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert len(llm.calls) == 1
+    assert boundary.workspace_delta_observed is False
+    assert boundary.workspace_observation_error == (
+        "failed to capture remote Git view with exit code 1: "
+        "workspace changed during observation: "
+        "error: unable to read file ./build/tmp.o"
+    )
+
+
+async def test_snapshot_observation_failure_resets_at_the_next_boundary(
+    fake_harbor_symbols: None,
+) -> None:
+    observer_environment = FakeEnvironment(
+        [
+            RemoteResult(
+                stdout="find: './gone': No such file or directory",
+                stderr="",
+                return_code=1,
+            ),
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(stdout="unchanged\n"),
+            RemoteResult(stdout="d\0.\0metadata:\0"),
+            RemoteResult(stdout="unchanged\n"),
+        ]
+    )
+    observer = HarborWorkspaceDeltaObserver(
+        observer_environment, remote_workspace="/app"
+    )
+    runtime, _, _, _ = _runtime(
+        [
+            FakeResponse("first", FakeUsage(12, 8), observation="one"),
+            FakeResponse("second", FakeUsage(13, 7), observation="two"),
+        ],
+        observer=observer,
+    )
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    first = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+    second = await runtime.resume(
+        first.conversation,
+        prompt=first.conversation.next_prompt,
+        tokens_remaining=10_000,
+    )
+
+    assert first.workspace_delta_observed is False
+    assert first.workspace_observation_error == (
+        "failed to hash remote workspace with exit code 1: "
+        "workspace changed during observation: "
+        "find: './gone': No such file or directory"
+    )
+    assert second.workspace_delta_observed is True
+    assert second.workspace_observation_error is None
+    assert second.changed_paths == ()
+    assert second.diff == ""
+    assert observer_environment.results == []
+
+
+async def test_workspace_canonicalization_failure_remains_a_hard_precondition() -> None:
+    class MissingWorkspaceEnvironment:
+        async def exec(self, command: str, **kwargs: Any) -> RemoteResult:
+            return RemoteResult(
+                stdout="",
+                stderr="realpath: /app: No such file or directory",
+                return_code=1,
+            )
+
+    observer = HarborWorkspaceDeltaObserver(
+        MissingWorkspaceEnvironment(), remote_workspace="/app"
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await observer.snapshot()
+
+    assert str(raised.value) == (
+        "failed to canonicalize remote workspace: "
+        "realpath: /app: No such file or directory"
+    )
 
 
 async def test_runtime_preserves_harbor_two_response_completion_handshake(

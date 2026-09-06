@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 import shutil
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from driftlock.checkpoints import SnapshotIntegrityError
-from driftlock.models import Checkpoint
+from driftlock.models import Checkpoint, CheckpointRestoreStatus
 
 
 class RemoteCheckpointError(RuntimeError):
@@ -116,8 +118,14 @@ class RemoteArchiveCheckpointStore:
                     ".",
                 ]
             )
-            unstable_paths = await self._create_remote_archive(command)
-            await self.environment.download_file(remote_archive, local_archive)
+            archive_result = await self._create_remote_archive(command)
+            unstable_paths = archive_result.unstable_paths
+            try:
+                await self.environment.download_file(remote_archive, local_archive)
+            except FileNotFoundError as error:
+                raise RemoteCheckpointError(
+                    "environment did not provide the checkpoint archive"
+                ) from error
             if not local_archive.is_file():
                 raise RemoteCheckpointError(
                     "environment did not download the checkpoint archive"
@@ -133,9 +141,14 @@ class RemoteArchiveCheckpointStore:
                 "parent_id": parent_id,
                 "label": label,
                 "remote_workspace": self.remote_workspace,
+                "restore_status": archive_result.restore_status.value,
             }
             if unstable_paths:
                 manifest["unstable_paths"] = list(unstable_paths)
+            if archive_result.unaccounted_output is not None:
+                manifest["unaccounted_archive_output"] = (
+                    archive_result.unaccounted_output
+                )
             (temporary / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
             )
@@ -154,13 +167,32 @@ class RemoteArchiveCheckpointStore:
             parent_id=parent_id,
             label=label,
             unstable_paths=unstable_paths,
+            restore_status=archive_result.restore_status,
+            unaccounted_archive_output=archive_result.unaccounted_output,
         )
 
     async def restore(self, checkpoint: Checkpoint) -> dict[str, Any]:
-        await self._ensure_remote_paths_are_safe()
         checkpoint_dir = checkpoint.path.resolve()
         if checkpoint_dir.parent != self.checkpoints_dir.resolve():
             raise ValueError("checkpoint does not belong to this store")
+        manifest_status, manifest_output = _checkpoint_restore_metadata(
+            checkpoint_dir, checkpoint
+        )
+        if manifest_status is CheckpointRestoreStatus.INELIGIBLE:
+            raise RemoteCheckpointError(
+                f"checkpoint {checkpoint.checkpoint_id} is not eligible for restore: "
+                "archive creation returned unaccounted output: "
+                f"{manifest_output}"
+            )
+        if (
+            checkpoint.restore_status is not manifest_status
+            or checkpoint.unaccounted_archive_output != manifest_output
+        ):
+            raise SnapshotIntegrityError(
+                f"checkpoint {checkpoint.checkpoint_id} restore metadata differs "
+                "from its manifest"
+            )
+        await self._ensure_remote_paths_are_safe()
         archive = checkpoint_dir / "workspace.tar.gz"
         state_path = checkpoint_dir / "state.json"
         if not archive.is_file():
@@ -438,16 +470,15 @@ find "$workspace_real" -type d -samefile "$tmp_real" -print -quit
         _require_success(result, operation=operation)
         return result
 
-    async def _create_remote_archive(self, command: str) -> tuple[str, ...]:
+    async def _create_remote_archive(self, command: str) -> _ArchiveCreationResult:
         result = await self.environment.exec(
             command,
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
         if result.return_code == 0:
-            return ()
-        unstable_paths = _parse_file_changed_warnings(result)
-        if unstable_paths is None:
+            return _ArchiveCreationResult()
+        if result.return_code != 1:
             _require_success(result, operation="create remote archive")
 
         retry = await self.environment.exec(
@@ -456,11 +487,10 @@ find "$workspace_real" -type d -samefile "$tmp_real" -print -quit
             user=self.user,
         )
         if retry.return_code == 0:
-            return ()
-        retry_unstable_paths = _parse_file_changed_warnings(retry)
-        if retry_unstable_paths is None:
+            return _ArchiveCreationResult()
+        if retry.return_code != 1:
             _require_success(retry, operation="create remote archive")
-        return retry_unstable_paths
+        return _parse_file_changed_warnings(retry)
 
     async def _best_effort_remove(self, *paths: str) -> None:
         if not paths:
@@ -507,10 +537,9 @@ def _is_relative_to(path: str, parent: str) -> bool:
     return path_parts[: len(parent_parts)] == parent_parts
 
 
-# Lines GNU tar emits alongside a "file changed" warning that carry no new
-# information: the first is its exit-status summary, the second is printed
-# whenever an absolute path is archived. Recognising them is not leniency -- an
-# unrecognised line still fails closed, below.
+# Lines GNU tar emits alongside archive warnings that carry no new information:
+# the first is its exit-status summary, while the others only explain safe name
+# normalization for absolute paths.
 _BENIGN_TAR_LINES = frozenset(
     {
         "tar: Exiting with failure status due to previous errors",
@@ -520,8 +549,50 @@ _BENIGN_TAR_LINES = frozenset(
 )
 
 
-def _parse_file_changed_warnings(result: ExecResultLike) -> tuple[str, ...] | None:
-    """Paths tar reported as changing mid-read, or None if this is a real failure.
+# These GNU tar warning suffixes mean a path changed or disappeared between
+# discovery and archival, so the path is unstable but the archive is usable.
+_CONCURRENT_MODIFICATION_SUFFIXES = (
+    ": file changed as we read it",
+    ": File removed before we read it",
+)
+
+# GNU tar reports a dynamic byte count when a file contracts during its read;
+# matching the complete suffix keeps unrelated "File shrank" text unaccounted.
+_FILE_SHRANK_SUFFIX = re.compile(r": File shrank by [0-9]+ bytes; padding with zeros$")
+
+# A missing diagnostic cannot justify restoring an exit-1 archive, so this
+# stable explanation is recorded when tar supplies no nonblank output at all.
+_MISSING_EXIT_ONE_DIAGNOSTIC = "tar exited with code 1 without diagnostic output"
+
+# Eight KiB preserves enough diagnostic context for a human without allowing a
+# noisy command to inflate every checkpoint manifest by an unbounded amount.
+_MAX_UNACCOUNTED_ARCHIVE_OUTPUT_CHARS = 8_192
+
+# GNU tar appends errors after the affected member name; seeing one of these
+# fragments inside a candidate path means suffix matching consumed a garbled error.
+_TAR_ERROR_PATH_FRAGMENTS = (
+    ": Cannot open:",
+    ": Cannot read:",
+    ": Cannot stat:",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchiveCreationResult:
+    """Safety metadata for the archive produced by the final tar attempt."""
+
+    unstable_paths: tuple[str, ...] = ()
+    unaccounted_output: str | None = None
+
+    @property
+    def restore_status(self) -> CheckpointRestoreStatus:
+        if self.unaccounted_output is None:
+            return CheckpointRestoreStatus.ELIGIBLE
+        return CheckpointRestoreStatus.INELIGIBLE
+
+
+def _parse_file_changed_warnings(result: ExecResultLike) -> _ArchiveCreationResult:
+    """Classify exit-1 diagnostics without turning uncertainty into run failure.
 
     Whitespace tolerance is load-bearing rather than cosmetic. The first version
     compared raw lines, so a leading newline or a trailing space anywhere in
@@ -531,25 +602,63 @@ def _parse_file_changed_warnings(result: ExecResultLike) -> tuple[str, ...] | No
     That cost one trial in round 1 and two more in round 4.
     """
     if result.return_code != 1:
-        return None
-    diagnostic = _diagnostic_output(result)
-    if not diagnostic:
-        return None
+        raise ValueError("tar warning parsing requires exit code 1")
+    diagnostics = _diagnostic_streams(result)
+    if not diagnostics:
+        return _ArchiveCreationResult(unaccounted_output=_MISSING_EXIT_ONE_DIAGNOSTIC)
     prefix = "tar: "
-    suffix = ": file changed as we read it"
     paths: list[str] = []
-    for raw_line in diagnostic.splitlines():
-        line = raw_line.strip()
-        if not line or line in _BENIGN_TAR_LINES:
-            continue
-        if not line.startswith(prefix) or not line.endswith(suffix):
-            return None
-        path = line[len(prefix) : -len(suffix)].strip()
-        if not path:
-            return None
-        if path not in paths:
-            paths.append(path)
-    return tuple(paths) if paths else None
+    unaccounted_lines: list[str] = []
+    for diagnostic in diagnostics:
+        for raw_line in diagnostic.splitlines():
+            line = raw_line.strip()
+            if not line or line in _BENIGN_TAR_LINES:
+                continue
+            path: str | None = None
+            if line.startswith(prefix):
+                content = line[len(prefix) :]
+                for suffix in _CONCURRENT_MODIFICATION_SUFFIXES:
+                    if content.endswith(suffix):
+                        path = content[: -len(suffix)].strip()
+                        break
+                if path is None:
+                    shrank = _FILE_SHRANK_SUFFIX.search(content)
+                    if shrank is not None:
+                        path = content[: shrank.start()].strip()
+            if path and not any(
+                fragment in path for fragment in _TAR_ERROR_PATH_FRAGMENTS
+            ):
+                if path not in paths:
+                    paths.append(path)
+            else:
+                unaccounted_lines.append(line)
+    unaccounted_output = "\n".join(unaccounted_lines) or None
+    return _ArchiveCreationResult(
+        unstable_paths=tuple(paths),
+        unaccounted_output=(
+            _bounded_unaccounted_archive_output(unaccounted_output)
+            if unaccounted_output is not None
+            else None
+        ),
+    )
+
+
+def _diagnostic_streams(result: ExecResultLike) -> tuple[str, ...]:
+    """Return every non-empty diagnostic-bearing stream without discarding either."""
+
+    return tuple(
+        output
+        for output in (result.stderr, result.stdout)
+        if output is not None and output.strip()
+    )
+
+
+def _bounded_unaccounted_archive_output(output: str) -> str:
+    if len(output) <= _MAX_UNACCOUNTED_ARCHIVE_OUTPUT_CHARS:
+        return output
+    marker = "\n[unaccounted archive output truncated]"
+    prefix_length = _MAX_UNACCOUNTED_ARCHIVE_OUTPUT_CHARS - len(marker)
+    return output[:prefix_length] + marker
 
 
 def _diagnostic_output(result: ExecResultLike) -> str:
@@ -564,6 +673,41 @@ def _diagnostic_output(result: ExecResultLike) -> str:
         if output is not None and output.strip():
             return output
     return ""
+
+
+def _checkpoint_restore_metadata(
+    checkpoint_dir: Path, checkpoint: Checkpoint
+) -> tuple[CheckpointRestoreStatus, str | None]:
+    manifest_path = checkpoint_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SnapshotIntegrityError(
+            "checkpoint manifest is invalid or missing"
+        ) from error
+    if not isinstance(manifest, dict):
+        raise SnapshotIntegrityError("checkpoint manifest must be a JSON object")
+    if (
+        manifest.get("checkpoint_id") != checkpoint.checkpoint_id
+        or manifest.get("digest") != checkpoint.digest
+    ):
+        raise SnapshotIntegrityError(
+            f"checkpoint {checkpoint.checkpoint_id} identity differs from its manifest"
+        )
+    try:
+        status = CheckpointRestoreStatus(
+            manifest.get("restore_status", CheckpointRestoreStatus.ELIGIBLE.value)
+        )
+    except (TypeError, ValueError) as error:
+        raise SnapshotIntegrityError("checkpoint restore status is invalid") from error
+    output = manifest.get("unaccounted_archive_output")
+    if output is not None and (not isinstance(output, str) or not output):
+        raise SnapshotIntegrityError("checkpoint unaccounted archive output is invalid")
+    if (status is CheckpointRestoreStatus.ELIGIBLE) != (output is None):
+        raise SnapshotIntegrityError(
+            "checkpoint restore eligibility metadata is inconsistent"
+        )
+    return status, output
 
 
 def _require_success(result: ExecResultLike, *, operation: str) -> None:

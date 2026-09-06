@@ -16,6 +16,7 @@ from driftlock.lhtb import openrouter_provider_from_call_kwargs
 from driftlock.lhtb_experiment import build_job_config
 from driftlock.models import (
     Checkpoint,
+    CheckpointRestoreStatus,
     DriftSignal,
     DriftTriggerOutcome,
     DriftTriggerRecord,
@@ -1164,6 +1165,61 @@ def test_phase_record_counts_checkpoints_with_unstable_paths(
     ][0]
     assert native_phase["checkpoint_count"] == 2
     assert native_phase["unstable_checkpoint_count"] == 1
+
+
+def test_phase_record_counts_non_restorable_checkpoints(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    created_at = datetime(2026, 9, 6, tzinfo=UTC)
+    eligible = Checkpoint(
+        checkpoint_id="eligible-checkpoint",
+        step=0,
+        created_at=created_at,
+        digest="eligible-digest",
+        path=tmp_path / "eligible-checkpoint",
+    )
+    ineligible = Checkpoint(
+        checkpoint_id="ineligible-checkpoint",
+        step=1,
+        created_at=created_at,
+        digest="ineligible-digest",
+        path=tmp_path / "ineligible-checkpoint",
+        restore_status=CheckpointRestoreStatus.INELIGIBLE,
+        unaccounted_archive_output="tar: ./ignored.sock: socket ignored",
+    )
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={"done": True},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(eligible, ineligible),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+    )
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+
+    agent._write_phase_record(result, tmp_path / "phase-0", retained=True)
+
+    phase = json.loads((tmp_path / "driftlock-result.json").read_text())["phases"][0]
+    assert phase["checkpoint_count"] == 2
+    assert phase["non_restorable_checkpoint_count"] == 1
+
+    native = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    native.logs_dir = tmp_path
+    native._native_phases = []
+    native._native_retain_checkpoints = False
+    native._write_phase_record(result)
+
+    native_phase = json.loads((tmp_path / "driftlock-native-result.json").read_text())[
+        "phases"
+    ][0]
+    assert native_phase["checkpoint_count"] == 2
+    assert native_phase["non_restorable_checkpoint_count"] == 1
 
 
 def test_phase_record_names_uncheckpointable_boundary_reason(

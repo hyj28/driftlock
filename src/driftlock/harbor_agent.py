@@ -741,6 +741,9 @@ class LHTBDriftlockAgent(Terminus2):
                         bool(checkpoint.unstable_paths)
                         for checkpoint in result.checkpoints
                     ),
+                    "non_restorable_checkpoint_count": sum(
+                        not checkpoint.restorable for checkpoint in result.checkpoints
+                    ),
                     "coarse_triggers": [
                         trigger.to_dict() for trigger in result.coarse_triggers
                     ],
