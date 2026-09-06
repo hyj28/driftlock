@@ -289,6 +289,8 @@ def test_conversation_codec_translates_deep_copy_recursion_errors() -> None:
         ({"completed": "false"}, "completed must be a boolean"),
         ({"reward": math.nan}, "reward must be a finite number"),
         ({"changed_paths": ["src/app.py"]}, "tuple of strings"),
+        ({"workspace_delta_observed": "yes"}, "must be a boolean"),
+        ({"workspace_observation_error": 7}, "must be a string or None"),
     ],
 )
 def test_boundary_rejects_malformed_runtime_values(
@@ -463,6 +465,41 @@ async def test_step_adapter_surfaces_parser_error_as_its_own_episode() -> None:
     decoded = adapter.codec.decode(outcome.state)
     assert decoded is not None
     assert decoded.next_prompt == "fix the malformed JSON response"
+
+
+async def test_step_adapter_preserves_uncheckpointable_boundary_reason() -> None:
+    class UncheckpointableRuntime(FakeBoundaryRuntime):
+        async def start(
+            self,
+            *,
+            prompt: str,
+            tokens_remaining: int | None,
+        ) -> TerminusBoundary:
+            self.provider_call_count += 1
+            return TerminusBoundary(
+                conversation=_conversation(
+                    episode=1,
+                    next_prompt="continue after timeout",
+                    user_prompt=prompt,
+                ),
+                action="timed-out command",
+                workspace_delta_observed=False,
+                workspace_observation_error=(
+                    "checkpoint marker send raised TimeoutError; marker completion "
+                    "was not observed; pane capture shows a shell prompt"
+                ),
+                tokens=17,
+            )
+
+    adapter = TerminusStepAdapter(UncheckpointableRuntime())
+
+    outcome = await adapter(_context(adapter.initial_state()))
+
+    assert outcome.workspace_delta_observed is False
+    assert outcome.workspace_observation_error == (
+        "checkpoint marker send raised TimeoutError; marker completion was not "
+        "observed; pane capture shows a shell prompt"
+    )
 
 
 async def test_step_adapter_surfaces_truncation_without_an_internal_retry() -> None:

@@ -66,6 +66,8 @@ class TerminusBoundary:
     action: str
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    workspace_delta_observed: bool = True
+    workspace_observation_error: str | None = None
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -83,6 +85,12 @@ class TerminusBoundary:
             raise TypeError("changed_paths must be a tuple of strings")
         if not isinstance(self.diff, str):
             raise TypeError("diff must be a string")
+        if not isinstance(self.workspace_delta_observed, bool):
+            raise TypeError("workspace_delta_observed must be a boolean")
+        if self.workspace_observation_error is not None and not isinstance(
+            self.workspace_observation_error, str
+        ):
+            raise TypeError("workspace_observation_error must be a string or None")
         if self.error is not None and not isinstance(self.error, str):
             raise TypeError("error must be a string or None")
         if self.reward is not None and (
@@ -413,6 +421,8 @@ class TerminusStepAdapter:
             state=self.codec.encode(boundary.conversation),
             changed_paths=boundary.changed_paths,
             diff=boundary.diff,
+            workspace_delta_observed=boundary.workspace_delta_observed,
+            workspace_observation_error=boundary.workspace_observation_error,
             error=boundary.error,
             reward=boundary.reward,
             tokens=boundary.tokens,

@@ -162,6 +162,7 @@ class DriftlockRunner:
                     judge_tokens_used,
                     current_checkpoint=checkpoint,
                     logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
                 )
             if (
                 self.config.max_tokens is not None
@@ -178,10 +179,11 @@ class DriftlockRunner:
                     judge_tokens_used,
                     current_checkpoint=checkpoint,
                     logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
                 )
 
             signals = self.coarse_judge.evaluate(recent_steps)
-            checkpoint_is_healthy = not signals
+            checkpoint_is_healthy = outcome.workspace_delta_observed and not signals
             if signals and not self.coarse_judge.initiates_review(signals):
                 # Corroborating-only: recorded so the detector's firing rate stays
                 # measurable, but not escalated and not billed.
@@ -229,6 +231,7 @@ class DriftlockRunner:
                             judge_tokens_used,
                             current_checkpoint=checkpoint,
                             logical_step=logical_step,
+                            checkpointable=outcome.workspace_delta_observed,
                         )
                     checkpoint = rollback_checkpoint
                     state = await self._restore_checkpoint(checkpoint)
@@ -284,7 +287,8 @@ class DriftlockRunner:
                     )
                 )
                 checkpoint_is_healthy = (
-                    verdict.status is FineJudgeStatus.VERDICT
+                    outcome.workspace_delta_observed
+                    and verdict.status is FineJudgeStatus.VERDICT
                     and verdict.verdict is Verdict.HEALTHY
                 )
 
@@ -300,6 +304,7 @@ class DriftlockRunner:
                     judge_tokens_used,
                     current_checkpoint=checkpoint,
                     logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
                 )
 
             if (
@@ -327,6 +332,7 @@ class DriftlockRunner:
             judge_tokens_used,
             current_checkpoint=checkpoint,
             logical_step=logical_step,
+            checkpointable=outcome.workspace_delta_observed,
         )
 
     async def _judge(
@@ -502,8 +508,13 @@ class DriftlockRunner:
         *,
         current_checkpoint: Checkpoint,
         logical_step: int,
+        checkpointable: bool = True,
     ) -> RunResult:
-        if self.config.checkpoint_on_exit and current_checkpoint.step != logical_step:
+        if (
+            checkpointable
+            and self.config.checkpoint_on_exit
+            and current_checkpoint.step != logical_step
+        ):
             terminal = await self._create_checkpoint(
                 state,
                 step=logical_step,

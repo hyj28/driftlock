@@ -110,6 +110,7 @@ def _write_harbor_attempt(
     ("exception_name", "expected_kind"),
     [
         ("RateLimitError", "transient_infrastructure"),
+        ("DriftlockTerminalUnusableError", "terminal_unusable"),
         (None, "no_reward"),
         ("RuntimeError", "no_reward"),
     ],
@@ -161,6 +162,9 @@ async def test_no_reward_provider_attribution_reaches_the_validation_report(
     assert attempt["audit"]["observed_exception_names"] == (
         [] if exception_name is None else [exception_name]
     )
+    if exception_name == "DriftlockTerminalUnusableError":
+        assert attempt["failure_kind"] != "no_reward"
+        assert attempt["failure_kind"] != "transient_infrastructure"
     if exception_name is None:
         assert attempt["reason"] == "validation job produced no reward (job recovered)"
     else:

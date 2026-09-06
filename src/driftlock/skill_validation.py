@@ -76,6 +76,7 @@ class ValidationFailureKind(StrEnum):
     DID_NOT_PRODUCE_RESULT = "did_not_produce_result"
     AMBIGUOUS_RESULT = "ambiguous_result"
     TRANSIENT_INFRASTRUCTURE = "transient_infrastructure"
+    TERMINAL_UNUSABLE = "terminal_unusable"
     NO_REWARD = "no_reward"
     REWARD_EVIDENCE = "reward_evidence"
     SKILL_LAYER_EVIDENCE = "skill_layer_evidence"

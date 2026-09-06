@@ -66,6 +66,45 @@ def _quick_coarse_judge() -> HeuristicJudge:
     )
 
 
+@pytest.mark.parametrize(
+    ("completed", "expected_status"),
+    [(False, RunStatus.STEP_LIMIT), (True, RunStatus.COMPLETED)],
+)
+async def test_unobserved_boundary_is_not_checkpointed(
+    tmp_path: Path,
+    completed: bool,
+    expected_status: RunStatus,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action="continue after terminal recovery",
+            state={"turn": context.logical_step},
+            workspace_delta_observed=False,
+            workspace_observation_error=(
+                "checkpoint marker send raised TimeoutError; marker completion was "
+                "not observed; pane capture shows a shell prompt"
+            ),
+            completed=completed,
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        config=RunnerConfig(
+            max_steps=1,
+            checkpoint_interval=1,
+            checkpoint_on_exit=True,
+        ),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert result.status is expected_status
+    assert len(result.steps) == 1
+    assert len(result.checkpoints) == 1
+    assert result.checkpoints[0].label == "initial"
+
+
 async def test_runner_rolls_back_workspace_and_state_then_retries(
     tmp_path: Path,
 ) -> None:
