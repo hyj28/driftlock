@@ -12,8 +12,8 @@ things the boundary runtime cannot safely infer from stock Harbor:
 4. it appends to the tmux pane log so replacing a rejected shell cannot erase the
    earlier physical trajectory; and
 5. it waits for a shell completion marker before exposing a command boundary, then
-   interrupts and inspects the tmux pane after a timeout, aborting only when tmux
-   positively reports that the session is gone; and
+   interrupts and captures the tmux pane after a session-layer failure while marking
+   only that boundary uncheckpointable instead of aborting the paid trial; and
 6. it invokes driftlock's optional end-of-agent-loop finalizer so retry-only host
    checkpoints are removed before final verification.
 
@@ -47,7 +47,7 @@ from harbor._driftlock_pin import (
 )
 
 assert LHTB_REPOSITORY_REVISION == "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-assert DRIFTLOCK_HARBOR_PATCH_VERSION == 13
+assert DRIFTLOCK_HARBOR_PATCH_VERSION == 14
 assert version("litellm") == "1.83.14"
 print("pinned LHTB Harbor integration ready")
 PY
@@ -132,7 +132,7 @@ verifier; generating an ordinary agent configuration under the `oracle` label wo
 invalidate the comparison.
 
 Preflight requires the benchmark `tasks/` tree to match the pinned commit byte for
-byte. Harbor may differ only by the packaged version-13 companion patch: every patch
+byte. Harbor may differ only by the packaged version-14 companion patch: every patch
 target is checked against its expected SHA-256 and any other tracked or untracked
 Harbor change is rejected. The imported `harbor` module must also resolve inside the
 requested LHTB checkout.

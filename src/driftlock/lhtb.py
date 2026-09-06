@@ -33,7 +33,7 @@ from driftlock.terminus import (
 
 LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
 LHTB_LITELLM_VERSION = "1.83.14"
-DRIFTLOCK_HARBOR_PATCH_VERSION = 13
+DRIFTLOCK_HARBOR_PATCH_VERSION = 14
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # On 2026-08-23 the pinned agent provider's *shared* upstream pool was saturated

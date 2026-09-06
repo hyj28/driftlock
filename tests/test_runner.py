@@ -66,6 +66,32 @@ def _quick_coarse_judge() -> HeuristicJudge:
     )
 
 
+def _single_error_coarse_judge() -> HeuristicJudge:
+    return HeuristicJudge(
+        HeuristicConfig(
+            no_change_steps=10,
+            loop_window=10,
+            loop_repetitions=10,
+            error_window=1,
+            error_rate=1.0,
+            command_failure_window=10,
+            reward_stall_steps=10,
+            corroborating_signals=frozenset(),
+        )
+    )
+
+
+def _unobserved_error_outcome(context: StepContext, *, tokens: int = 0) -> StepOutcome:
+    return StepOutcome(
+        action="timed-out command",
+        state={"turn": context.logical_step},
+        workspace_delta_observed=False,
+        workspace_observation_error="shell-boundary recovery could not be established",
+        error="command timed out",
+        tokens=tokens,
+    )
+
+
 @pytest.mark.parametrize(
     ("completed", "expected_status"),
     [(False, RunStatus.STEP_LIMIT), (True, RunStatus.COMPLETED)],
@@ -103,6 +129,109 @@ async def test_unobserved_boundary_is_not_checkpointed(
     assert len(result.steps) == 1
     assert len(result.checkpoints) == 1
     assert result.checkpoints[0].label == "initial"
+
+
+async def test_unobserved_token_limit_exit_is_not_checkpointed(tmp_path: Path) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return _unobserved_error_outcome(context, tokens=5)
+
+    result = await DriftlockRunner(
+        store,
+        _single_error_coarse_judge(),
+        config=RunnerConfig(
+            max_steps=1,
+            max_tokens=5,
+            checkpoint_interval=1,
+            checkpoint_on_exit=True,
+        ),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.TOKEN_LIMIT
+    assert len(result.checkpoints) == 1
+
+
+async def test_unobserved_rollback_limit_exit_is_not_checkpointed(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return _unobserved_error_outcome(context)
+
+    result = await DriftlockRunner(
+        store,
+        _single_error_coarse_judge(),
+        config=RunnerConfig(
+            max_steps=1,
+            max_rollbacks=0,
+            checkpoint_interval=1,
+            checkpoint_on_exit=True,
+        ),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.ROLLBACK_LIMIT
+    assert len(result.checkpoints) == 1
+
+
+async def test_unobserved_judge_budget_exit_is_not_checkpointed(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    class BudgetConsumingHealthyJudge:
+        calls = 0
+
+        async def judge(self, context: DriftContext) -> JudgeVerdict:
+            del context
+            self.calls += 1
+            return JudgeVerdict(
+                Verdict.HEALTHY,
+                "trajectory is healthy",
+                tokens=4,
+            )
+
+    judge = BudgetConsumingHealthyJudge()
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return _unobserved_error_outcome(context, tokens=1)
+
+    result = await DriftlockRunner(
+        store,
+        _single_error_coarse_judge(),
+        fine_judge=judge,
+        config=RunnerConfig(
+            max_steps=1,
+            max_tokens=5,
+            checkpoint_interval=1,
+            checkpoint_on_exit=True,
+        ),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert judge.calls == 1
+    assert result.status is RunStatus.TOKEN_LIMIT
+    assert len(result.checkpoints) == 1
+
+
+async def test_healthy_verdict_cannot_promote_unobserved_boundary(
+    tmp_path: Path,
+) -> None:
+    _workspace, store = _store(tmp_path)
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return _unobserved_error_outcome(context)
+
+    result = await DriftlockRunner(
+        store,
+        _single_error_coarse_judge(),
+        fine_judge=HealthyJudge(),
+        config=RunnerConfig(max_steps=1, checkpoint_interval=1),
+    ).run(goal="finish", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.STEP_LIMIT
+    assert len(result.checkpoints) == 1
+    assert result.coarse_triggers[0].judge_verdict is Verdict.HEALTHY
 
 
 async def test_runner_rolls_back_workspace_and_state_then_retries(

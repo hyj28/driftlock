@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,9 +10,9 @@ import pytest
 from driftlock.terminal_quiescence import (
     PANE_LIVENESS_TIMEOUT_SECONDS,
     QUIESCE_HANDSHAKE_TIMEOUT_SECONDS,
-    CheckpointQuiesceStatus,
-    DriftlockTerminalUnusableError,
+    CheckpointQuiesceOutcome,
     quiesce_terminal_after_timeout,
+    record_checkpoint_quiesce_outcome,
 )
 
 
@@ -23,22 +23,15 @@ class SendKeysCall:
 
 
 class FakeSendKeys:
-    def __init__(
-        self,
-        timeout_calls: Sequence[int] = (),
-        errors: dict[int, BaseException] | None = None,
-    ) -> None:
-        self.timeout_calls = frozenset(timeout_calls)
+    def __init__(self, errors: dict[int, BaseException] | None = None) -> None:
         self.errors = errors or {}
         self.calls: list[SendKeysCall] = []
 
     async def __call__(self, keys: list[str], **options: Any) -> None:
         self.calls.append(SendKeysCall(tuple(keys), options))
-        call_number = len(self.calls)
-        if call_number in self.errors:
-            raise self.errors[call_number]
-        if call_number in self.timeout_calls:
-            raise TimeoutError("simulated send timeout")
+        error = self.errors.get(len(self.calls))
+        if error is not None:
+            raise error
 
 
 def _unexpected_probe() -> Callable[[], Awaitable[str]]:
@@ -57,9 +50,7 @@ async def test_first_quiesce_handshake_recovers_checkpoint_boundary() -> None:
         capture_pane=_unexpected_probe(),
     )
 
-    assert outcome.status is CheckpointQuiesceStatus.RECOVERED
-    assert outcome.checkpointable is True
-    assert outcome.reason is None
+    assert outcome == CheckpointQuiesceOutcome(checkpointable=True)
     assert send_keys.calls == [
         SendKeysCall(
             ("C-c",),
@@ -73,13 +64,10 @@ async def test_first_quiesce_handshake_recovers_checkpoint_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_alive_but_slow_shell_prompt_does_not_abort_paid_episode() -> None:
-    send_keys = FakeSendKeys(timeout_calls=(2,))
-    pane_calls = 0
+async def test_alive_but_slow_shell_prompt_never_aborts_paid_episode() -> None:
+    send_keys = FakeSendKeys({2: TimeoutError("marker never came back")})
 
     async def capture_pane() -> str:
-        nonlocal pane_calls
-        pane_calls += 1
         return (
             'root@137798b67ea8:/app/output/workspace# (set -- "$?"; '
             'tmux wait -S driftlock-cdb118; exit "$1")\n'
@@ -91,13 +79,15 @@ async def test_alive_but_slow_shell_prompt_does_not_abort_paid_episode() -> None
         capture_pane=capture_pane,
     )
 
-    assert outcome.status is CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE
-    assert outcome.checkpointable is False
-    assert outcome.reason == (
-        "checkpoint marker send raised TimeoutError; marker completion was not "
-        "observed; pane capture shows a shell prompt"
+    assert outcome == CheckpointQuiesceOutcome(
+        checkpointable=False,
+        reason=(
+            "checkpoint marker send raised TimeoutError; marker completion and "
+            "shell-boundary recovery could not be established; pane capture "
+            "returned non-empty content; terminal usability was not inferred from "
+            "pane text"
+        ),
     )
-    assert pane_calls == 1
     assert send_keys.calls == [
         SendKeysCall(
             ("C-c",),
@@ -111,80 +101,31 @@ async def test_alive_but_slow_shell_prompt_does_not_abort_paid_episode() -> None
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_pane_is_absence_of_evidence_not_terminal_failure() -> None:
-    send_keys = FakeSendKeys(timeout_calls=(2,))
+async def test_marker_runtime_error_is_an_uncheckpointable_boundary() -> None:
+    send_keys = FakeSendKeys({2: RuntimeError("tmux channel failed")})
 
     async def capture_pane() -> str:
-        return "still rendering output without a recognizable prompt"
+        return "still rendering output"
 
     outcome = await quiesce_terminal_after_timeout(
         send_keys,
         capture_pane=capture_pane,
     )
 
-    assert outcome.status is CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE
     assert outcome.checkpointable is False
     assert outcome.reason == (
-        "checkpoint marker send raised TimeoutError; marker completion was not "
-        "observed; pane was captured without a recognizable shell prompt; absence "
-        "of a prompt was not treated as evidence that the terminal session is gone"
+        "checkpoint marker send raised RuntimeError; marker completion and "
+        "shell-boundary recovery could not be established; pane capture returned "
+        "non-empty content; terminal usability was not inferred from pane text"
     )
+    assert len(send_keys.calls) == 2
 
 
 @pytest.mark.asyncio
-async def test_positive_tmux_session_absence_raises_named_terminal_error() -> None:
-    send_keys = FakeSendKeys(timeout_calls=(2,))
-    liveness_calls = 0
-
-    async def capture_pane() -> str:
-        return ""
-
-    async def session_is_alive() -> bool:
-        nonlocal liveness_calls
-        liveness_calls += 1
-        return False
-
-    with pytest.raises(DriftlockTerminalUnusableError) as caught:
-        await quiesce_terminal_after_timeout(
-            send_keys,
-            capture_pane=capture_pane,
-            session_is_alive=session_is_alive,
-        )
-
-    assert type(caught.value) is DriftlockTerminalUnusableError
-    assert str(caught.value) == "terminal session is gone after the timed-out command"
-    assert "agent" not in str(caught.value)
-    assert liveness_calls == 1
-    assert send_keys.calls == [
-        SendKeysCall(
-            ("C-c",),
-            {"block": False, "min_timeout_sec": 0.1},
-        ),
-        SendKeysCall(
-            (":", "Enter"),
-            {"block": True, "max_timeout_sec": 15.0},
-        ),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_missing_pane_capability_preserves_episode_with_reason() -> None:
-    send_keys = FakeSendKeys(timeout_calls=(2,))
-
-    outcome = await quiesce_terminal_after_timeout(send_keys)
-
-    assert outcome.status is CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE
-    assert outcome.checkpointable is False
-    assert outcome.reason == (
-        "checkpoint marker send raised TimeoutError; marker completion was not "
-        "observed; no pane-capture capability was supplied, so terminal usability "
-        "was not established"
+async def test_interrupt_runtime_error_is_handled_without_a_second_send() -> None:
+    send_keys = FakeSendKeys(
+        {1: RuntimeError("trial-7: failed to send non-blocking keys")}
     )
-
-
-@pytest.mark.asyncio
-async def test_interrupt_timeout_is_classified_by_policy_without_second_send() -> None:
-    send_keys = FakeSendKeys(timeout_calls=(1,))
 
     async def capture_pane() -> str:
         return "root@container:/app# "
@@ -194,11 +135,11 @@ async def test_interrupt_timeout_is_classified_by_policy_without_second_send() -
         capture_pane=capture_pane,
     )
 
-    assert outcome.status is CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE
     assert outcome.checkpointable is False
     assert outcome.reason == (
-        "interrupt send raised TimeoutError; interrupt delivery was not established; "
-        "pane capture shows a shell prompt"
+        "interrupt send raised RuntimeError; interrupt delivery and shell-boundary "
+        "recovery could not be established; pane capture returned non-empty content; "
+        "terminal usability was not inferred from pane text"
     )
     assert send_keys.calls == [
         SendKeysCall(
@@ -209,32 +150,70 @@ async def test_interrupt_timeout_is_classified_by_policy_without_second_send() -
 
 
 @pytest.mark.asyncio
-async def test_unrelated_timeout_subclass_does_not_become_terminal_error() -> None:
-    class PaneTransportTimeout(TimeoutError):
-        pass
-
-    send_keys = FakeSendKeys(timeout_calls=(2,))
+async def test_empty_pane_does_not_claim_that_terminal_is_dead() -> None:
+    send_keys = FakeSendKeys({2: TimeoutError("marker wait timed out")})
 
     async def capture_pane() -> str:
-        raise PaneTransportTimeout("capture transport failed")
+        return ""
 
     outcome = await quiesce_terminal_after_timeout(
         send_keys,
         capture_pane=capture_pane,
     )
 
-    assert outcome.status is CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE
+    assert outcome.checkpointable is False
     assert outcome.reason == (
-        "checkpoint marker send raised TimeoutError; marker completion was not "
-        "observed; pane evidence raised PaneTransportTimeout, so no terminal "
-        "usability conclusion was drawn"
+        "checkpoint marker send raised TimeoutError; marker completion and "
+        "shell-boundary recovery could not be established; pane capture returned no "
+        "content; terminal usability could not be determined"
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [asyncio.CancelledError(), ValueError("broken")])
-async def test_non_timeout_send_keys_errors_propagate(error: BaseException) -> None:
-    send_keys = FakeSendKeys(errors={2: error})
+@pytest.mark.parametrize(
+    "capture_error",
+    [TimeoutError("capture timed out"), RuntimeError("docker exec failed")],
+)
+async def test_pane_capture_failure_records_uncertainty(
+    capture_error: Exception,
+) -> None:
+    send_keys = FakeSendKeys({2: TimeoutError("marker wait timed out")})
+
+    async def capture_pane() -> str:
+        raise capture_error
+
+    outcome = await quiesce_terminal_after_timeout(
+        send_keys,
+        capture_pane=capture_pane,
+    )
+
+    assert outcome.checkpointable is False
+    assert outcome.reason == (
+        "checkpoint marker send raised TimeoutError; marker completion and "
+        f"shell-boundary recovery could not be established; pane capture raised "
+        f"{type(capture_error).__name__}, so terminal usability could not be "
+        "determined"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_pane_capability_records_uncertainty() -> None:
+    send_keys = FakeSendKeys({2: TimeoutError("marker wait timed out")})
+
+    outcome = await quiesce_terminal_after_timeout(send_keys)
+
+    assert outcome.checkpointable is False
+    assert outcome.reason == (
+        "checkpoint marker send raised TimeoutError; marker completion and "
+        "shell-boundary recovery could not be established; no pane-capture capability "
+        "was supplied, so terminal usability was not established"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
+async def test_process_control_send_errors_propagate(error: BaseException) -> None:
+    send_keys = FakeSendKeys({1: error})
 
     with pytest.raises(type(error)) as caught:
         await quiesce_terminal_after_timeout(send_keys)
@@ -243,27 +222,59 @@ async def test_non_timeout_send_keys_errors_propagate(error: BaseException) -> N
 
 
 @pytest.mark.asyncio
-async def test_cancelled_pane_capture_propagates_unchanged() -> None:
-    send_keys = FakeSendKeys(timeout_calls=(2,))
-    cancelled = asyncio.CancelledError()
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
+async def test_process_control_pane_errors_propagate(error: BaseException) -> None:
+    send_keys = FakeSendKeys({2: TimeoutError("marker wait timed out")})
 
     async def capture_pane() -> str:
-        raise cancelled
+        raise error
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(type(error)) as caught:
         await quiesce_terminal_after_timeout(
             send_keys,
             capture_pane=capture_pane,
         )
 
-    assert caught.value is cancelled
+    assert caught.value is error
 
 
-def test_quiesce_status_values_and_deadlines_are_independent_literals() -> None:
-    values = [member.value for member in CheckpointQuiesceStatus.__members__.values()]
+def test_outcome_recording_sets_and_clears_runtime_boundary_field() -> None:
+    class Target:
+        _driftlock_boundary_uncheckpointable_reason: str | None = "stale reason"
 
-    assert values == ["recovered", "boundary_not_checkpointable"]
-    assert len(values) == len(set(values))
+    target = Target()
+    missed = CheckpointQuiesceOutcome(
+        checkpointable=False,
+        reason="marker completion could not be established",
+    )
+
+    record_checkpoint_quiesce_outcome(target, missed)
+
+    assert target._driftlock_boundary_uncheckpointable_reason == (
+        "marker completion could not be established"
+    )
+
+    record_checkpoint_quiesce_outcome(
+        target,
+        CheckpointQuiesceOutcome(checkpointable=True),
+    )
+
+    assert target._driftlock_boundary_uncheckpointable_reason is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"checkpointable": True, "reason": "failure"},
+        {"checkpointable": False},
+    ],
+)
+def test_outcome_rejects_disagreeing_fields(values: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        CheckpointQuiesceOutcome(**values)
+
+
+def test_quiesce_deadlines_are_independent_literals() -> None:
     assert QUIESCE_HANDSHAKE_TIMEOUT_SECONDS == 15.0
     assert PANE_LIVENESS_TIMEOUT_SECONDS == 60.0
     assert 60.0 > 15.0

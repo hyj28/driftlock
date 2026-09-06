@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 # A tenth of a second lets tmux deliver the interrupt before the shell no-op is
 # queued without turning signal delivery itself into another long blocking wait.
@@ -17,8 +15,8 @@ INTERRUPT_SETTLE_SECONDS = 0.1
 # completion marker more scheduling headroom than the failed ten-second policy.
 QUIESCE_HANDSHAKE_TIMEOUT_SECONDS = 15.0
 
-# A loaded validation host runs four containers concurrently. One minute gives
-# pane capture and the fallback tmux session check time to survive host contention.
+# A loaded validation host runs four containers concurrently. One minute lets
+# pane capture survive host contention without treating its result as a verdict.
 PANE_LIVENESS_TIMEOUT_SECONDS = 60.0
 
 # One interrupt targets the timed-out foreground process without risking a second
@@ -29,50 +27,50 @@ _INTERRUPT_KEYS = ["C-c"]
 # completion marker when these keys are sent in blocking mode.
 _SHELL_MARKER_KEYS = [":", "Enter"]
 
-# Shell prompts vary, but the observed LHTB prompt and conventional interactive
-# Bash prompts end a line with ``#`` or ``$`` followed only by optional whitespace.
-_SHELL_PROMPT_PATTERN = re.compile(r"(?m)^[^\r\n]*[#$][ \t]*$")
-
-# This wording records uncertainty about marker completion without claiming that
-# an arbitrary TimeoutError proves the marker itself failed to reach the shell.
-_MARKER_TIMEOUT_REASON = (
-    "checkpoint marker send raised TimeoutError; marker completion was not observed"
-)
-
 SendKeys = Callable[..., Awaitable[Any]]
 CapturePane = Callable[[], Awaitable[str]]
-SessionIsAlive = Callable[[], Awaitable[bool]]
 
 
-class CheckpointQuiesceStatus(StrEnum):
-    """What terminal recovery established after a command timeout."""
+class BoundaryReasonTarget(Protocol):
+    """Object carrying the per-boundary reason consumed by the LHTB runtime."""
 
-    RECOVERED = "recovered"
-    BOUNDARY_NOT_CHECKPOINTABLE = "boundary_not_checkpointable"
+    _driftlock_boundary_uncheckpointable_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class CheckpointQuiesceOutcome:
-    """Checkpoint availability established without ending the episode."""
+    """Whether this boundary can be checkpointed, with evidence when it cannot."""
 
-    status: CheckpointQuiesceStatus
     checkpointable: bool
     reason: str | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.checkpointable, bool):
+            raise TypeError("checkpointable must be a boolean")
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise TypeError("reason must be a string or None")
+        if self.checkpointable and self.reason is not None:
+            raise ValueError("a checkpointable boundary cannot have a failure reason")
+        if not self.checkpointable and not self.reason:
+            raise ValueError("an uncheckpointable boundary needs a failure reason")
 
-class DriftlockTerminalUnusableError(RuntimeError):
-    """Raised when tmux positively reports that the terminal session is gone."""
+
+def record_checkpoint_quiesce_outcome(
+    target: BoundaryReasonTarget,
+    outcome: CheckpointQuiesceOutcome,
+) -> None:
+    """Expose the policy result on the agent field read by the boundary runtime."""
+
+    target._driftlock_boundary_uncheckpointable_reason = outcome.reason
 
 
 async def _uncheckpointable_boundary(
     *,
     capture_pane: CapturePane | None,
-    session_is_alive: SessionIsAlive | None,
     trigger_reason: str,
 ) -> CheckpointQuiesceOutcome:
     if capture_pane is None:
         return CheckpointQuiesceOutcome(
-            status=CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE,
             checkpointable=False,
             reason=(
                 f"{trigger_reason}; no pane-capture capability was supplied, so "
@@ -83,37 +81,33 @@ async def _uncheckpointable_boundary(
     try:
         async with asyncio.timeout(PANE_LIVENESS_TIMEOUT_SECONDS):
             pane = await capture_pane()
-            if not isinstance(pane, str):
-                raise TypeError("pane capture must return a string")
-            if not pane and session_is_alive is not None:
-                alive = await session_is_alive()
-                if not isinstance(alive, bool):
-                    raise TypeError("session liveness check must return a boolean")
-                if not alive:
-                    raise DriftlockTerminalUnusableError(
-                        "terminal session is gone after the timed-out command"
-                    )
-    except TimeoutError as error:
+    except Exception as error:
         return CheckpointQuiesceOutcome(
-            status=CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE,
             checkpointable=False,
             reason=(
-                f"{trigger_reason}; pane evidence raised "
-                f"{type(error).__name__}, so no terminal usability conclusion "
-                "was drawn"
+                f"{trigger_reason}; pane capture raised {type(error).__name__}, so "
+                "terminal usability could not be determined"
             ),
         )
 
+    if not isinstance(pane, str):
+        return CheckpointQuiesceOutcome(
+            checkpointable=False,
+            reason=(
+                f"{trigger_reason}; pane capture returned {type(pane).__name__} "
+                "instead of text, so terminal usability could not be determined"
+            ),
+        )
     pane_reason = (
-        "pane capture shows a shell prompt"
-        if _SHELL_PROMPT_PATTERN.search(pane)
+        "pane capture returned non-empty content; terminal usability was not "
+        "inferred from pane text"
+        if pane
         else (
-            "pane was captured without a recognizable shell prompt; absence of a "
-            "prompt was not treated as evidence that the terminal session is gone"
+            "pane capture returned no content; terminal usability could not be "
+            "determined"
         )
     )
     return CheckpointQuiesceOutcome(
-        status=CheckpointQuiesceStatus.BOUNDARY_NOT_CHECKPOINTABLE,
         checkpointable=False,
         reason=f"{trigger_reason}; {pane_reason}",
     )
@@ -123,13 +117,12 @@ async def quiesce_terminal_after_timeout(
     send_keys: SendKeys,
     *,
     capture_pane: CapturePane | None = None,
-    session_is_alive: SessionIsAlive | None = None,
 ) -> CheckpointQuiesceOutcome:
-    """Interrupt a timed-out command and inspect tmux before declaring it unusable.
+    """Report whether a timed-out command reached an observable shell boundary.
 
     Harbor passes its tmux methods, while tests can supply deterministic async
-    callables. A missed send deadline is never treated as proof that the terminal
-    is dead; only an explicit negative ``session_is_alive`` result is conclusive.
+    callables. Ordinary session failures make only this boundary uncheckpointable;
+    terminal lifecycle decisions remain Harbor's responsibility.
     """
 
     try:
@@ -138,13 +131,13 @@ async def quiesce_terminal_after_timeout(
             block=False,
             min_timeout_sec=INTERRUPT_SETTLE_SECONDS,
         )
-    except TimeoutError as error:
+    except Exception as error:
         return await _uncheckpointable_boundary(
             capture_pane=capture_pane,
-            session_is_alive=session_is_alive,
             trigger_reason=(
                 "interrupt send raised "
-                f"{type(error).__name__}; interrupt delivery was not established"
+                f"{type(error).__name__}; interrupt delivery and shell-boundary "
+                "recovery could not be established"
             ),
         )
 
@@ -154,15 +147,17 @@ async def quiesce_terminal_after_timeout(
             block=True,
             max_timeout_sec=QUIESCE_HANDSHAKE_TIMEOUT_SECONDS,
         )
-    except TimeoutError:
+    except Exception as error:
         # Do not enqueue a second no-op: the first marker may only be late, and pane
         # capture provides independent evidence without leaving two markers pending.
         return await _uncheckpointable_boundary(
             capture_pane=capture_pane,
-            session_is_alive=session_is_alive,
-            trigger_reason=_MARKER_TIMEOUT_REASON,
+            trigger_reason=(
+                "checkpoint marker send raised "
+                f"{type(error).__name__}; marker completion and shell-boundary "
+                "recovery could not be established"
+            ),
         )
     return CheckpointQuiesceOutcome(
-        status=CheckpointQuiesceStatus.RECOVERED,
         checkpointable=True,
     )

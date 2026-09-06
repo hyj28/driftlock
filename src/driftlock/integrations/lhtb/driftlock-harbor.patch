@@ -1,26 +1,29 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..845172ee99951c1e83d7d6039eae78812d74e3a8
+index 0000000000000000000000000000000000000000..cf142dcbc7509766eec5bae4231badc8671d0329
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 13
++DRIFTLOCK_HARBOR_PATCH_VERSION = 14
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-index bcd04739f072760fe4635f4677190cf4c7c07bcf..ff45559a2c0495fda01e31f84f8d05707cf607c3 100644
+index bcd04739f072760fe4635f4677190cf4c7c07bcf..231712b068946169687176f01dd28e192f1b4eb5 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
 +++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-@@ -14,6 +14,7 @@ from tenacity import (
+@@ -14,6 +14,10 @@ from tenacity import (
      stop_after_attempt,
  )
  
-+from driftlock.terminal_quiescence import quiesce_terminal_after_timeout
++from driftlock.terminal_quiescence import (
++    quiesce_terminal_after_timeout,
++    record_checkpoint_quiesce_outcome,
++)
  from harbor.agents.base import BaseAgent
  from harbor.agents.terminus_2.terminus_json_plain_parser import (
      TerminusJSONPlainParser,
-@@ -1236,6 +1237,41 @@ so ask everything you need to know."""
+@@ -1236,6 +1240,41 @@ so ask everything you need to know."""
              llm_response,
          )
  
@@ -62,7 +65,7 @@ index bcd04739f072760fe4635f4677190cf4c7c07bcf..ff45559a2c0495fda01e31f84f8d0570
      async def _execute_commands(
          self,
          commands: list[Command],
-@@ -1250,14 +1286,37 @@ so ask everything you need to know."""
+@@ -1250,14 +1289,35 @@ so ask everything you need to know."""
          Returns:
              Tuple of (timeout_occurred, terminal_output)
          """
@@ -97,14 +100,12 @@ index bcd04739f072760fe4635f4677190cf4c7c07bcf..ff45559a2c0495fda01e31f84f8d0570
 +                recovery = await quiesce_terminal_after_timeout(
 +                    session.send_keys,
 +                    capture_pane=session.capture_pane,
-+                    session_is_alive=session.is_session_alive,
 +                )
-+                if not recovery.checkpointable:
-+                    self._driftlock_boundary_uncheckpointable_reason = recovery.reason
++                record_checkpoint_quiesce_outcome(self, recovery)
                  return True, self._timeout_template.format(
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
-@@ -1413,6 +1472,15 @@ so ask everything you need to know."""
+@@ -1413,6 +1473,15 @@ so ask everything you need to know."""
                  f"Episode {episode}: {len(commands)} commands",
              )
  

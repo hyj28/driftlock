@@ -84,7 +84,6 @@ from driftlock.skill_validation import (
     plan_skill_validation,
     run_skill_validation,
 )
-from driftlock.terminal_quiescence import DriftlockTerminalUnusableError
 from driftlock.usage import ReplayUsage
 
 # Both identifiers carry an explicit dated build. An unversioned alias such as
@@ -144,14 +143,14 @@ DRIFTLOCK_DETECTOR_DEFAULTS = {
     "driftlock_corroborating_signals": ["no_file_change"],
 }
 
-# SHA-256 of every Harbor file after applying the packaged version-13 patch to the
+# SHA-256 of every Harbor file after applying the packaged version-14 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
 _PATCHED_HARBOR_SHA256 = {
     "harbor/src/harbor/_driftlock_pin.py": (
-        "af56ea6e2e16b3071466c754f462dff8c17efe8ab35e863907c84884b6e9b031"
+        "08a4dc53ddee2c8b54e2914246c17af4a2576b98d20583c3e57500e1241fc89b"
     ),
     "harbor/src/harbor/agents/terminus_2/terminus_2.py": (
-        "58414e16c9ff39846fa224c86ac4b881321203ca57e68d499e380e573f76b6d7"
+        "d36ccd68060f1556578fa55b831a5851992da9667c9da87140ca5af3febef47c"
     ),
     "harbor/src/harbor/agents/terminus_2/tmux_session.py": (
         "3efd8216f7c9e276178b474a5c73e4a050026910af8876fa06b4f1bfae8b24f1"
@@ -1063,6 +1062,14 @@ class _HarborSkillValidationRunner:
                 audit=audit,
             )
         try:
+            audit["uncheckpointable_boundary_count"] = (
+                _validation_uncheckpointable_boundary_count(run_record)
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            audit["uncheckpointable_boundary_evidence_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+        try:
             reward = (
                 single_job_reward(job_dir)
                 if (job_dir / "result.json").is_file()
@@ -1097,9 +1104,7 @@ class _HarborSkillValidationRunner:
                 if exception_names
                 else ""
             )
-            if DriftlockTerminalUnusableError.__name__ in exception_names:
-                failure_kind = ValidationFailureKind.TERMINAL_UNUSABLE
-            elif exception_names and all(
+            if exception_names and all(
                 name in TRANSIENT_VALIDATION_EXCEPTION_NAMES for name in exception_names
             ):
                 failure_kind = ValidationFailureKind.TRANSIENT_INFRASTRUCTURE
@@ -1315,6 +1320,28 @@ def _validation_exception_names(job_dir: Path) -> tuple[str, ...]:
         and trial_names
     }
     return tuple(sorted(names))
+
+
+def _validation_uncheckpointable_boundary_count(run_record: Path) -> int:
+    """Count boundaries whose workspace observation was skipped across all phases."""
+
+    data = json.loads(run_record.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"validation run record must be an object: {run_record}")
+    phases = data.get("phases", [])
+    if not isinstance(phases, list):
+        raise ValueError(f"validation run phases must be a list: {run_record}")
+    total = 0
+    for phase in phases:
+        if not isinstance(phase, dict):
+            raise ValueError(f"validation run phase must be an object: {run_record}")
+        boundaries = phase.get("uncheckpointable_boundaries", [])
+        if not isinstance(boundaries, list):
+            raise ValueError(
+                f"validation uncheckpointable boundaries must be a list: {run_record}"
+            )
+        total += len(boundaries)
+    return total
 
 
 def _validation_injection_evidence(
