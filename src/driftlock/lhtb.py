@@ -33,7 +33,7 @@ from driftlock.terminus import (
 
 LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
 LHTB_LITELLM_VERSION = "1.83.14"
-DRIFTLOCK_HARBOR_PATCH_VERSION = 11
+DRIFTLOCK_HARBOR_PATCH_VERSION = 14
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 # On 2026-08-23 the pinned agent provider's *shared* upstream pool was saturated
@@ -787,6 +787,7 @@ class LHTBTerminusRuntime:
         self.agent._llm_call_kwargs["num_retries"] = 0
         self.agent._llm_call_kwargs["max_retries"] = 0
         self.agent._max_episodes = self.agent._n_episodes + 1
+        self.agent._driftlock_boundary_uncheckpointable_reason = None
 
         truncation: BaseException | None = None
         try:
@@ -834,8 +835,21 @@ class LHTBTerminusRuntime:
 
         self.agent._update_context_from_state(self.context)
         self.agent._dump_trajectory()
-        after = await self.observer.snapshot()
-        delta = self.observer.compare(before, after)
+        observation_error = getattr(
+            self.agent, "_driftlock_boundary_uncheckpointable_reason", None
+        )
+        if observation_error is not None and not isinstance(observation_error, str):
+            raise LHTBRuntimeCompatibilityError(
+                "patched terminal boundary reason must be a string or None"
+            )
+        if observation_error is None:
+            after = await self.observer.snapshot()
+            delta = self.observer.compare(before, after)
+            changed_paths = delta.changed_paths
+            diff = delta.diff
+        else:
+            changed_paths = ()
+            diff = ""
         next_prompt = _step_observation(step)
         conversation = self.bridge.capture(
             self.agent,
@@ -846,8 +860,10 @@ class LHTBTerminusRuntime:
         return TerminusBoundary(
             conversation=conversation,
             action=_step_action(step),
-            changed_paths=delta.changed_paths,
-            diff=delta.diff,
+            changed_paths=changed_paths,
+            diff=diff,
+            workspace_delta_observed=observation_error is None,
+            workspace_observation_error=observation_error,
             error=error,
             tokens=_step_tokens(step),
             completed=self.agent._termination_reason == "confirmed_task_complete",

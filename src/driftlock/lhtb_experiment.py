@@ -143,14 +143,14 @@ DRIFTLOCK_DETECTOR_DEFAULTS = {
     "driftlock_corroborating_signals": ["no_file_change"],
 }
 
-# SHA-256 of every Harbor file after applying the packaged version-11 patch to the
+# SHA-256 of every Harbor file after applying the packaged version-14 patch to the
 # pinned LHTB revision.  Preflight also rejects any other Harbor or task-tree change.
 _PATCHED_HARBOR_SHA256 = {
     "harbor/src/harbor/_driftlock_pin.py": (
-        "9da8ba424621246e0836713932d75a0e94e14aadcb50fe93d008005f57970050"
+        "08a4dc53ddee2c8b54e2914246c17af4a2576b98d20583c3e57500e1241fc89b"
     ),
     "harbor/src/harbor/agents/terminus_2/terminus_2.py": (
-        "7ec452a41b135d1fb1f130a9ff31578653280c7a6a6b12165776bc83080b61e5"
+        "d36ccd68060f1556578fa55b831a5851992da9667c9da87140ca5af3febef47c"
     ),
     "harbor/src/harbor/agents/terminus_2/tmux_session.py": (
         "3efd8216f7c9e276178b474a5c73e4a050026910af8876fa06b4f1bfae8b24f1"
@@ -168,7 +168,7 @@ _PATCHED_HARBOR_SHA256 = {
         "fc769a6fd7646ec8c3049e16ebb70c31e5a2a7a7ffe010ed30b4d5737184b2c5"
     ),
     "harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py": (
-        "fab5d8cd139ff8b6fce158a04d09fec77f47ae8cae58a2ba600a41055e13f186"
+        "99afcffbfe1882525f3547a625de3ceb384a2350fef751832084a5c24d26f5dc"
     ),
     "harbor/tests/unit/agents/terminus_2/test_tmux_session.py": (
         "0412e289ae6e8de7d2fc92fb1d1762761b1862b42102755638ce2a451d737d07"
@@ -1062,6 +1062,14 @@ class _HarborSkillValidationRunner:
                 audit=audit,
             )
         try:
+            audit["uncheckpointable_boundary_count"] = (
+                _validation_uncheckpointable_boundary_count(run_record)
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            audit["uncheckpointable_boundary_evidence_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+        try:
             reward = (
                 single_job_reward(job_dir)
                 if (job_dir / "result.json").is_file()
@@ -1096,15 +1104,12 @@ class _HarborSkillValidationRunner:
                 if exception_names
                 else ""
             )
-            failure_kind = (
-                ValidationFailureKind.TRANSIENT_INFRASTRUCTURE
-                if exception_names
-                and all(
-                    name in TRANSIENT_VALIDATION_EXCEPTION_NAMES
-                    for name in exception_names
-                )
-                else ValidationFailureKind.NO_REWARD
-            )
+            if exception_names and all(
+                name in TRANSIENT_VALIDATION_EXCEPTION_NAMES for name in exception_names
+            ):
+                failure_kind = ValidationFailureKind.TRANSIENT_INFRASTRUCTURE
+            else:
+                failure_kind = ValidationFailureKind.NO_REWARD
             return ValidationTrialResult(
                 status=ValidationTrialStatus.FAILED,
                 reason=(
@@ -1315,6 +1320,28 @@ def _validation_exception_names(job_dir: Path) -> tuple[str, ...]:
         and trial_names
     }
     return tuple(sorted(names))
+
+
+def _validation_uncheckpointable_boundary_count(run_record: Path) -> int:
+    """Count boundaries whose workspace observation was skipped across all phases."""
+
+    data = json.loads(run_record.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"validation run record must be an object: {run_record}")
+    phases = data.get("phases", [])
+    if not isinstance(phases, list):
+        raise ValueError(f"validation run phases must be a list: {run_record}")
+    total = 0
+    for phase in phases:
+        if not isinstance(phase, dict):
+            raise ValueError(f"validation run phase must be an object: {run_record}")
+        boundaries = phase.get("uncheckpointable_boundaries", [])
+        if not isinstance(boundaries, list):
+            raise ValueError(
+                f"validation uncheckpointable boundaries must be a list: {run_record}"
+            )
+        total += len(boundaries)
+    return total
 
 
 def _validation_injection_evidence(

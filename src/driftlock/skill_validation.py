@@ -985,6 +985,11 @@ def _report(
     failure_kind_counts = Counter(
         attempt["failure_kind"] or "unattributed" for attempt in failed_attempts
     )
+    uncheckpointable_boundary_count = 0
+    for attempt in ordered_attempts:
+        count = attempt["audit"].get("uncheckpointable_boundary_count", 0)
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            uncheckpointable_boundary_count += count
     exception_name_counts: Counter[str] = Counter()
     for attempt in failed_attempts:
         exception_names = attempt["audit"].get("observed_exception_names", [])
@@ -1052,6 +1057,7 @@ def _report(
                 "configured_max_retries": max_retries,
                 "force_retry_unmeasured_requested": force_retry_unmeasured,
                 "forced_reattempt_trial_count": forced_reattempt_trial_count,
+                "uncheckpointable_boundary_count": (uncheckpointable_boundary_count),
                 "null_channel": null_channel,
             }
         )

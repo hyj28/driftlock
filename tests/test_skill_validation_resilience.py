@@ -76,12 +76,25 @@ def _write_harbor_attempt(
     reward: float | None,
     injected_candidate_ids: tuple[str, ...],
     exception_name: str | None = None,
+    uncheckpointable_boundary_count: int = 0,
 ) -> None:
     run_record = job_dir / "trial-0" / "agent" / "driftlock-result.json"
     run_record.parent.mkdir(parents=True)
     run_record.write_text(
         json.dumps(
             {
+                "phases": [
+                    {
+                        "uncheckpointable_boundaries": [
+                            {
+                                "sequence": index + 1,
+                                "logical_step": index + 1,
+                                "reason": "checkpoint boundary was not observable",
+                            }
+                            for index in range(uncheckpointable_boundary_count)
+                        ]
+                    }
+                ],
                 "skill_layer": {
                     "distillation_arm": "localized",
                     "injection": {
@@ -90,7 +103,7 @@ def _write_harbor_attempt(
                         ),
                         "candidate_ids": list(injected_candidate_ids),
                     },
-                }
+                },
             }
         ),
         encoding="utf-8",
@@ -104,6 +117,51 @@ def _write_harbor_attempt(
         json.dumps({"stats": {"evals": {"evaluation": evaluation}}}),
         encoding="utf-8",
     )
+
+
+@pytest.mark.asyncio
+async def test_validation_summary_counts_uncheckpointable_boundaries(
+    tmp_path: Path,
+) -> None:
+    root = _lhtb_tree(tmp_path)
+    plan = plan_skill_validation(_candidate_file(tmp_path), root)
+    work_dir = tmp_path / "work"
+    target = plan.work_items(work_dir)[0]
+    for trial in plan.work_items(work_dir):
+        _write_harbor_attempt(
+            work_dir / "jobs" / trial.job_name,
+            reward=0.5,
+            injected_candidate_ids=trial.available_candidate_ids,
+            uncheckpointable_boundary_count=3 if trial == target else 0,
+        )
+    runner = experiment._HarborSkillValidationRunner(
+        lhtb_dir=root,
+        work_dir=work_dir,
+        skill_embedder_import_path="offline_embedder:embed",
+        model="offline-model",
+        provider="offline-provider",
+        api_base="http://offline.invalid/v1",
+        judge_api_base=None,
+        judge_provider="offline-judge",
+        timeout_sec=60,
+        max_total_tokens=100,
+    )
+
+    report = await run_skill_validation(
+        plan,
+        tmp_path / "validated.json",
+        runner=runner,
+        work_dir=work_dir,
+        max_retries=0,
+    )
+
+    attempt = next(
+        item
+        for item in report["validation"]["attempts"]
+        if item["trial_id"] == target.trial_id
+    )
+    assert attempt["audit"]["uncheckpointable_boundary_count"] == 3
+    assert report["validation"]["summary"]["uncheckpointable_boundary_count"] == 3
 
 
 @pytest.mark.parametrize(

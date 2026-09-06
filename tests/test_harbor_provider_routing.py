@@ -1164,3 +1164,51 @@ def test_phase_record_counts_checkpoints_with_unstable_paths(
     ][0]
     assert native_phase["checkpoint_count"] == 2
     assert native_phase["unstable_checkpoint_count"] == 1
+
+
+def test_phase_record_names_uncheckpointable_boundary_reason(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, _native_agent = harbor_agent_modules
+    step = StepRecord(
+        sequence=3,
+        logical_step=2,
+        attempt=1,
+        outcome=StepOutcome(
+            action="timed-out command",
+            state={"episode": 2},
+            workspace_delta_observed=False,
+            workspace_observation_error=(
+                "checkpoint marker send raised TimeoutError; marker completion was "
+                "not observed; pane capture shows a shell prompt"
+            ),
+        ),
+    )
+    result = RunResult(
+        status=RunStatus.STEP_LIMIT,
+        state={"episode": 2},
+        steps=(step,),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+    )
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+
+    agent._write_phase_record(result, tmp_path / "phase-0", retained=True)
+
+    phase = json.loads((tmp_path / "driftlock-result.json").read_text())["phases"][0]
+    assert phase["uncheckpointable_boundaries"] == [
+        {
+            "sequence": 3,
+            "logical_step": 2,
+            "reason": (
+                "checkpoint marker send raised TimeoutError; marker completion was "
+                "not observed; pane capture shows a shell prompt"
+            ),
+        }
+    ]

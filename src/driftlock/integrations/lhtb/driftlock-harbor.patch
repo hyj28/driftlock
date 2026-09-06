@@ -1,18 +1,29 @@
 diff --git a/harbor/src/harbor/_driftlock_pin.py b/harbor/src/harbor/_driftlock_pin.py
 new file mode 100644
-index 0000000..73f540f
+index 0000000000000000000000000000000000000000..cf142dcbc7509766eec5bae4231badc8671d0329
 --- /dev/null
 +++ b/harbor/src/harbor/_driftlock_pin.py
 @@ -0,0 +1,4 @@
 +"""Compatibility marker for driftlock's pinned LHTB integration."""
 +
 +LHTB_REPOSITORY_REVISION = "0d9918f6b66eda0752f8c7d17c9a73a18ee32f98"
-+DRIFTLOCK_HARBOR_PATCH_VERSION = 11
++DRIFTLOCK_HARBOR_PATCH_VERSION = 14
 diff --git a/harbor/src/harbor/agents/terminus_2/terminus_2.py b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-index bcd0473..58e1e2d 100644
+index bcd04739f072760fe4635f4677190cf4c7c07bcf..231712b068946169687176f01dd28e192f1b4eb5 100644
 --- a/harbor/src/harbor/agents/terminus_2/terminus_2.py
 +++ b/harbor/src/harbor/agents/terminus_2/terminus_2.py
-@@ -1236,6 +1236,41 @@ so ask everything you need to know."""
+@@ -14,6 +14,10 @@ from tenacity import (
+     stop_after_attempt,
+ )
+ 
++from driftlock.terminal_quiescence import (
++    quiesce_terminal_after_timeout,
++    record_checkpoint_quiesce_outcome,
++)
+ from harbor.agents.base import BaseAgent
+ from harbor.agents.terminus_2.terminus_json_plain_parser import (
+     TerminusJSONPlainParser,
+@@ -1236,6 +1240,41 @@ so ask everything you need to know."""
              llm_response,
          )
  
@@ -54,7 +65,7 @@ index bcd0473..58e1e2d 100644
      async def _execute_commands(
          self,
          commands: list[Command],
-@@ -1250,14 +1285,48 @@ so ask everything you need to know."""
+@@ -1250,14 +1289,35 @@ so ask everything you need to know."""
          Returns:
              Tuple of (timeout_occurred, terminal_output)
          """
@@ -86,28 +97,15 @@ index bcd0473..58e1e2d 100644
 +                    max_timeout_sec=max(180.0, command.duration_sec),
                  )
              except TimeoutError:
-+                # A checkpoint boundary cannot observe or archive a workspace while
-+                # the accepted command is still changing it. Interrupt the timed-out
-+                # foreground job, then prove the replacement no-op reached the shell.
-+                await session.send_keys(
-+                    ["C-c"],
-+                    block=False,
-+                    min_timeout_sec=0.1,
++                recovery = await quiesce_terminal_after_timeout(
++                    session.send_keys,
++                    capture_pane=session.capture_pane,
 +                )
-+                try:
-+                    await session.send_keys(
-+                        [":", "Enter"],
-+                        block=True,
-+                        max_timeout_sec=10.0,
-+                    )
-+                except TimeoutError as error:
-+                    raise RuntimeError(
-+                        "timed-out command could not be quiesced for checkpointing"
-+                    ) from error
++                record_checkpoint_quiesce_outcome(self, recovery)
                  return True, self._timeout_template.format(
                      timeout_sec=command.duration_sec,
                      command=command.keystrokes,
-@@ -1413,6 +1482,15 @@ so ask everything you need to know."""
+@@ -1413,6 +1473,15 @@ so ask everything you need to know."""
                  f"Episode {episode}: {len(commands)} commands",
              )
  
@@ -124,7 +122,7 @@ index bcd0473..58e1e2d 100644
                  prompt = (
                      f"Previous response had parsing errors:\n{feedback}\n\n"
 diff --git a/harbor/src/harbor/agents/terminus_2/tmux_session.py b/harbor/src/harbor/agents/terminus_2/tmux_session.py
-index 74f836b..718b984 100644
+index 74f836b58b4c5b48dba5cf5720f43184b505ef30..718b98420829d66e2947ac7e35cb0f74a19374ec 100644
 --- a/harbor/src/harbor/agents/terminus_2/tmux_session.py
 +++ b/harbor/src/harbor/agents/terminus_2/tmux_session.py
 @@ -1,5 +1,6 @@
@@ -267,7 +265,7 @@ index 74f836b..718b984 100644
          else:
              await self._send_non_blocking_keys(
 diff --git a/harbor/src/harbor/llms/base.py b/harbor/src/harbor/llms/base.py
-index 6aae215..9f532e0 100644
+index 6aae21542a53e72abee2a462f0ab1c9fd360225b..9f532e0e79cf4fdf45e0e261d5b94c6e040d4d56 100644
 --- a/harbor/src/harbor/llms/base.py
 +++ b/harbor/src/harbor/llms/base.py
 @@ -46,9 +46,15 @@ class ContextLengthExceededError(Exception):
@@ -288,7 +286,7 @@ index 6aae215..9f532e0 100644
  
  class BaseLLM(ABC):
 diff --git a/harbor/src/harbor/llms/chat.py b/harbor/src/harbor/llms/chat.py
-index 51eddf3..c376ade 100644
+index 51eddf35295a25be253249905e05d9a9777bb607..c376ade902afaff7c54c4184224b480525fde860 100644
 --- a/harbor/src/harbor/llms/chat.py
 +++ b/harbor/src/harbor/llms/chat.py
 @@ -94,6 +94,17 @@ class Chat:
@@ -318,7 +316,7 @@ index 51eddf3..c376ade 100644
      def reset_response_chain(self) -> None:
          """Reset the response chain so the next call sends full message history.
 diff --git a/harbor/src/harbor/llms/lite_llm.py b/harbor/src/harbor/llms/lite_llm.py
-index 7442a5f..6d9a900 100644
+index 7442a5ff90944926ae35381b465ab2dbfac2c0cf..6d9a900fffe09a615d76b516cd95fe65a0940f03 100644
 --- a/harbor/src/harbor/llms/lite_llm.py
 +++ b/harbor/src/harbor/llms/lite_llm.py
 @@ -120,6 +120,8 @@ class LiteLLM(BaseLLM):
@@ -436,7 +434,7 @@ index 7442a5f..6d9a900 100644
 -        )
 +        return llm_response
 diff --git a/harbor/src/harbor/trial/trial.py b/harbor/src/harbor/trial/trial.py
-index 5c5dd7f..33af5ad 100644
+index 5c5dd7fd4fc64c1edf0364ccf5d4d4bcfb990e5b..33af5adb99ed1b20453d032a607e51dbd0767e43 100644
 --- a/harbor/src/harbor/trial/trial.py
 +++ b/harbor/src/harbor/trial/trial.py
 @@ -1169,6 +1169,11 @@ class Trial:
@@ -453,10 +451,10 @@ index 5c5dd7f..33af5ad 100644
      async def _run_verification(self) -> None:
 diff --git a/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
 new file mode 100644
-index 0000000..3b62108
+index 0000000000000000000000000000000000000000..05a6242e8df47b115fa01f871187850d5d26598d
 --- /dev/null
 +++ b/harbor/tests/unit/agents/terminus_2/test_driftlock_quiescence.py
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,503 @@
 +import os
 +import pty
 +import select
@@ -482,6 +480,9 @@ index 0000000..3b62108
 +
 +    async def get_incremental_output(self):
 +        return "terminal output"
++
++    async def capture_pane(self):
++        return "root@container:/app# "
 +
 +    async def is_session_alive(self):
 +        return True
@@ -656,7 +657,7 @@ index 0000000..3b62108
 +    assert "terminal output" in output
 +    assert session.calls[1:] == [
 +        (["C-c"], {"block": False, "min_timeout_sec": 0.1}),
-+        ([":", "Enter"], {"block": True, "max_timeout_sec": 10.0}),
++        ([":", "Enter"], {"block": True, "max_timeout_sec": 15.0}),
 +    ]
 +
 +
@@ -958,7 +959,7 @@ index 0000000..3b62108
 +    assert "could not parse the response as JSON" in reported
 +    assert "output limit" not in reported
 diff --git a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
-index 8dcd203..cc358f2 100644
+index 8dcd203f261a3feacb118c896333fc21e981e6d5..cc358f211455fcd7065830ce76a3272f6bf43630 100644
 --- a/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
 +++ b/harbor/tests/unit/agents/terminus_2/test_tmux_session.py
 @@ -139,7 +139,8 @@ async def test_send_non_blocking_keys_raises_on_failed_chunk(tmux_session):
@@ -994,7 +995,7 @@ index 8dcd203..cc358f2 100644
 +            completion_channel="driftlock-test-channel",
          )
 diff --git a/harbor/tests/unit/llms/test_chat.py b/harbor/tests/unit/llms/test_chat.py
-index b34b4fc..20cc6ac 100644
+index b34b4fcd68a8c0536decf46f5d97e4320210e8a5..20cc6ac638499c5d1fc910036073b1c50d70b437 100644
 --- a/harbor/tests/unit/llms/test_chat.py
 +++ b/harbor/tests/unit/llms/test_chat.py
 @@ -52,6 +52,31 @@ async def test_chat_tracks_response_id():
@@ -1030,7 +1031,7 @@ index b34b4fc..20cc6ac 100644
  async def test_chat_passes_previous_response_id():
      """Verify previous_response_id is passed as kwarg to model.call()."""
 diff --git a/harbor/tests/unit/llms/test_lite_llm.py b/harbor/tests/unit/llms/test_lite_llm.py
-index 03266fb..dcf3332 100644
+index 03266fb28ad152f68bbc0abc8161364b110e9de3..dcf33326a12a6e2c3d671b9b0930a49d338af00d 100644
 --- a/harbor/tests/unit/llms/test_lite_llm.py
 +++ b/harbor/tests/unit/llms/test_lite_llm.py
 @@ -349,6 +349,70 @@ async def test_litellm_responses_api_output_length_error(monkeypatch):

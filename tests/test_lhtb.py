@@ -521,6 +521,79 @@ async def test_runtime_records_parser_error_as_billed_boundary(
     assert boundary.conversation.next_prompt.startswith("Previous response")
 
 
+async def test_runtime_records_uncheckpointable_terminal_boundary(
+    fake_harbor_symbols: None,
+) -> None:
+    observer = FakeObserver()
+    runtime, agent, _, _ = _runtime(
+        [FakeResponse("timed out", FakeUsage(12, 8))], observer=observer
+    )
+    original_loop = agent._run_agent_loop
+
+    async def run_with_missed_handshake(*args: Any, **kwargs: Any) -> None:
+        await original_loop(*args, **kwargs)
+        agent._driftlock_boundary_uncheckpointable_reason = (
+            "checkpoint marker send raised TimeoutError; marker completion was not "
+            "observed; pane capture shows a shell prompt"
+        )
+
+    agent._run_agent_loop = run_with_missed_handshake  # type: ignore[method-assign]
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    boundary = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+
+    assert boundary.workspace_delta_observed is False
+    assert boundary.workspace_observation_error == (
+        "checkpoint marker send raised TimeoutError; marker completion was not "
+        "observed; pane capture shows a shell prompt"
+    )
+    assert boundary.changed_paths == ()
+    assert boundary.diff == ""
+    assert len(observer.snapshots) == 3
+
+
+async def test_runtime_observes_later_boundary_after_missed_handshake(
+    fake_harbor_symbols: None,
+) -> None:
+    observer = FakeObserver()
+    runtime, agent, _, _ = _runtime(
+        [
+            FakeResponse("timed out", FakeUsage(12, 8), observation="first"),
+            FakeResponse("continued", FakeUsage(13, 7), observation="second"),
+        ],
+        observer=observer,
+    )
+    original_loop = agent._run_agent_loop
+    loop_calls = 0
+
+    async def miss_only_first_boundary(*args: Any, **kwargs: Any) -> None:
+        nonlocal loop_calls
+        loop_calls += 1
+        await original_loop(*args, **kwargs)
+        if loop_calls == 1:
+            agent._driftlock_boundary_uncheckpointable_reason = (
+                "marker completion could not be established"
+            )
+
+    agent._run_agent_loop = miss_only_first_boundary  # type: ignore[method-assign]
+    prompt = await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+    first = await runtime.start(prompt=prompt, tokens_remaining=10_000)
+    second = await runtime.resume(
+        first.conversation,
+        prompt=first.conversation.next_prompt,
+        tokens_remaining=10_000,
+    )
+
+    assert first.workspace_delta_observed is False
+    assert first.workspace_observation_error == (
+        "marker completion could not be established"
+    )
+    assert second.workspace_delta_observed is True
+    assert second.workspace_observation_error is None
+    assert len(observer.snapshots) == 1
+
+
 async def test_runtime_preserves_harbor_two_response_completion_handshake(
     fake_harbor_symbols: None,
 ) -> None:
@@ -676,7 +749,7 @@ def test_packaged_harbor_patch_is_available() -> None:
 
     assert patch.is_file()
     text = patch.read_text()
-    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 11" in text
+    assert "DRIFTLOCK_HARBOR_PATCH_VERSION = 14" in text
     # The packaged patch writes the marker the installed module then verifies, so
     # bumping one without the other would ship a tree preflight always rejects.
     assert (
@@ -686,6 +759,7 @@ def test_packaged_harbor_patch_is_available() -> None:
     assert "_driftlock_finalize_after_agent_run" in text
     assert "cat >>" in text
     assert "block=True" in text
+    assert "record_checkpoint_quiesce_outcome(self, recovery)" in text
     assert "__driftlock_status=$?" not in text
     # A batch that cannot reach a shell boundary goes back to the model as
     # feedback; only the unreachable last line of defence still raises.

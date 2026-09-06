@@ -718,6 +718,15 @@ class LHTBDriftlockAgent(Terminus2):
         if result is None:
             record["status"] = "exception"
         else:
+            uncheckpointable_boundaries = [
+                {
+                    "sequence": step.sequence,
+                    "logical_step": step.logical_step,
+                    "reason": step.outcome.workspace_observation_error,
+                }
+                for step in result.steps
+                if not step.outcome.workspace_delta_observed
+            ]
             record.update(
                 {
                     "status": result.status.value,
@@ -739,6 +748,8 @@ class LHTBDriftlockAgent(Terminus2):
                     "rate_limited_calls": self._driftlock_rate_limited_calls(),
                 }
             )
+            if uncheckpointable_boundaries:
+                record["uncheckpointable_boundaries"] = uncheckpointable_boundaries
         injector = getattr(self, "_driftlock_skill_injector", None)
         if injector is not None:
             record["skill_injection"] = injector.phase_report()
