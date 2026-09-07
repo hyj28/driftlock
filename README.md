@@ -2,17 +2,24 @@
 
 **A self-evolving long-horizon coding agent that learns from its own scored checkpoints.**
 
-> 🚧 **Status: experimental.** The checkpoint, rollback, judge, checkpoint-scoring and
-> experiment-analysis layers are implemented and unit-tested, and five four-arm rounds
-> have run on LHTB. The skill layer is not yet written.
+> 🚧 **Status: the planned experiment is complete.** The checkpoint, rollback, judge,
+> checkpoint-scoring, skill-distillation, retrieval, injection, validation and admission layers
+> are implemented and unit-tested. A 170-trial paired validation ran to completion for $15.06.
 >
-> **One result so far, and it is negative.** Rollback can only help if an agent passes
-> through a state better than the one it ends in. Replaying every retained checkpoint
-> through the benchmark's own verifier — 44 replays, six tasks, zero token cost — found
-> that on one task in six, worth 9 points. See `PLAN.md` §2.3a for the numbers and the
-> boundaries. The rollback layer is a completed, measured component; it is not a claimed
-> improvement. What it left behind — the ability to score any intermediate state — is
-> the supervision signal the skill layer now uses.
+> **Two results, both negative, both measured.** Rollback can only help if an agent passes
+> through a state better than the one it ends in; replaying every retained checkpoint through
+> the benchmark's own verifier — 44 replays, six tasks, zero token cost — found that on one task
+> in six. And checkpoint-localized distillation shows **no advantage** over a whole-trajectory
+> baseline: within task, `localized − baseline` is −0.039 and +0.046 on the two tasks that
+> support the comparison, from one to three candidates per cell. The single admitted candidate
+> came from the *baseline* arm, against a chance expectation of 0.150 admissions across the
+> cohort.
+>
+> Six of fourteen candidates were never retrieved on the task they were distilled from, so they
+> never entered the test at all — a retrieval-calibration result, reported separately rather
+> than folded into the effect. See **[RESULTS.md](RESULTS.md)** for the numbers, the noise floor
+> every effect is read against, and what the measurement apparatus caught that I had already
+> written down and believed.
 
 ---
 
@@ -166,9 +173,10 @@ field measures at a 14.2% candidate pass rate.
 1. This project — a terminal coding agent with checkpointing, free checkpoint scoring,
    progress-aware rollback, and checkpoint-localized skill distillation. The rollback and
    scoring layers stay usable standalone around someone else's agent loop.
-2. A technical writeup: the drift curves, the transfer results, the candidate pass
-   rate against the 14.2% reference, failure-case analysis, and the judge design
-   tradeoffs
+2. A technical writeup — **delivered: [RESULTS.md](RESULTS.md)**. The candidate pass rate
+   against the 14.2% reference, the per-task noise floor every effect is read against, the
+   retrieval-calibration finding, failure-case analysis, and the five instrumentation defects
+   that were destroying paid measurements while looking like agent failures
 
 ## Core library quick start
 
