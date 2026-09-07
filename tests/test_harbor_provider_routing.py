@@ -949,6 +949,67 @@ def test_harbor_phase_record_writes_full_triggers_and_metadata_counts(
     assert empty_phase["unstable_checkpoint_count"] == 0
 
 
+def test_phase_records_persist_step_tool_audits(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    audit = {
+        "schema_version": 1,
+        "tool_call": {"id": "retrieval-1", "name": "retrieve_context"},
+        "result": {"status": "usable", "selected_document_count": 1},
+    }
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={"done": True},
+        steps=(
+            StepRecord(
+                sequence=3,
+                logical_step=2,
+                attempt=2,
+                outcome=StepOutcome(
+                    action="retrieve",
+                    state={},
+                    tool_audits=(audit,),
+                ),
+            ),
+        ),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=1,
+        agent_tokens_used=1,
+        judge_tokens_used=0,
+    )
+    expected = [
+        {
+            "sequence": 3,
+            "logical_step": 2,
+            "attempt": 2,
+            "audits": [audit],
+        }
+    ]
+
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+    agent._write_phase_record(result, tmp_path / "phase-0", retained=False)
+    harbor_phase = json.loads(
+        (tmp_path / "driftlock-result.json").read_text(encoding="utf-8")
+    )["phases"][0]
+
+    native = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    native.logs_dir = tmp_path
+    native._native_phases = []
+    native._native_retain_checkpoints = False
+    native._write_phase_record(result)
+    native_phase = json.loads(
+        (tmp_path / "driftlock-native-result.json").read_text(encoding="utf-8")
+    )["phases"][0]
+
+    assert harbor_phase["tool_audits"] == expected
+    assert native_phase["tool_audits"] == expected
+
+
 @pytest.mark.parametrize(
     ("failure_count", "expected_reliability"),
     [

@@ -12,13 +12,14 @@ import json
 import math
 import os
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from numbers import Real
 from pathlib import Path
-from statistics import median
+from statistics import NormalDist, median
 from typing import Any
 
 from driftlock.skill_admission import SkillLibrary
@@ -37,8 +38,8 @@ AGENTIC_RETRIEVAL_RULE_ID = "agent-query-adaptive-semantic-rank-v2"
 # turning a single exploratory query into a large prompt append.
 DEFAULT_MAX_RESULTS_PER_CALL = 4
 
-# Six thousand returned document characters matches the existing conservative
-# one-shot skill allowance while now covering both skills and source snippets.
+# Six thousand characters bounds both selected document text and the complete
+# serialized agent observation; audit-only diagnostics remain out of context.
 DEFAULT_MAX_CHARACTERS_PER_CALL = 6_000
 
 # Three full-size calls permit re-querying while fixing total document context at
@@ -73,13 +74,23 @@ DEFAULT_MAX_QUERY_CHARACTERS = 2_000
 # complete per-document decisions remain in the out-of-context step audit.
 DEFAULT_MAX_OBSERVATION_EXCLUSIONS = 20
 
+# A one-in-one-hundred-thousand family-wise null-match allowance makes semantic
+# retrieval conservative enough to abstain on unrelated MiniLM queries while the
+# resulting cosine floor still adapts to vector dimension and corpus size.
+DEFAULT_SEMANTIC_FALSE_MATCH_PROBABILITY = 0.00001
+
+# A largest semantic score gap must be at least twice the median positive gap to
+# identify a distinct cluster rather than manufacture one from ordinary noise.
+_SEMANTIC_GAP_DOMINANCE_FACTOR = 2.0
+
 # A tiny absolute tolerance distinguishes mathematical ties and cosine identity
 # from floating-point roundoff; it is never used as a relevance-score threshold.
 _SCORE_EQUALITY_TOLERANCE = 1e-12
 
-# Unicode alphanumeric runs deliberately stop at punctuation, hyphens, and
-# underscores.  Lexical evidence should match sentence-final words and either
-# component of a compound; embeddings remain the primary paraphrase mechanism.
+# NFC-normalized Unicode alphanumeric runs deliberately stop at punctuation,
+# hyphens, and underscores. Lexical evidence should match sentence-final words,
+# decomposed macOS filenames/text, and either component of a compound; embeddings
+# remain the primary paraphrase mechanism.
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 
 # These ubiquitous instruction words otherwise make unrelated task prose appear
@@ -120,7 +131,16 @@ DEFAULT_IGNORED_DIRECTORY_NAMES = frozenset(
 # Common credential filenames are excluded before opening a file; retrieval never
 # needs private-key or environment-secret contents to answer a code question.
 _SENSITIVE_FILE_NAMES = frozenset(
-    {".env", ".env.local", ".netrc", "credentials", "credentials.json", "id_rsa"}
+    {
+        ".env",
+        ".env.local",
+        ".git-credentials",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials",
+        "credentials.json",
+    }
 )
 
 
@@ -144,6 +164,7 @@ class AgenticRetrievalStatus(StrEnum):
     USABLE = "usable"
     FAILED = "failed"
     TASK_BUDGET_EXHAUSTED = "task_budget_exhausted"
+    TASK_BUDGET_INSUFFICIENT = "task_budget_insufficient"
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +181,7 @@ class AgenticRetrievalConfig:
     max_workspace_characters: int = DEFAULT_MAX_WORKSPACE_CHARACTERS
     max_query_characters: int = DEFAULT_MAX_QUERY_CHARACTERS
     max_observation_exclusions: int = DEFAULT_MAX_OBSERVATION_EXCLUSIONS
+    semantic_false_match_probability: float = DEFAULT_SEMANTIC_FALSE_MATCH_PROBABILITY
     ignored_directory_names: frozenset[str] = DEFAULT_IGNORED_DIRECTORY_NAMES
 
     def __post_init__(self) -> None:
@@ -185,6 +207,17 @@ class AgenticRetrievalConfig:
                 "workspace_chunk_overlap must be smaller than "
                 "workspace_chunk_characters"
             )
+        probability = self.semantic_false_match_probability
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, Real)
+            or not math.isfinite(float(probability))
+            or not 0.0 < float(probability) < 1.0
+        ):
+            raise ValueError(
+                "semantic_false_match_probability must be finite and in (0, 1)"
+            )
+        object.__setattr__(self, "semantic_false_match_probability", float(probability))
         ignored = self.ignored_directory_names
         if not isinstance(ignored, frozenset) or any(
             not isinstance(name, str) or not name or "/" in name or "\x00" in name
@@ -209,6 +242,8 @@ class AgenticRetrievalConfig:
             "max_workspace_files": self.max_workspace_files,
             "max_workspace_characters": self.max_workspace_characters,
             "max_query_characters": self.max_query_characters,
+            "max_observation_exclusions": self.max_observation_exclusions,
+            "semantic_false_match_probability": (self.semantic_false_match_probability),
             "ignored_directory_names": sorted(self.ignored_directory_names),
             "indexing_policy": (
                 "Skill entries index activation text only and return the complete "
@@ -217,14 +252,15 @@ class AgenticRetrievalConfig:
             ),
             "selection_policy": (
                 "A document is eligible through either non-stopword lexical overlap "
-                "with its indexed span or query-relative semantic separation. For "
-                "three or more documents, semantic evidence is the prefix above a "
-                "unique largest adjacent cosine gap that is larger than the median "
-                "gap; a flat or ambiguous distribution abstains. For two documents, "
-                "semantic evidence requires cosine identity because one gap cannot "
-                "establish a distribution; the same identity rule applies to a lone "
-                "document. Eligible documents rank by cosine, lexical coverage, and "
-                "stable document id. No global relevance-score threshold is used."
+                "with its indexed span or query-relative semantic separation. "
+                "Semantic evidence must first clear a family-wise geometric null "
+                "floor derived from embedding dimension, corpus size, and the "
+                "configured false-match probability. For three or more documents it "
+                "must also be in the prefix above a unique largest adjacent cosine "
+                "gap at least twice the median positive gap; a flat or ambiguous "
+                "distribution abstains. Eligible documents rank by cosine, lexical "
+                "coverage, and stable document id. No fixed global cosine threshold "
+                "is used."
             ),
             "requery_policy": (
                 "Queries are scored statelessly against the immutable corpus. A "
@@ -325,6 +361,7 @@ class AgenticRetrievalResult:
     corpus: Mapping[str, Any]
     task_characters_before: int
     task_characters_after: int
+    semantic_relevance_floor: float | None = None
     matches: tuple[RetrievedContext, ...] = ()
     considered: tuple[Mapping[str, Any], ...] = ()
     exclusion_reason_counts: Mapping[str, int] = field(default_factory=dict)
@@ -354,6 +391,7 @@ class AgenticRetrievalResult:
                 "fingerprint": self.config.fingerprint,
             },
             "corpus": dict(self.corpus),
+            "semantic_relevance_floor": self.semantic_relevance_floor,
             "considered_document_count": len(self.considered),
             "considered_documents": [dict(candidate) for candidate in self.considered],
             "selected_document_count": len(self.matches),
@@ -376,6 +414,11 @@ class AgenticRetrievalResult:
                         "per_call_character_cap", 0
                     ),
                 },
+                "observation_character_cap": {
+                    "limit": self.config.max_characters_per_call,
+                    "results_before_diagnostics": True,
+                    "serialization": "complete_json_never_mid_string_truncation",
+                },
                 "per_task_character_budget": {
                     "limit": self.config.max_characters_per_task,
                     "before": self.task_characters_before,
@@ -392,31 +435,95 @@ class AgenticRetrievalResult:
             report["refusal"] = dict(self.refusal)
         return report
 
-    def to_observation(self) -> str:
-        """Serialize bounded agent context while leaving full diagnostics in audit."""
+    def to_observation(self, *, max_characters: int | None = None) -> str:
+        """Serialize bounded JSON, allocating space to results before diagnostics."""
 
-        excluded = [
-            dict(candidate)
+        limit = self.config.max_characters_per_call
+        if max_characters is not None:
+            if (
+                not isinstance(max_characters, int)
+                or isinstance(max_characters, bool)
+                or max_characters <= 0
+            ):
+                raise ValueError("max_characters must be a positive integer or None")
+            limit = min(limit, max_characters)
+        excluded = tuple(
+            _observation_exclusion(candidate)
             for candidate in self.considered
             if candidate.get("outcome") == "excluded"
-        ]
+        )
+        results = [_observation_match(match, content="") for match in self.matches]
         payload: dict[str, Any] = {
             "schema_version": 1,
             "status": self.status.value,
             "query": self.query,
-            "results": [match.to_report() for match in self.matches],
+            "results": results,
             "considered_document_count": len(self.considered),
             "exclusion_reason_counts": dict(self.exclusion_reason_counts),
-            "exclusion_examples": excluded[: self.config.max_observation_exclusions],
-            "unreported_exclusion_count": max(
-                0,
-                len(excluded) - self.config.max_observation_exclusions,
-            ),
+            "exclusion_examples": [],
+            "unreported_exclusion_count": len(excluded),
             "limits": self.to_report()["limits"],
         }
+        observation_limit = payload["limits"]["observation_character_cap"]
+        observation_limit["limit"] = limit
+        # Start pessimistically so every content-allocation probe includes the
+        # longer boolean representation; clearing it later can only save space.
+        observation_limit["hit"] = True
         if self.refusal is not None:
             payload["refusal"] = dict(self.refusal)
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        query_omitted = False
+        if len(_observation_json(payload)) > limit:
+            payload["query"] = {
+                "sha256": self.query_sha256,
+                "character_count": len(self.query),
+                "text_omitted_for_observation_cap": True,
+            }
+            query_omitted = True
+        for index, match in enumerate(self.matches):
+            _allocate_result_content(payload, index, match.content, limit)
+        exclusions_omitted_for_character_cap = False
+        if all(result["content_omitted_character_count"] == 0 for result in results):
+            for exclusion in excluded[: self.config.max_observation_exclusions]:
+                payload["exclusion_examples"].append(exclusion)
+                payload["unreported_exclusion_count"] -= 1
+                if len(_observation_json(payload)) > limit:
+                    payload["exclusion_examples"].pop()
+                    payload["unreported_exclusion_count"] += 1
+                    exclusions_omitted_for_character_cap = True
+                    break
+        content_omitted = any(
+            result["content_omitted_character_count"] > 0 for result in results
+        )
+        observation_limit["hit"] = (
+            query_omitted or content_omitted or exclusions_omitted_for_character_cap
+        )
+        rendered = _observation_json(payload)
+        if len(rendered) <= limit:
+            return rendered
+        # Extremely small caller caps or unusually long origins can make even the
+        # normal compact schema impossible. Return a parseable failure rather than
+        # slicing JSON; the full result and origins remain in the step audit.
+        fallback = {
+            "schema_version": 1,
+            "status": AgenticRetrievalStatus.FAILED.value,
+            "results": [],
+            "refusal": {
+                "reason": "observation_character_cap_too_small",
+                "configured_limit": limit,
+            },
+        }
+        rendered = _observation_json(fallback)
+        if len(rendered) <= limit:
+            return rendered
+        minimal_failure = {
+            "status": AgenticRetrievalStatus.FAILED.value,
+            "results": [],
+            "error": "observation_character_cap_too_small",
+        }
+        rendered = _observation_json(minimal_failure)
+        if len(rendered) <= limit:
+            return rendered
+        return "{}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -765,7 +872,7 @@ class AgenticRetrievalTool:
             result = AgenticRetrievalResult(
                 status=AgenticRetrievalStatus.TASK_BUDGET_EXHAUSTED,
                 query=query,
-                query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+                query_sha256=_text_sha256(query),
                 config=self.corpus.config,
                 corpus=self.corpus.snapshot_report(),
                 task_characters_before=before,
@@ -784,7 +891,11 @@ class AgenticRetrievalTool:
         return result
 
     def record_rejected_attempt(
-        self, attempted_input: object, detail: str
+        self,
+        attempted_input: object,
+        detail: str,
+        *,
+        reason: str = "malformed_tool_arguments",
     ) -> AgenticRetrievalResult:
         """Record malformed tool arguments that could not reach normal retrieval."""
 
@@ -793,7 +904,7 @@ class AgenticRetrievalTool:
             _audit_input_text(attempted_input),
             before,
             {
-                "reason": "malformed_tool_arguments",
+                "reason": reason,
                 "stage": "input",
                 "detail": detail,
             },
@@ -807,7 +918,7 @@ class AgenticRetrievalTool:
         return AgenticRetrievalResult(
             status=AgenticRetrievalStatus.FAILED,
             query=query,
-            query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            query_sha256=_text_sha256(query),
             config=self.corpus.config,
             corpus=self.corpus.snapshot_report(),
             task_characters_before=before,
@@ -859,7 +970,14 @@ class AgenticRetrievalTool:
             )
             for document in documents
         ]
-        semantic_document_ids = _semantic_document_ids(scored)
+        semantic_floor = _semantic_relevance_floor(
+            dimension=len(query_vector),
+            candidate_count=len(scored),
+            false_match_probability=(
+                self.corpus.config.semantic_false_match_probability
+            ),
+        )
+        semantic_document_ids = _semantic_document_ids(scored, semantic_floor)
         eligible = sorted(
             (
                 item
@@ -923,6 +1041,7 @@ class AgenticRetrievalTool:
                 "indexed_span": document.indexed_span,
                 "similarity": similarity,
                 "similarity_rank": similarity_ranks[document.document_id],
+                "semantic_relevance_floor": semantic_floor,
                 "lexical_coverage": lexical_coverage,
                 "overlap_terms": sorted(overlap),
                 "outcome": (
@@ -940,19 +1059,24 @@ class AgenticRetrievalTool:
         )
         reason_counts = Counter(reasons.values())
         after = before + per_call_characters
-        task_budget_hit = reason_counts["per_task_character_budget"] > 0
+        task_budget_blocked = reason_counts["per_task_character_budget"] > 0
+        task_budget_exhausted = after >= self.corpus.config.max_characters_per_task
+        task_budget_hit = task_budget_blocked or task_budget_exhausted
+        if task_budget_exhausted:
+            status = AgenticRetrievalStatus.TASK_BUDGET_EXHAUSTED
+        elif task_budget_blocked:
+            status = AgenticRetrievalStatus.TASK_BUDGET_INSUFFICIENT
+        else:
+            status = AgenticRetrievalStatus.USABLE
         return AgenticRetrievalResult(
-            status=(
-                AgenticRetrievalStatus.TASK_BUDGET_EXHAUSTED
-                if task_budget_hit
-                else AgenticRetrievalStatus.USABLE
-            ),
+            status=status,
             query=query,
-            query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            query_sha256=_text_sha256(query),
             config=self.corpus.config,
             corpus=self.corpus.snapshot_report(),
             task_characters_before=before,
             task_characters_after=after,
+            semantic_relevance_floor=semantic_floor,
             matches=tuple(selected),
             considered=considered,
             exclusion_reason_counts=dict(sorted(reason_counts.items())),
@@ -968,7 +1092,7 @@ class AgenticRetrievalTool:
                         "task retrieval character budget"
                     ),
                 }
-                if task_budget_hit and not selected
+                if task_budget_blocked and not selected
                 else None
             ),
         )
@@ -977,7 +1101,7 @@ class AgenticRetrievalTool:
         return AgenticRetrievalResult(
             status=AgenticRetrievalStatus.USABLE,
             query=query,
-            query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            query_sha256=_text_sha256(query),
             config=self.corpus.config,
             corpus=self.corpus.snapshot_report(),
             task_characters_before=before,
@@ -986,39 +1110,33 @@ class AgenticRetrievalTool:
 
 
 def _terms(text: str) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFC", text)
     return frozenset(
         token
-        for token in (match.group(0).casefold() for match in _TOKEN.finditer(text))
+        for token in (
+            match.group(0).casefold() for match in _TOKEN.finditer(normalized)
+        )
         if len(token) > 1 and token not in _STOP_WORDS
     )
 
 
 def _semantic_document_ids(
     scored: Sequence[tuple[float, float, frozenset[str], _CorpusDocument]],
+    semantic_floor: float,
 ) -> frozenset[str]:
-    """Return the query-specific semantic cluster without a global score cut.
+    """Return a query-specific semantic cluster above a geometric null floor.
 
-    A heterogeneous corpus cannot share a meaningful absolute cosine threshold.
-    Instead, three-or-more-document corpora expose semantic evidence only when
-    their own ranked scores contain one unambiguous, above-median separation; the
-    prefix above that gap is the query's semantic cluster. Flat or equally gapped
-    distributions abstain. With fewer than three documents no gap distribution
-    exists, so only cosine identity is strong enough to stand alone. Lexical
-    evidence is an independent eligibility path in the caller, never a prerequisite.
+    A fixed cosine threshold cannot serve a heterogeneous corpus. The caller's
+    floor instead comes from vector dimension and a corpus-size-corrected null
+    probability, providing the non-scale-invariant evidence a pure gap rule lacks.
+    Three-or-more-document corpora additionally require one gap to dominate their
+    own positive-gap distribution. Lexical evidence remains an independent path.
     """
 
     ordered = sorted(scored, key=lambda item: (-item[0], item[3].document_id))
+    above_floor = tuple(item for item in ordered if item[0] >= semantic_floor)
     if len(ordered) < 3:
-        return frozenset(
-            document.document_id
-            for similarity, _coverage, _overlap, document in ordered
-            if math.isclose(
-                similarity,
-                1.0,
-                rel_tol=0.0,
-                abs_tol=_SCORE_EQUALITY_TOLERANCE,
-            )
-        )
+        return frozenset(item[3].document_id for item in above_floor)
     gaps = tuple(
         ordered[index][0] - ordered[index + 1][0] for index in range(len(ordered) - 1)
     )
@@ -1037,18 +1155,105 @@ def _semantic_document_ids(
     )
     if len(largest_positions) != 1:
         return frozenset()
-    if largest_gap <= median(gaps) + _SCORE_EQUALITY_TOLERANCE:
+    positive_gaps = tuple(gap for gap in gaps if gap > _SCORE_EQUALITY_TOLERANCE)
+    if not positive_gaps or largest_gap < (
+        _SEMANTIC_GAP_DOMINANCE_FACTOR * median(positive_gaps)
+    ):
         return frozenset()
     cluster_end = largest_positions[0] + 1
-    return frozenset(item[3].document_id for item in ordered[:cluster_end])
+    return frozenset(
+        item[3].document_id
+        for item in ordered[:cluster_end]
+        if item[0] >= semantic_floor
+    )
+
+
+def _semantic_relevance_floor(
+    *, dimension: int, candidate_count: int, false_match_probability: float
+) -> float:
+    """Approximate a family-wise cosine bound under an isotropic null model."""
+
+    per_candidate_tail = false_match_probability / max(1, candidate_count)
+    z_score = NormalDist().inv_cdf(1.0 - per_candidate_tail)
+    return min(1.0, z_score / math.sqrt(dimension))
 
 
 def _retrieval_basis(lexical_evidence: bool, semantic_evidence: bool) -> str:
     if lexical_evidence and semantic_evidence:
-        return "eligible through both lexical overlap and adaptive semantic separation"
+        return "eligible through both lexical overlap and the semantic relevance rule"
     if lexical_evidence:
         return "eligible through lexical overlap with the indexed span"
-    return "eligible through adaptive semantic separation without lexical overlap"
+    return "eligible through the semantic relevance rule without lexical overlap"
+
+
+def _observation_match(match: RetrievedContext, *, content: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "rank": match.rank,
+        "document_id": match.document_id,
+        "kind": match.kind.value,
+        "origin": match.origin,
+        "indexed_span": match.indexed_span,
+        "similarity": match.similarity,
+        "lexical_coverage": match.lexical_coverage,
+        "eligibility_evidence": {
+            "lexical_overlap": match.lexical_evidence,
+            "adaptive_semantic_separation": match.semantic_evidence,
+        },
+        "content": content,
+        "content_character_count": len(match.content),
+        "content_omitted_character_count": len(match.content) - len(content),
+    }
+    if match.chunk_start is not None:
+        result["chunk"] = {
+            "start_character": match.chunk_start,
+            "end_character": match.chunk_end,
+        }
+    return result
+
+
+def _observation_exclusion(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: candidate[key]
+        for key in (
+            "document_id",
+            "kind",
+            "origin",
+            "similarity",
+            "similarity_rank",
+            "reason",
+        )
+        if key in candidate
+    }
+
+
+def _allocate_result_content(
+    payload: dict[str, Any], result_index: int, content: str, limit: int
+) -> None:
+    results = payload["results"]
+    assert isinstance(results, list)
+    result = results[result_index]
+    assert isinstance(result, dict)
+    low = 0
+    high = len(content)
+    while low < high:
+        length = (low + high + 1) // 2
+        result["content"] = content[:length]
+        result["content_omitted_character_count"] = len(content) - length
+        if len(_observation_json(payload)) <= limit:
+            low = length
+        else:
+            high = length - 1
+    result["content"] = content[:low]
+    result["content_omitted_character_count"] = len(content) - low
+
+
+def _observation_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _audit_input_text(value: object) -> str:
@@ -1058,6 +1263,14 @@ def _audit_input_text(value: object) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _text_sha256(value: str) -> str:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _chunks(text: str, size: int, overlap: int) -> tuple[tuple[int, int, str], ...]:
@@ -1077,6 +1290,7 @@ def _sensitive_filename(filename: str) -> bool:
     return (
         lowered in _SENSITIVE_FILE_NAMES
         or lowered.startswith(".env.")
+        or (lowered.startswith("id_") and not lowered.endswith(".pub"))
         or lowered.endswith((".key", ".pem", ".p12", ".pfx"))
     )
 

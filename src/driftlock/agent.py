@@ -424,7 +424,10 @@ class ToolCallingAgent:
 
     async def _execute_tool(self, call: ToolCall, workspace: str) -> _ToolObservation:
         if call.name == "retrieve_context":
-            return self._retrieve_context(call)
+            try:
+                return self._retrieve_context(call)
+            except Exception as error:
+                return self._record_unexpected_retrieval_failure(call, error)
         try:
             arguments = _decode_arguments(call.arguments)
             if call.name == "run_shell":
@@ -594,10 +597,39 @@ class ToolCallingAgent:
         }
         return _ToolObservation(
             call,
-            _truncate(result.to_observation(), self.max_tool_output_chars),
+            result.to_observation(max_characters=self.max_tool_output_chars),
             error=malformed_error,
             audit=audit,
         )
+
+    def _record_unexpected_retrieval_failure(
+        self, call: ToolCall, error: Exception
+    ) -> _ToolObservation:
+        message = f"retrieve_context failed: {type(error).__name__}: {error}"
+        if self.retrieval_tool is None:
+            return _tool_error(call, message)
+        try:
+            result = self.retrieval_tool.record_rejected_attempt(
+                call.arguments,
+                message,
+                reason="retrieval_execution_failed",
+            )
+            audit = {
+                "schema_version": 1,
+                "tool_call": {
+                    "id": call.call_id,
+                    "name": call.name,
+                    "arguments": _json_safe(call.arguments),
+                },
+                "result": result.to_report(),
+            }
+            content = result.to_observation(max_characters=self.max_tool_output_chars)
+        except Exception as audit_error:
+            return _tool_error(
+                call,
+                f"{message}; retrieval failure audit also failed: {audit_error}",
+            )
+        return _ToolObservation(call, content, error=message, audit=audit)
 
     def _complete_task(
         self, call: ToolCall, arguments: dict[str, Any]

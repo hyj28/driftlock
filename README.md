@@ -43,6 +43,8 @@ own runs; the rest is what any capable agent needs.
 | Prompt-cache management | planned |
 | Output self-verification | planned |
 
+The optional `driftlock.st_embedder` module pins the real MiniLM model; installing `sentence-transformers` project-locally enables its integration test without changing retrieval's injected interface.
+
 ## The problem
 
 Agents fail differently on long tasks than on short ones. Frontier models solve

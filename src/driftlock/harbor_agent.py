@@ -753,6 +753,18 @@ class LHTBDriftlockAgent(Terminus2):
             )
             if uncheckpointable_boundaries:
                 record["uncheckpointable_boundaries"] = uncheckpointable_boundaries
+            tool_audits = [
+                {
+                    "sequence": step.sequence,
+                    "logical_step": step.logical_step,
+                    "attempt": step.attempt,
+                    "audits": [dict(audit) for audit in step.outcome.tool_audits],
+                }
+                for step in result.steps
+                if step.outcome.tool_audits
+            ]
+            if tool_audits:
+                record["tool_audits"] = tool_audits
         injector = getattr(self, "_driftlock_skill_injector", None)
         if injector is not None:
             record["skill_injection"] = injector.phase_report()
