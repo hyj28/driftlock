@@ -267,6 +267,7 @@ class DriftTriggerRecord:
     outcome: DriftTriggerOutcome
     rollback_checkpoint_id: str | None = None
     rollback_checkpoint_step: int | None = None
+    rollback_refusal_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.sequence <= 0:
@@ -334,6 +335,13 @@ class DriftTriggerRecord:
             raise ValueError(
                 "only a completed rollback may identify a target checkpoint"
             )
+        if self.rollback_refusal_reason is not None:
+            if not self.rollback_refusal_reason:
+                raise ValueError("rollback refusal reason cannot be empty")
+            if self.outcome is not DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED:
+                raise ValueError(
+                    "a rollback refusal reason requires a refused rollback outcome"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable JSON representation used by phase audit records."""
@@ -343,7 +351,7 @@ class DriftTriggerRecord:
                 "checkpoint_id": self.rollback_checkpoint_id,
                 "step": self.rollback_checkpoint_step,
             }
-        return {
+        payload: dict[str, Any] = {
             "sequence": self.sequence,
             "logical_step": self.logical_step,
             "signals": [
@@ -364,6 +372,9 @@ class DriftTriggerRecord:
             "outcome": self.outcome.value,
             "rollback_checkpoint": checkpoint,
         }
+        if self.rollback_refusal_reason is not None:
+            payload["rollback_refusal_reason"] = self.rollback_refusal_reason
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

@@ -1071,6 +1071,58 @@ async def test_before_restore_replaces_shell_and_verifies_cwd(
     )
 
 
+async def test_before_restore_requires_rejected_tree_quiescence() -> None:
+    environment = FakeEnvironment([RemoteResult(stderr="kill failed", return_code=1)])
+    runtime, agent, _, _ = _runtime([])
+    runtime.environment = environment
+    runtime._process_baseline = ("2:100",)
+    runtime._canonical_workspace = "/app"
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^failed to quiesce rejected tmux process tree: kill failed$",
+    ):
+        await runtime.before_workspace_restore("/app")
+
+    assert agent._session.stops == 1
+    assert agent._session.starts == 0
+
+
+async def test_before_restore_requires_replacement_shell_workspace_cwd() -> None:
+    environment = FakeEnvironment(
+        [
+            RemoteResult(),
+            RemoteResult(stderr="tmux query failed", return_code=1),
+        ]
+    )
+    runtime, agent, _, _ = _runtime([])
+    runtime.environment = environment
+    runtime._process_baseline = ("2:100",)
+    runtime._canonical_workspace = "/app"
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^failed to verify replacement tmux cwd: tmux query failed$",
+    ):
+        await runtime.before_workspace_restore("/app")
+
+    assert agent._session.stops == 1
+    assert agent._session.starts == 1
+
+
+async def test_prepare_start_requires_pre_agent_process_baseline() -> None:
+    runtime, _agent, _, _ = _runtime([])
+    runtime.environment = FakeEnvironment(
+        [RemoteResult(stderr="process scan failed", return_code=1)]
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^failed to capture pre-agent process baseline: process scan failed$",
+    ):
+        await runtime.prepare_start("task", plan="", rollback_feedback=None)
+
+
 def test_runtime_rejects_process_reward_tracker() -> None:
     agent = FakeAgent(FakeLLM([]))
     agent._process_reward_tracker = object()

@@ -194,10 +194,11 @@ class DriftlockRunner:
                     signals,
                     logical_step,
                 )
+                judge_checkpoint = rollback_checkpoint or checkpoint_lineage[0]
                 verdict = await self._judge(
                     goal=goal,
                     plan=plan,
-                    checkpoint=rollback_checkpoint,
+                    checkpoint=judge_checkpoint,
                     signals=signals,
                     recent_steps=recent_steps,
                     tokens_used=agent_tokens_used + judge_tokens_used,
@@ -211,7 +212,27 @@ class DriftlockRunner:
                     )
                 )
                 if should_rollback:
-                    if len(rollbacks) >= self.config.max_rollbacks:
+                    if rollback_checkpoint is None:
+                        # An unavailable rollback is recorded and declined. It is
+                        # not a delayed fatal error: the paid run keeps its current
+                        # workspace and may establish a later eligible checkpoint.
+                        coarse_triggers.append(
+                            self._trigger_record(
+                                record,
+                                signals,
+                                verdict,
+                                # Keep the stable serialized outcome vocabulary:
+                                # this existing refusal outcome also records a
+                                # rollback declined for restore-safety reasons.
+                                DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED,
+                                rollback_refusal_reason=(
+                                    "no restore-eligible checkpoint exists in the "
+                                    "rollback lineage"
+                                ),
+                            )
+                        )
+                        checkpoint_is_healthy = False
+                    elif len(rollbacks) >= self.config.max_rollbacks:
                         coarse_triggers.append(
                             self._trigger_record(
                                 record,
@@ -233,64 +254,70 @@ class DriftlockRunner:
                             logical_step=logical_step,
                             checkpointable=outcome.workspace_delta_observed,
                         )
-                    checkpoint = rollback_checkpoint
-                    state = await self._restore_checkpoint(checkpoint)
+                    else:
+                        checkpoint = rollback_checkpoint
+                        state = await self._restore_checkpoint(checkpoint)
+                        coarse_triggers.append(
+                            self._trigger_record(
+                                record,
+                                signals,
+                                verdict,
+                                DriftTriggerOutcome.ROLLED_BACK,
+                                rollback_checkpoint=checkpoint,
+                            )
+                        )
+                        rollbacks.append(
+                            RollbackRecord(
+                                sequence=sequence,
+                                checkpoint_id=checkpoint.checkpoint_id,
+                                signals=signals,
+                                reason=verdict.reason,
+                            )
+                        )
+                        logical_step = checkpoint.step
+                        attempt += 1
+                        checkpoint_index = checkpoint_lineage.index(checkpoint)
+                        checkpoint_lineage = checkpoint_lineage[: checkpoint_index + 1]
+                        recent_steps = list(
+                            checkpoint_histories[checkpoint.checkpoint_id]
+                        )
+                        rollback_feedback = verdict.reason
+                        if self._budget_exhausted(
+                            agent_tokens_used + judge_tokens_used
+                        ):
+                            return await self._finish(
+                                RunStatus.TOKEN_LIMIT,
+                                state,
+                                all_steps,
+                                rollbacks,
+                                coarse_triggers,
+                                checkpoints,
+                                agent_tokens_used,
+                                judge_tokens_used,
+                                current_checkpoint=checkpoint,
+                                logical_step=logical_step,
+                            )
+                        continue
+                else:
+                    failure_outcome = {
+                        FineJudgeStatus.FAILED: DriftTriggerOutcome.JUDGE_FAILED,
+                        FineJudgeStatus.BUDGET_EXHAUSTED: (
+                            DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED
+                        ),
+                    }.get(verdict.status)
                     coarse_triggers.append(
                         self._trigger_record(
                             record,
                             signals,
                             verdict,
-                            DriftTriggerOutcome.ROLLED_BACK,
-                            rollback_checkpoint=checkpoint,
+                            failure_outcome or DriftTriggerOutcome.VETOED,
                         )
                     )
-                    rollbacks.append(
-                        RollbackRecord(
-                            sequence=sequence,
-                            checkpoint_id=checkpoint.checkpoint_id,
-                            signals=signals,
-                            reason=verdict.reason,
-                        )
+                    checkpoint_is_healthy = (
+                        outcome.workspace_delta_observed
+                        and verdict.status is FineJudgeStatus.VERDICT
+                        and verdict.verdict is Verdict.HEALTHY
                     )
-                    logical_step = checkpoint.step
-                    attempt += 1
-                    checkpoint_index = checkpoint_lineage.index(checkpoint)
-                    checkpoint_lineage = checkpoint_lineage[: checkpoint_index + 1]
-                    recent_steps = list(checkpoint_histories[checkpoint.checkpoint_id])
-                    rollback_feedback = verdict.reason
-                    if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
-                        return await self._finish(
-                            RunStatus.TOKEN_LIMIT,
-                            state,
-                            all_steps,
-                            rollbacks,
-                            coarse_triggers,
-                            checkpoints,
-                            agent_tokens_used,
-                            judge_tokens_used,
-                            current_checkpoint=checkpoint,
-                            logical_step=logical_step,
-                        )
-                    continue
-                failure_outcome = {
-                    FineJudgeStatus.FAILED: DriftTriggerOutcome.JUDGE_FAILED,
-                    FineJudgeStatus.BUDGET_EXHAUSTED: (
-                        DriftTriggerOutcome.JUDGE_BUDGET_EXHAUSTED
-                    ),
-                }.get(verdict.status)
-                coarse_triggers.append(
-                    self._trigger_record(
-                        record,
-                        signals,
-                        verdict,
-                        failure_outcome or DriftTriggerOutcome.VETOED,
-                    )
-                )
-                checkpoint_is_healthy = (
-                    outcome.workspace_delta_observed
-                    and verdict.status is FineJudgeStatus.VERDICT
-                    and verdict.verdict is Verdict.HEALTHY
-                )
 
             if self._budget_exhausted(agent_tokens_used + judge_tokens_used):
                 return await self._finish(
@@ -412,6 +439,7 @@ class DriftlockRunner:
         outcome: DriftTriggerOutcome,
         *,
         rollback_checkpoint: Checkpoint | None = None,
+        rollback_refusal_reason: str | None = None,
     ) -> DriftTriggerRecord:
         judge_configured = self.fine_judge is not None
         return DriftTriggerRecord(
@@ -432,6 +460,7 @@ class DriftlockRunner:
             rollback_checkpoint_step=(
                 rollback_checkpoint.step if rollback_checkpoint is not None else None
             ),
+            rollback_refusal_reason=rollback_refusal_reason,
         )
 
     @staticmethod
@@ -439,14 +468,21 @@ class DriftlockRunner:
         checkpoint_lineage: list[Checkpoint],
         signals: tuple[DriftSignal, ...],
         logical_step: int,
-    ) -> Checkpoint:
+    ) -> Checkpoint | None:
         suspicious_start = logical_step - max(signal.lookback for signal in signals) + 1
         candidates = [
             checkpoint
             for checkpoint in checkpoint_lineage
             if checkpoint.step < suspicious_start
         ]
-        return candidates[-1] if candidates else checkpoint_lineage[0]
+        target = candidates[-1] if candidates else checkpoint_lineage[0]
+        target_index = checkpoint_lineage.index(target)
+        eligible_ancestors = [
+            checkpoint
+            for checkpoint in checkpoint_lineage[: target_index + 1]
+            if checkpoint.restorable
+        ]
+        return eligible_ancestors[-1] if eligible_ancestors else None
 
     async def _create_checkpoint(
         self,

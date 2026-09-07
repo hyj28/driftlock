@@ -432,7 +432,6 @@ test -d {tmp_dir}
 workspace_real=$(realpath -- {workspace})
 tmp_real=$(realpath -- {tmp_dir})
 printf '%s\n' "$workspace_real" "$tmp_real"
-find "$workspace_real" -type d -samefile "$tmp_real" -print -quit
 """
         result = await self._checked_exec(
             "sh -ceu " + shlex.quote(script),
@@ -449,14 +448,33 @@ find "$workspace_real" -type d -samefile "$tmp_real" -print -quit
         canonical_tmp = _validated_remote_path(
             lines[1], name="canonical remote_tmp_dir", allow_root=False
         )
-        alias_inside_workspace = lines[2] if len(lines) > 2 else ""
-        if (
-            _is_relative_to(canonical_tmp, canonical_workspace)
-            or alias_inside_workspace
-        ):
+        if _is_relative_to(canonical_tmp, canonical_workspace):
             raise ValueError(
                 "remote_tmp_dir resolves to or aliases a directory inside "
                 "remote_workspace"
+            )
+        alias_result = await self.environment.exec(
+            "find "
+            f"{shlex.quote(canonical_workspace)} -type d -samefile "
+            f"{shlex.quote(canonical_tmp)} -print0 -quit",
+            timeout_sec=self.timeout_sec,
+            user=self.user,
+        )
+        # Canonical containment and any positive same-inode match are hard safety
+        # failures. A walk that loses an entry to concurrent removal is safe to
+        # continue because that vanished entry cannot remain an alias; unreadable
+        # or otherwise uninspected live subtrees still fail the precondition.
+        if "\0" in (alias_result.stdout or ""):
+            raise ValueError(
+                "remote_tmp_dir resolves to or aliases a directory inside "
+                "remote_workspace"
+            )
+        if alias_result.return_code != 0 and not _path_walk_only_lost_entries(
+            alias_result
+        ):
+            _require_success(
+                alias_result,
+                operation="validate remote checkpoint path aliases",
             )
         self._canonical_workspace = canonical_workspace
         self._canonical_tmp_dir = canonical_tmp
@@ -568,14 +586,6 @@ _MISSING_EXIT_ONE_DIAGNOSTIC = "tar exited with code 1 without diagnostic output
 # noisy command to inflate every checkpoint manifest by an unbounded amount.
 _MAX_UNACCOUNTED_ARCHIVE_OUTPUT_CHARS = 8_192
 
-# GNU tar appends errors after the affected member name; seeing one of these
-# fragments inside a candidate path means suffix matching consumed a garbled error.
-_TAR_ERROR_PATH_FRAGMENTS = (
-    ": Cannot open:",
-    ": Cannot read:",
-    ": Cannot stat:",
-)
-
 
 @dataclass(frozen=True, slots=True)
 class _ArchiveCreationResult:
@@ -625,9 +635,7 @@ def _parse_file_changed_warnings(result: ExecResultLike) -> _ArchiveCreationResu
                     shrank = _FILE_SHRANK_SUFFIX.search(content)
                     if shrank is not None:
                         path = content[: shrank.start()].strip()
-            if path and not any(
-                fragment in path for fragment in _TAR_ERROR_PATH_FRAGMENTS
-            ):
+            if path and _is_archive_member_name(path):
                 if path not in paths:
                     paths.append(path)
             else:
@@ -659,6 +667,51 @@ def _bounded_unaccounted_archive_output(output: str) -> str:
     marker = "\n[unaccounted archive output truncated]"
     prefix_length = _MAX_UNACCOUNTED_ARCHIVE_OUTPUT_CHARS - len(marker)
     return output[:prefix_length] + marker
+
+
+def _is_archive_member_name(candidate: str) -> bool:
+    """Accept only normalized ``./relative`` names emitted by ``tar -C dir .``.
+
+    Control characters, traversal, nested ``tar: `` prefixes, and ``": "`` are
+    excluded. The latter is GNU tar's diagnostic separator; rejecting it also
+    deliberately rejects unusual but ambiguous filenames rather than restoring
+    an archive that may have silently omitted content.
+    """
+
+    if (
+        not candidate.startswith("./")
+        or len(candidate) <= 2
+        or ": " in candidate
+        or "tar: " in candidate
+        or any(ord(character) < 32 or ord(character) == 127 for character in candidate)
+    ):
+        return False
+    relative = candidate[2:]
+    path = PurePosixPath(relative)
+    return (
+        not path.is_absolute()
+        and path != PurePosixPath(".")
+        and ".." not in path.parts
+        and candidate == f"./{path}"
+    )
+
+
+def _path_walk_only_lost_entries(result: ExecResultLike) -> bool:
+    diagnostics = _diagnostic_streams(result)
+    if result.return_code != 1 or not diagnostics:
+        return False
+    lines = [
+        line.strip().lower()
+        for output in diagnostics
+        for line in output.splitlines()
+        if line.strip()
+    ]
+    return bool(lines) and all(
+        "no such file or directory" in line
+        or "not a directory" in line
+        or "stale file handle" in line
+        for line in lines
+    )
 
 
 def _diagnostic_output(result: ExecResultLike) -> str:

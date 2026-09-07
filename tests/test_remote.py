@@ -91,6 +91,27 @@ class MissingArchiveDownloadEnvironment(ArchiveResultEnvironment):
         raise FileNotFoundError(source_path)
 
 
+class PathWalkResultEnvironment(ArchiveResultEnvironment):
+    def __init__(
+        self,
+        archive_results: list[LocalExecResult],
+        path_walk_result: LocalExecResult,
+    ) -> None:
+        super().__init__(archive_results)
+        self.path_walk_result = path_walk_result
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> LocalExecResult:
+        if command.startswith("find "):
+            return self.path_walk_result
+        return await super().exec(command, timeout_sec=timeout_sec, user=user)
+
+
 class PartialApplyFailureEnvironment(LocalRemoteEnvironment):
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
@@ -625,6 +646,83 @@ async def test_garbled_error_suffix_is_not_absorbed_into_an_unstable_path(
 
 
 @pytest.mark.parametrize(
+    "warning",
+    [
+        (
+            "tar: ./build/priv: Cannot savedir: Permission denied: "
+            "file changed as we read it"
+        ),
+        (
+            "tar: ./x: Cannot add file: No space left on device: "
+            "file changed as we read it"
+        ),
+        (
+            "tar: /tmp/snap.tar.gz: Wrote only 4096 of 10240 bytes: "
+            "file changed as we read it"
+        ),
+        (
+            "tar: ./a: Cannot savedir: Permission deniedtar: ./b: "
+            "file changed as we read it"
+        ),
+    ],
+)
+async def test_only_positive_archive_member_shapes_become_unstable_paths(
+    tmp_path: Path, warning: str
+) -> None:
+    workspace, store, _environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, warning, None), LocalExecResult(1, warning, None)],
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    assert checkpoint.unstable_paths == ()
+    assert checkpoint.restore_status is CheckpointRestoreStatus.INELIGIBLE
+    assert checkpoint.unaccounted_archive_output == warning
+
+
+async def test_exit_one_without_diagnostics_is_not_restorable(tmp_path: Path) -> None:
+    workspace, store, environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, "", None), LocalExecResult(1, "", None)],
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    assert environment.archive_attempts == 2
+    assert checkpoint.unstable_paths == ()
+    assert checkpoint.restore_status is CheckpointRestoreStatus.INELIGIBLE
+    assert checkpoint.unaccounted_archive_output == (
+        "tar exited with code 1 without diagnostic output"
+    )
+
+
+@pytest.mark.parametrize(
+    "warning",
+    [
+        "tar: ./x: File shrank unexpectedly",
+        "tar: ./x: file changed as we read itX",
+    ],
+)
+async def test_concurrency_warning_matches_must_be_complete_suffixes(
+    tmp_path: Path, warning: str
+) -> None:
+    workspace, store, _environment = _remote_store_with_archive_results(
+        tmp_path,
+        [LocalExecResult(1, "", warning), LocalExecResult(1, "", warning)],
+    )
+    (workspace / "answer.txt").write_text("stable", encoding="utf-8")
+
+    checkpoint = await store.create({}, step=0)
+
+    assert checkpoint.unstable_paths == ()
+    assert checkpoint.restorable is False
+    assert checkpoint.unaccounted_archive_output == warning
+
+
+@pytest.mark.parametrize(
     ("output", "expected_unstable", "expected_unaccounted"),
     [
         (
@@ -756,11 +854,17 @@ async def test_restore_reloads_ineligible_status_from_the_manifest(
     )
     assert reconstructed.restorable is True
     (workspace / "answer.txt").write_text("live", encoding="utf-8")
+    before_restore_calls: list[str] = []
+
+    async def before_restore(path: str) -> None:
+        before_restore_calls.append(path)
+
     reopened_store = RemoteArchiveCheckpointStore(
         LocalRemoteEnvironment(),
         str(workspace),
         store.store_dir,
         remote_tmp_dir=str(tmp_path / "remote tmp"),
+        before_restore=before_restore,
     )
 
     with pytest.raises(RemoteCheckpointError) as raised:
@@ -769,8 +873,119 @@ async def test_restore_reloads_ineligible_status_from_the_manifest(
     assert "not eligible for restore" in str(raised.value)
     assert warning in str(raised.value)
     assert (workspace / "answer.txt").read_text(encoding="utf-8") == "live"
+    assert before_restore_calls == []
     with pytest.raises(ValueError, match="restorable checkpoint"):
         replace(checkpoint, restore_status=CheckpointRestoreStatus.ELIGIBLE)
+
+
+async def test_restore_rejects_in_memory_metadata_divergence(tmp_path: Path) -> None:
+    workspace, store = _remote_store(tmp_path)
+    (workspace / "answer.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    divergent = replace(
+        checkpoint,
+        restore_status=CheckpointRestoreStatus.INELIGIBLE,
+        unaccounted_archive_output="caller supplied an unrecorded warning",
+    )
+
+    with pytest.raises(SnapshotIntegrityError) as raised:
+        await store.restore(divergent)
+
+    assert str(raised.value) == (
+        f"checkpoint {checkpoint.checkpoint_id} restore metadata differs from its "
+        "manifest"
+    )
+
+
+async def test_restore_rejects_manifest_checkpoint_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _remote_store(tmp_path)
+    (workspace / "answer.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    manifest_path = checkpoint.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["checkpoint_id"] = "f" * 32
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotIntegrityError) as raised:
+        await store.restore(checkpoint)
+
+    assert str(raised.value) == (
+        f"checkpoint {checkpoint.checkpoint_id} identity differs from its manifest"
+    )
+
+
+async def test_restore_rejects_manifest_digest_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _remote_store(tmp_path)
+    (workspace / "answer.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    manifest_path = checkpoint.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["digest"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotIntegrityError) as raised:
+        await store.restore(checkpoint)
+
+    assert str(raised.value) == (
+        f"checkpoint {checkpoint.checkpoint_id} identity differs from its manifest"
+    )
+
+
+async def test_restore_rejects_eligible_manifest_with_unaccounted_output(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _remote_store(tmp_path)
+    (workspace / "answer.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({}, step=0)
+    manifest_path = checkpoint.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["unaccounted_archive_output"] = "tar: unexplained warning"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotIntegrityError) as raised:
+        await store.restore(checkpoint)
+
+    assert str(raised.value) == (
+        "checkpoint restore eligibility metadata is inconsistent"
+    )
+
+
+async def test_legacy_manifest_without_restore_status_remains_restorable(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _remote_store(tmp_path)
+    (workspace / "answer.txt").write_text("checkpoint", encoding="utf-8")
+    checkpoint = await store.create({"legacy": True}, step=0)
+    manifest_path = checkpoint.path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["restore_status"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (workspace / "answer.txt").write_text("live", encoding="utf-8")
+
+    state = await store.restore(checkpoint)
+
+    assert state == {"legacy": True}
+    assert (workspace / "answer.txt").read_text(encoding="utf-8") == "checkpoint"
+
+
+def test_non_restorable_checkpoint_requires_unaccounted_output(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as raised:
+        Checkpoint(
+            checkpoint_id="unsafe",
+            step=0,
+            created_at=datetime(2026, 9, 6, tzinfo=UTC),
+            digest="digest",
+            path=tmp_path / "unsafe",
+            restore_status=CheckpointRestoreStatus.INELIGIBLE,
+        )
+
+    assert str(raised.value) == (
+        "a non-restorable checkpoint needs unaccounted archive output"
+    )
 
 
 async def test_remote_checkpoint_round_trip_preserves_workspace_inode(
@@ -1009,6 +1224,72 @@ async def test_remote_path_validation_rejects_symlink_alias_inside_workspace(
 
     with pytest.raises(ValueError, match="aliases"):
         await store.create({}, step=0)
+
+
+async def test_remote_path_alias_walk_tolerates_only_vanished_entries(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    environment = PathWalkResultEnvironment(
+        [LocalExecResult(0, "", "")],
+        LocalExecResult(
+            1,
+            "",
+            f"find: '{workspace}/short-lived': No such file or directory",
+        ),
+    )
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+
+    checkpoint = await store.create({}, step=0)
+
+    assert checkpoint.restorable is True
+    assert environment.archive_attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("path_walk_result", "expected_message"),
+    [
+        (
+            LocalExecResult(1, "", "find: './private': Permission denied"),
+            "validate remote checkpoint path aliases failed with exit code 1: "
+            "find: './private': Permission denied",
+        ),
+        (
+            LocalExecResult(0, "/workspace/aliased-tmp\0", ""),
+            "remote_tmp_dir resolves to or aliases a directory inside remote_workspace",
+        ),
+    ],
+)
+async def test_remote_path_alias_walk_keeps_safety_failures_hard(
+    tmp_path: Path,
+    path_walk_result: LocalExecResult,
+    expected_message: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote-tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    environment = PathWalkResultEnvironment([], path_walk_result)
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+
+    with pytest.raises((RemoteCheckpointError, ValueError)) as raised:
+        await store.create({}, step=0)
+
+    assert str(raised.value) == expected_message
+    assert environment.archive_attempts == 0
 
 
 async def test_cancelled_restore_retains_host_and_remote_recovery(

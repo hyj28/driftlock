@@ -167,6 +167,49 @@ def test_load_remote_checkpoint_bundle_preserves_restore_ineligibility(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "expected_message"),
+    [
+        ("restore_status", "unknown", "checkpoint restore status is invalid"),
+        (
+            "unaccounted_archive_output",
+            7,
+            "checkpoint unaccounted archive output is invalid",
+        ),
+    ],
+)
+def test_load_remote_checkpoint_bundle_rejects_invalid_restore_metadata(
+    tmp_path: Path, field: str, value: object, expected_message: str
+) -> None:
+    directory = _checkpoint(tmp_path)
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(OracleCheckpointError) as raised:
+        load_remote_checkpoint_bundle(directory)
+
+    assert str(raised.value) == expected_message
+
+
+def test_load_remote_checkpoint_bundle_requires_output_for_ineligible_status(
+    tmp_path: Path,
+) -> None:
+    directory = _checkpoint(tmp_path)
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["restore_status"] = "ineligible"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(OracleCheckpointError) as raised:
+        load_remote_checkpoint_bundle(directory)
+
+    assert str(raised.value) == (
+        "checkpoint restore eligibility metadata is inconsistent"
+    )
+
+
 @pytest.mark.parametrize("name", ["workspace.tar.gz", "state.json", "manifest.json"])
 def test_load_remote_checkpoint_bundle_rejects_symlinked_inputs(
     tmp_path: Path, name: str

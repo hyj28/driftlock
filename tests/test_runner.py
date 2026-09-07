@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -8,6 +11,8 @@ from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import JudgeTokenBudgetExhausted
 from driftlock.models import (
+    Checkpoint,
+    CheckpointRestoreStatus,
     DriftContext,
     DriftSignal,
     DriftTriggerOutcome,
@@ -48,6 +53,44 @@ def _store(tmp_path: Path) -> tuple[Path, DirectoryCheckpointStore]:
     workspace.mkdir()
     (workspace / "answer.txt").write_text("healthy", encoding="utf-8")
     return workspace, DirectoryCheckpointStore(workspace, tmp_path / "snapshots")
+
+
+class RestoreEligibilityStore:
+    def __init__(
+        self,
+        delegate: DirectoryCheckpointStore,
+        restore_statuses: list[CheckpointRestoreStatus],
+    ) -> None:
+        self.delegate = delegate
+        self.restore_statuses = restore_statuses
+        self.restore_calls: list[str] = []
+
+    def create(
+        self,
+        state: Mapping[str, Any],
+        *,
+        step: int,
+        parent_id: str | None = None,
+        label: str | None = None,
+    ) -> Checkpoint:
+        checkpoint = self.delegate.create(
+            state,
+            step=step,
+            parent_id=parent_id,
+            label=label,
+        )
+        restore_status = self.restore_statuses.pop(0)
+        if restore_status is CheckpointRestoreStatus.ELIGIBLE:
+            return checkpoint
+        return replace(
+            checkpoint,
+            restore_status=CheckpointRestoreStatus.INELIGIBLE,
+            unaccounted_archive_output="tar: archive observation was incomplete",
+        )
+
+    def restore(self, checkpoint: Checkpoint) -> dict[str, Any]:
+        self.restore_calls.append(checkpoint.checkpoint_id)
+        return self.delegate.restore(checkpoint)
 
 
 def _quick_coarse_judge() -> HeuristicJudge:
@@ -743,6 +786,106 @@ async def test_rollback_limit_records_refused_trigger_without_a_rollback(
             "judge_budget_exhausted": 0,
         }
     }
+
+
+async def test_rollback_skips_ineligible_checkpoint_for_nearest_eligible_ancestor(
+    tmp_path: Path,
+) -> None:
+    workspace, delegate = _store(tmp_path)
+    store = RestoreEligibilityStore(
+        delegate,
+        [CheckpointRestoreStatus.ELIGIBLE, CheckpointRestoreStatus.INELIGIBLE],
+    )
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        if context.attempt == 2:
+            assert context.state == {"value": "initial"}
+            assert (workspace / "answer.txt").read_text(encoding="utf-8") == "healthy"
+            return StepOutcome(
+                action="finish from safe ancestor",
+                state={"value": "finished"},
+                completed=True,
+            )
+        if context.logical_step == 1:
+            (workspace / "answer.txt").write_text("accepted", encoding="utf-8")
+            return StepOutcome(
+                action="make progress",
+                state={"value": "accepted"},
+                changed_paths=("answer.txt",),
+            )
+        (workspace / "answer.txt").write_text("drifted", encoding="utf-8")
+        return StepOutcome(
+            action="fail",
+            state={"value": "drifted"},
+            changed_paths=("answer.txt",),
+            error="command failed",
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _single_error_coarse_judge(),
+        config=RunnerConfig(
+            max_steps=4,
+            max_rollbacks=1,
+            checkpoint_interval=1,
+            checkpoint_on_exit=False,
+        ),
+    ).run(
+        goal="finish safely",
+        step=agent_step,
+        initial_state={"value": "initial"},
+    )
+
+    assert result.status is RunStatus.COMPLETED
+    assert [checkpoint.restorable for checkpoint in result.checkpoints] == [True, False]
+    assert store.restore_calls == [result.checkpoints[0].checkpoint_id]
+    assert result.rollbacks[0].checkpoint_id == result.checkpoints[0].checkpoint_id
+    assert result.coarse_triggers[0].outcome is DriftTriggerOutcome.ROLLED_BACK
+    assert result.coarse_triggers[0].rollback_checkpoint_step == 0
+
+
+async def test_rollback_without_eligible_ancestor_is_declined_and_run_continues(
+    tmp_path: Path,
+) -> None:
+    _workspace, delegate = _store(tmp_path)
+    store = RestoreEligibilityStore(
+        delegate,
+        [CheckpointRestoreStatus.INELIGIBLE],
+    )
+
+    async def agent_step(context: StepContext) -> StepOutcome:
+        return StepOutcome(
+            action=f"continue {context.logical_step}",
+            state={"turn": context.logical_step},
+        )
+
+    result = await DriftlockRunner(
+        store,
+        _quick_coarse_judge(),
+        config=RunnerConfig(
+            max_steps=2,
+            max_rollbacks=1,
+            checkpoint_interval=5,
+            checkpoint_on_exit=False,
+        ),
+    ).run(goal="continue", step=agent_step, initial_state={})
+
+    assert result.status is RunStatus.STEP_LIMIT
+    assert result.state == {"turn": 2}
+    assert result.rollbacks == ()
+    assert store.restore_calls == []
+    assert len(result.coarse_triggers) == 1
+    trigger = result.coarse_triggers[0]
+    assert trigger.outcome is DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED
+    assert trigger.outcome.value == "rollback_limit_refused"
+    assert trigger.rollback_refusal_reason == (
+        "no restore-eligible checkpoint exists in the rollback lineage"
+    )
+    assert trigger.rollback_checkpoint_id is None
+    assert trigger.rollback_checkpoint_step is None
+    assert trigger.to_dict()["rollback_refusal_reason"] == (
+        "no restore-eligible checkpoint exists in the rollback lineage"
+    )
 
 
 async def test_signal_counts_split_upheld_and_vetoed_triggers(tmp_path: Path) -> None:
