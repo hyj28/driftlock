@@ -12,7 +12,7 @@ import math
 import re
 import shutil
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -62,7 +62,21 @@ DELTA_ABS_TOLERANCE = 1e-12
 NULL_CHANNEL_RATIONALE = (
     "No-skill-injected treatments were byte-identical to their controls, so "
     "their measured deltas are a run-to-run noise floor. Skill-injected effects "
-    "must be read against that noise floor, not against zero."
+    "must be read against that noise floor, not against zero. Because task "
+    "distributions can differ, channel contrasts are valid only within a task; "
+    "a pooled cross-task contrast with different task mixes is not reported."
+)
+
+# Older validation reports do not carry task metadata.  A visible label prevents
+# their observations from being dropped or silently merged with a recorded task.
+UNKNOWN_TASK_LABEL = "task unknown"
+
+# The two channels can contain different task mixtures, making a pooled mean
+# difference a task-composition artifact rather than an interpretable effect.
+NULL_CHANNEL_POOLING_INVALID_REASON = (
+    "The injected and no-skill-injected channels can contain different task "
+    "mixtures, so a pooled cross-task mean difference would confound channel "
+    "with task composition."
 )
 
 _SAFE_CANDIDATE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -76,6 +90,19 @@ class SkillAdmissionStatus(StrEnum):
     INCOMPLETE = "incomplete"
 
 
+class TaskMetadataCondition(StrEnum):
+    """How admission obtained a candidate's reporting-only task identity."""
+
+    DIRECT = "direct_candidate_metadata"
+    SUMMARY_RECORDED = "validation_observation_summary_recorded"
+    SUMMARY_ABSENT = "validation_observation_summary_missing"
+    SUMMARY_TASK_NULL = "validation_observation_summary_task_name_null"
+    SUMMARY_SOURCE_ABSENT = "validation_observation_summary_source_task_name_null"
+    TOP_LEVEL_FALLBACK_SUMMARY_ABSENT = "top_level_fallback_summary_missing"
+    TOP_LEVEL_FALLBACK_SUMMARY_TASK_NULL = "top_level_fallback_summary_task_null"
+    SUMMARY_TOP_LEVEL_DISAGREEMENT = "summary_top_level_task_name_disagreement"
+
+
 @dataclass(frozen=True, slots=True)
 class SkillAdmissionCandidate:
     """One distilled skill and its already-paired per-task reward deltas."""
@@ -85,6 +112,10 @@ class SkillAdmissionCandidate:
     skill: Skill
     paired_deltas: tuple[float | None, ...]
     injection_flags: tuple[bool | None, ...] | None = None
+    task_name: str | None = None
+    source_task_name: str | None = None
+    task_metadata_condition: TaskMetadataCondition = TaskMetadataCondition.DIRECT
+    top_level_task_name: str | None = None
 
     def __post_init__(self) -> None:
         _validate_candidate_id(self.candidate_id)
@@ -116,6 +147,22 @@ class SkillAdmissionCandidate:
                     f"{len(normalized)} paired deltas"
                 )
             object.__setattr__(self, "injection_flags", normalized_flags)
+        _validate_optional_task_name(self.task_name, self.candidate_id, "task_name")
+        _validate_optional_task_name(
+            self.source_task_name, self.candidate_id, "source_task_name"
+        )
+        _validate_optional_task_name(
+            self.top_level_task_name, self.candidate_id, "top_level_task_name"
+        )
+        if not isinstance(self.task_metadata_condition, TaskMetadataCondition):
+            try:
+                condition = TaskMetadataCondition(self.task_metadata_condition)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"candidate {self.candidate_id!r} has unknown task metadata "
+                    f"condition {self.task_metadata_condition!r}"
+                ) from None
+            object.__setattr__(self, "task_metadata_condition", condition)
 
 
 def decide_skill_admission(candidate: SkillAdmissionCandidate) -> dict[str, Any]:
@@ -230,22 +277,23 @@ def assemble_admission_report(
         decision["refusal"]["reason"] for decision in decisions if "refusal" in decision
     )
     expected_chance = tested * NULL_ADMISSION_PROBABILITY_UPPER_BOUND
-    null_observations = [
-        (delta, flag)
-        for candidate in candidates
-        for delta, flag in zip(
-            candidate.paired_deltas,
-            candidate.injection_flags
-            if candidate.injection_flags is not None
-            else (None,) * len(candidate.paired_deltas),
-            strict=True,
-        )
-    ]
-    null_channel = build_null_channel_summary(
-        null_observations,
-        injection_data_available=any(
-            candidate.injection_flags is not None for candidate in candidates
-        ),
+    retrieval_split = _retrieval_split(candidates, decisions)
+    null_channel = _task_null_channel_summary(candidates, decisions)
+    if retrieval_split["availability"] == "unavailable":
+        pass_rate_numerator = admitted
+        pass_rate_denominator = tested
+        pass_rate_denominator_description = "all_complete_candidates"
+    else:
+        pass_rate_numerator = retrieval_split["retrieved_admitted_candidate_count"]
+        pass_rate_denominator = retrieval_split["retrieved_candidate_count"]
+        pass_rate_denominator_description = "retrieved_complete_candidates"
+    pass_rate = (
+        pass_rate_numerator / pass_rate_denominator if pass_rate_denominator else None
+    )
+    admitted_outside_pass_rate_denominator = (
+        admitted - pass_rate_numerator
+        if pass_rate_denominator_description == "retrieved_complete_candidates"
+        else 0
     )
     cohort_context = {
         "tested_candidate_count": tested,
@@ -261,7 +309,7 @@ def assemble_admission_report(
         if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
             decision["admission_context"]["cohort"] = cohort_context
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "skill-admission",
         "rule": _rule_report(),
         "submitted_candidate_count": len(decisions),
@@ -269,7 +317,14 @@ def assemble_admission_report(
         "incomplete_candidate_count": statuses[SkillAdmissionStatus.INCOMPLETE.value],
         "admitted_candidate_count": admitted,
         "rejected_candidate_count": statuses[SkillAdmissionStatus.REJECTED.value],
-        "pass_rate": admitted / tested if tested else None,
+        "pass_rate": pass_rate,
+        "pass_rate_numerator": pass_rate_numerator,
+        "pass_rate_denominator": pass_rate_denominator,
+        "pass_rate_denominator_description": pass_rate_denominator_description,
+        "admitted_outside_pass_rate_denominator_count": (
+            admitted_outside_pass_rate_denominator
+        ),
+        "retrieval_split": retrieval_split,
         "refusal_reason_counts": dict(sorted(reasons.items())),
         "null_channel": null_channel,
         "multiple_comparisons": {
@@ -309,20 +364,83 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
     incomplete = report["incomplete_candidate_count"]
     pass_rate = report["pass_rate"]
     rate_text = "not defined" if pass_rate is None else f"{pass_rate:.1%}"
+    pass_rate_numerator = report.get("pass_rate_numerator", admitted)
+    pass_rate_denominator = report.get("pass_rate_denominator", tested)
+    pass_rate_denominator_description = report.get(
+        "pass_rate_denominator_description", "all_complete_candidates"
+    )
     multiple = report["multiple_comparisons"]
     field = report["field_reference"]
     null_probability = multiple[
         "single_candidate_null_admission_probability_upper_bound"
     ]
-    lines = [
-        (
+    retrieval_split = report.get("retrieval_split")
+    if isinstance(retrieval_split, Mapping):
+        retrieval_unavailable = retrieval_split["availability"] == "unavailable"
+        denominator_label = (
+            "all complete candidates"
+            if pass_rate_denominator_description == "all_complete_candidates"
+            else "retrieved complete candidates"
+        )
+        headline = (
+            f"tested {tested} complete candidate(s); admitted {admitted} admission "
+            "verdict(s); "
+            f"rejected {report['rejected_candidate_count']}; incomplete "
+            f"{incomplete}; retrieval split among complete candidates: never "
+            f"retrieved {retrieval_split['never_retrieved_candidate_count']}; "
+            "retrieved and unhelpful "
+            f"{retrieval_split['retrieved_and_unhelpful_candidate_count']}; "
+            f"retrieved and admitted "
+            f"{retrieval_split['retrieved_admitted_candidate_count']}; "
+            f"retrieval unknown "
+            f"{retrieval_split['unknown_retrieval_candidate_count']}"
+        )
+        if retrieval_unavailable:
+            headline += "; retrieval could not be determined"
+        elif retrieval_split["availability"] == "partial":
+            headline += (
+                "; retrieval could not be determined for "
+                f"{retrieval_split['unknown_retrieval_candidate_count']} complete "
+                "candidate(s)"
+            )
+        headline += (
+            f"; pass rate {pass_rate_numerator}/{pass_rate_denominator} "
+            f"({rate_text}) among {denominator_label}"
+        )
+        admitted_outside_denominator = report.get(
+            "admitted_outside_pass_rate_denominator_count",
+            admitted - retrieval_split["retrieved_admitted_candidate_count"]
+            if pass_rate_denominator_description == "retrieved_complete_candidates"
+            else 0,
+        )
+        if admitted_outside_denominator:
+            headline += (
+                "; admitted outside the retrieval pass-rate denominator "
+                f"{admitted_outside_denominator} "
+                f"(never retrieved "
+                f"{retrieval_split['never_retrieved_admitted_candidate_count']}, "
+                "retrieval unknown "
+                f"{retrieval_split['unknown_retrieval_admitted_candidate_count']})"
+            )
+        headline += (
+            "; field "
+            f"reference {field['admitted_candidate_count']}/"
+            f"{field['tested_candidate_count']} ({field['pass_rate']:.1%}) under "
+            "a different validation filter (not like-for-like)"
+        )
+    else:
+        # Schema-version-1 inputs lack retrieval flags.  Preserve their headline
+        # while newer reports expose the effective retrieval denominator above.
+        headline = (
             f"tested {tested} complete candidate(s); admitted {admitted}; "
             f"rejected {report['rejected_candidate_count']}; incomplete "
             f"{incomplete}; pass rate {rate_text}; field reference "
             f"{field['admitted_candidate_count']}/{field['tested_candidate_count']} "
             f"({field['pass_rate']:.1%}) under a different validation filter "
             "(not like-for-like)"
-        ),
+        )
+    lines = [
+        headline,
         (
             "all-null chance expectation: at most "
             f"{multiple['all_null_expected_chance_admissions_upper_bound']:.3f} "
@@ -336,7 +454,80 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
         ),
     ]
     null_channel = report.get("null_channel")
-    if (
+    if isinstance(null_channel, Mapping) and isinstance(
+        null_channel.get("per_task"), list
+    ):
+        if null_channel.get("availability") == "unavailable":
+            if null_channel.get("unavailability_reason") == "injection_flags_unknown":
+                lines.append(
+                    "null channel: unavailable (per-observation injection flags "
+                    "were recorded, but all measured values are unknown)"
+                )
+            else:
+                lines.append(
+                    "null channel: unavailable (per-observation injection flags "
+                    "were not recorded)"
+                )
+            lines.append(f"null channel rationale: {null_channel['rationale']}")
+        else:
+            lines.append(f"null channel: {null_channel['rationale']}")
+        lines.append(
+            "null channel totals: "
+            f"{null_channel['measured_observation_count']} measured observation(s) "
+            f"across {null_channel['task_count']} task(s); no pooled cross-task "
+            f"contrast is reported: {null_channel['pooling']['reason']}"
+        )
+        lines.append(
+            "null channel observation scope: "
+            f"{null_channel['observation_scope']['note']}"
+        )
+        for task_group in null_channel["per_task"]:
+            task_label = task_group["task_label"]
+            if task_group["task_identity"] == "unknown":
+                lines.append(f"  {task_label} ({task_group['identity_condition']}):")
+            else:
+                lines.append(f"  task {task_label}:")
+            if task_group["identity_condition"] != (
+                "fully_qualified_task_identity_recorded"
+            ):
+                lines.append(
+                    f"    task identity condition: {task_group['identity_condition']}"
+                )
+            nonstandard_metadata = [
+                condition
+                for condition in task_group["task_metadata_conditions"]
+                if condition
+                not in {
+                    TaskMetadataCondition.DIRECT.value,
+                    TaskMetadataCondition.SUMMARY_RECORDED.value,
+                }
+            ]
+            if nonstandard_metadata:
+                lines.append(
+                    f"    task metadata condition(s): {', '.join(nonstandard_metadata)}"
+                )
+            if task_group["availability"] == "unavailable":
+                lines.append(
+                    "    channels unavailable: per-observation injection flags "
+                    "are not known on this task"
+                )
+            else:
+                _append_channel_group_lines(lines, task_group, indent="    ")
+            contrast = task_group["within_task_contrast"]
+            if contrast["availability"] == "available":
+                lines.append(
+                    "    within-task difference (skill injected minus no skill "
+                    "injected): "
+                    f"{contrast['injected_minus_no_skill_mean_delta']:+.6g}"
+                )
+            else:
+                lines.append(f"    {contrast['detail']}")
+            if task_group["unknown_injection_observation_count"]:
+                lines.append(
+                    "    measured observations with unknown injection: "
+                    f"{task_group['unknown_injection_observation_count']}"
+                )
+    elif (
         not isinstance(null_channel, Mapping)
         or null_channel.get("availability") == "unavailable"
     ):
@@ -357,26 +548,7 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
             )
     else:
         lines.append(f"null channel: {null_channel['rationale']}")
-        for group_name, label in (
-            ("no_skill_injected", "no skill injected (noise floor)"),
-            ("skill_injected", "skill injected"),
-        ):
-            group = null_channel[group_name]
-            mean = (
-                "unavailable"
-                if group["mean_delta"] is None
-                else f"{group['mean_delta']:+.6g}"
-            )
-            sample_sd = (
-                "null"
-                if group["sample_standard_deviation"] is None
-                else f"{group['sample_standard_deviation']:.6g}"
-            )
-            lines.append(
-                f"  {label}: n={group['n']}, mean={mean}, sample sd={sample_sd}, "
-                f"signs +{group['positive_count']} / 0:{group['zero_count']} / "
-                f"-{group['negative_count']}"
-            )
+        _append_channel_group_lines(lines, null_channel, indent="  ")
         if null_channel["unknown_injection_observation_count"]:
             lines.append(
                 "  measured observations with unknown injection: "
@@ -603,6 +775,8 @@ def load_admission_candidates(path: Path | str) -> list[SkillAdmissionCandidate]
         document = raw.get("skill")
         deltas = raw.get("paired_deltas")
         raw_injection_flags = raw.get("injection_flags")
+        raw_observation_summary = raw.get("validation_observation_summary")
+        top_level_task_name = raw.get("task_name")
         if not isinstance(candidate_id, str) or not isinstance(arm, str):
             raise ValueError(f"skill admission candidate {index} needs text id and arm")
         if not isinstance(document, str):
@@ -621,6 +795,30 @@ def load_admission_candidates(path: Path | str) -> list[SkillAdmissionCandidate]
                 f"skill admission candidate {candidate_id!r} injection_flags "
                 "must be a list or null"
             )
+        if raw_observation_summary is not None and not isinstance(
+            raw_observation_summary, dict
+        ):
+            raise ValueError(
+                f"skill admission candidate {candidate_id!r} validation "
+                "observation summary must be an object or null"
+            )
+        if top_level_task_name is not None and not isinstance(top_level_task_name, str):
+            raise ValueError(
+                f"skill admission candidate {candidate_id!r} top-level task_name "
+                "must be text or null"
+            )
+        if raw_observation_summary is not None:
+            for field_name in ("task_name", "source_task_name"):
+                field_value = raw_observation_summary.get(field_name)
+                if field_value is not None and not isinstance(field_value, str):
+                    raise ValueError(
+                        f"skill admission candidate {candidate_id!r} validation "
+                        f"observation {field_name} must be text or null"
+                    )
+        task_name, source_task_name, task_metadata_condition = _load_task_metadata(
+            raw_observation_summary,
+            top_level_task_name,
+        )
         candidates.append(
             SkillAdmissionCandidate(
                 candidate_id=candidate_id,
@@ -632,6 +830,10 @@ def load_admission_candidates(path: Path | str) -> list[SkillAdmissionCandidate]
                     if raw_injection_flags is not None
                     else None
                 ),
+                task_name=task_name,
+                source_task_name=source_task_name,
+                task_metadata_condition=task_metadata_condition,
+                top_level_task_name=top_level_task_name,
             )
         )
     return candidates
@@ -647,6 +849,61 @@ def write_admission_report(path: Path | str, report: Mapping[str, Any]) -> None:
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     temporary.replace(destination)
+
+
+def _load_task_metadata(
+    observation_summary: Mapping[str, Any] | None,
+    top_level_task_name: str | None,
+) -> tuple[str | None, str | None, TaskMetadataCondition]:
+    if observation_summary is None:
+        if top_level_task_name is None:
+            return None, None, TaskMetadataCondition.SUMMARY_ABSENT
+        return (
+            top_level_task_name,
+            top_level_task_name,
+            TaskMetadataCondition.TOP_LEVEL_FALLBACK_SUMMARY_ABSENT,
+        )
+
+    summary_task_name = observation_summary.get("task_name")
+    summary_source_task_name = observation_summary.get("source_task_name")
+    if summary_task_name is None:
+        if top_level_task_name is None:
+            return (
+                None,
+                summary_source_task_name,
+                TaskMetadataCondition.SUMMARY_TASK_NULL,
+            )
+        return (
+            top_level_task_name,
+            summary_source_task_name or top_level_task_name,
+            TaskMetadataCondition.TOP_LEVEL_FALLBACK_SUMMARY_TASK_NULL,
+        )
+
+    if summary_source_task_name is None and top_level_task_name is None:
+        return (
+            summary_task_name,
+            None,
+            TaskMetadataCondition.SUMMARY_SOURCE_ABSENT,
+        )
+    source_task_name = summary_source_task_name or top_level_task_name
+    if top_level_task_name is not None and not (
+        _task_names_compatible(
+            _normalize_task_name(top_level_task_name),
+            _normalize_task_name(summary_task_name),
+        )
+        or _task_names_compatible(
+            _normalize_task_name(top_level_task_name),
+            _normalize_task_name(source_task_name),
+        )
+        or _task_names_compatible(
+            _normalize_task_name(source_task_name),
+            _normalize_task_name(top_level_task_name),
+        )
+    ):
+        condition = TaskMetadataCondition.SUMMARY_TOP_LEVEL_DISAGREEMENT
+    else:
+        condition = TaskMetadataCondition.SUMMARY_RECORDED
+    return summary_task_name, source_task_name, condition
 
 
 def _rule_report() -> dict[str, Any]:
@@ -669,12 +926,240 @@ def _rule_report() -> dict[str, Any]:
     }
 
 
+def _task_null_channel_summary(
+    candidates: Sequence[SkillAdmissionCandidate],
+    decisions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    grouped: dict[str, list[tuple[SkillAdmissionCandidate, Mapping[str, Any]]]] = {}
+    for candidate, decision in zip(candidates, decisions, strict=True):
+        grouped.setdefault(_task_identity_key(candidate), []).append(
+            (candidate, decision)
+        )
+
+    per_task = []
+    for identity_key in sorted(grouped):
+        members = grouped[identity_key]
+        observations = [
+            (delta, flag)
+            for candidate, _ in members
+            for delta, flag in zip(
+                candidate.paired_deltas,
+                candidate.injection_flags
+                if candidate.injection_flags is not None
+                else (None,) * len(candidate.paired_deltas),
+                strict=True,
+            )
+        ]
+        flat = _flat_null_channel_summary(
+            observations,
+            injection_data_available=any(
+                candidate.injection_flags is not None for candidate, _ in members
+            ),
+        )
+        identity = _task_identity_report(
+            [candidate for candidate, _ in members], identity_key
+        )
+        per_task.append(
+            {
+                **identity,
+                "candidate_count": len(members),
+                "complete_candidate_count": sum(
+                    decision["status"] != SkillAdmissionStatus.INCOMPLETE.value
+                    for _, decision in members
+                ),
+                "incomplete_candidate_count": sum(
+                    decision["status"] == SkillAdmissionStatus.INCOMPLETE.value
+                    for _, decision in members
+                ),
+                "availability": flat["availability"],
+                "unavailability_reason": flat.get("unavailability_reason"),
+                "unknown_injection_observation_count": flat[
+                    "unknown_injection_observation_count"
+                ],
+                "no_skill_injected": flat["no_skill_injected"],
+                "skill_injected": flat["skill_injected"],
+                "within_task_contrast": _within_task_contrast(flat),
+            }
+        )
+
+    all_observations = [
+        (delta, flag)
+        for candidate in candidates
+        for delta, flag in zip(
+            candidate.paired_deltas,
+            candidate.injection_flags
+            if candidate.injection_flags is not None
+            else (None,) * len(candidate.paired_deltas),
+            strict=True,
+        )
+    ]
+    measured_count = sum(delta is not None for delta, _ in all_observations)
+    unknown_count = sum(
+        delta is not None and flag is None for delta, flag in all_observations
+    )
+    known_count = measured_count - unknown_count
+    injection_data_available = any(
+        candidate.injection_flags is not None for candidate in candidates
+    )
+    if not injection_data_available:
+        availability = "unavailable"
+        unavailability_reason = "injection_flags_not_recorded"
+    elif not known_count and unknown_count:
+        availability = "unavailable"
+        unavailability_reason = "injection_flags_unknown"
+    else:
+        availability = "partial" if unknown_count else "available"
+        unavailability_reason = None
+    incomplete_observation_count = sum(
+        delta is not None
+        for candidate, decision in zip(candidates, decisions, strict=True)
+        if decision["status"] == SkillAdmissionStatus.INCOMPLETE.value
+        for delta in candidate.paired_deltas
+    )
+    return {
+        "schema_version": 2,
+        "availability": availability,
+        "unavailability_reason": unavailability_reason,
+        "rationale": NULL_CHANNEL_RATIONALE,
+        "measured_observation_count": measured_count,
+        "unknown_injection_observation_count": unknown_count,
+        "task_count": len(per_task),
+        "observation_scope": {
+            "includes_incomplete_candidates": True,
+            "incomplete_candidate_measured_observation_count": (
+                incomplete_observation_count
+            ),
+            "note": (
+                "Channel statistics include every measured paired observation, "
+                "including observations from incomplete candidates. Their counts "
+                "therefore need not equal tested_candidate_count multiplied by "
+                f"{VALIDATION_TASK_COUNT}."
+            ),
+        },
+        "pooling": {
+            "cross_task_contrast": "not_reported",
+            "reason": NULL_CHANNEL_POOLING_INVALID_REASON,
+        },
+        "per_task": per_task,
+    }
+
+
+def _task_identity_key(candidate: SkillAdmissionCandidate) -> str:
+    if candidate.source_task_name is not None:
+        return f"recorded:{_normalize_task_name(candidate.source_task_name)}"
+    if candidate.task_name is not None:
+        return (
+            f"unqualified:{_normalize_task_name(candidate.task_name)}:"
+            f"{candidate.candidate_id}"
+        )
+    return f"unknown:{candidate.task_metadata_condition.value}"
+
+
+def _task_identity_report(
+    candidates: Sequence[SkillAdmissionCandidate], identity_key: str
+) -> dict[str, Any]:
+    source_names = _distinct_task_names(
+        candidate.source_task_name for candidate in candidates
+    )
+    task_names = _distinct_task_names(candidate.task_name for candidate in candidates)
+    top_level_names = _distinct_task_names(
+        candidate.top_level_task_name for candidate in candidates
+    )
+    metadata_conditions = sorted(
+        {candidate.task_metadata_condition.value for candidate in candidates}
+    )
+    if identity_key.startswith("unknown:"):
+        unknown_reason = identity_key.removeprefix("unknown:")
+        return {
+            "task_identity": "unknown",
+            "task_label": UNKNOWN_TASK_LABEL,
+            "task_name": None,
+            "source_task_name": None,
+            "task_names": [],
+            "source_task_names": [],
+            "top_level_task_names": top_level_names,
+            "task_metadata_conditions": metadata_conditions,
+            "identity_condition": unknown_reason,
+        }
+    if identity_key.startswith("unqualified:"):
+        return {
+            "task_identity": "unqualified",
+            "task_label": task_names[0],
+            "task_name": task_names[0],
+            "source_task_name": None,
+            "task_names": task_names,
+            "source_task_names": [],
+            "top_level_task_names": top_level_names,
+            "task_metadata_conditions": metadata_conditions,
+            "identity_condition": "fully_qualified_source_task_name_missing",
+        }
+
+    normalized_sources = {_normalize_task_name(name) for name in source_names}
+    normalized_tasks = {_normalize_task_name(name) for name in task_names}
+    if len(normalized_tasks) > 1:
+        identity_condition = "task_name_disagreement_within_source_identity"
+    elif (
+        normalized_sources
+        and normalized_tasks
+        and not all(
+            _task_names_compatible(source, task)
+            for source in normalized_sources
+            for task in normalized_tasks
+        )
+    ):
+        identity_condition = "source_and_task_name_disagree"
+    elif any(
+        condition == TaskMetadataCondition.SUMMARY_TOP_LEVEL_DISAGREEMENT.value
+        for condition in metadata_conditions
+    ):
+        identity_condition = "summary_and_top_level_task_name_disagree"
+    else:
+        identity_condition = "fully_qualified_task_identity_recorded"
+    task_label = source_names[0] if source_names else task_names[0]
+    return {
+        "task_identity": "recorded",
+        "task_label": task_label,
+        "task_name": task_names[0] if len(task_names) == 1 else None,
+        "source_task_name": source_names[0] if len(source_names) == 1 else None,
+        "task_names": task_names,
+        "source_task_names": source_names,
+        "top_level_task_names": top_level_names,
+        "task_metadata_conditions": metadata_conditions,
+        "identity_condition": identity_condition,
+    }
+
+
+def _distinct_task_names(names: Iterable[str | None]) -> list[str]:
+    distinct = {name.strip() for name in names if name is not None}
+    return sorted(distinct, key=lambda name: (_normalize_task_name(name), name))
+
+
+def _normalize_task_name(task_name: str) -> str:
+    return " ".join(task_name.strip().split()).casefold()
+
+
+def _task_names_compatible(source_name: str, task_name: str) -> bool:
+    return source_name == task_name or source_name.rsplit("/", 1)[-1] == task_name
+
+
 def build_null_channel_summary(
     observations: Sequence[tuple[float | None, bool | None]],
     *,
     injection_data_available: bool,
 ) -> dict[str, Any]:
     """Summarize measured deltas by injection without influencing admission."""
+
+    return _flat_null_channel_summary(
+        observations, injection_data_available=injection_data_available
+    )
+
+
+def _flat_null_channel_summary(
+    observations: Sequence[tuple[float | None, bool | None]],
+    *,
+    injection_data_available: bool,
+) -> dict[str, Any]:
+    """Build one task's channel summaries, or the legacy ungrouped summary."""
 
     measured = [(delta, flag) for delta, flag in observations if delta is not None]
     unknown_count = sum(flag is None for _, flag in measured)
@@ -708,6 +1193,50 @@ def build_null_channel_summary(
     }
 
 
+def _within_task_contrast(summary: Mapping[str, Any]) -> dict[str, Any]:
+    no_skill = summary["no_skill_injected"]
+    injected = summary["skill_injected"]
+    if no_skill is None or injected is None:
+        return {
+            "availability": "unavailable",
+            "reason": "injection_flags_unavailable",
+            "detail": (
+                "no contrast available on this task because injection flags are "
+                "unavailable"
+            ),
+        }
+    if no_skill["n"] and injected["n"]:
+        return {
+            "availability": "available",
+            "injected_minus_no_skill_mean_delta": (
+                injected["mean_delta"] - no_skill["mean_delta"]
+            ),
+        }
+    if injected["n"]:
+        return {
+            "availability": "unavailable",
+            "reason": "no_skill_injected_channel_missing",
+            "detail": (
+                "no contrast available on this task, only the skill-injected "
+                "channel exists (the no-skill-injected channel is missing)"
+            ),
+        }
+    if no_skill["n"]:
+        return {
+            "availability": "unavailable",
+            "reason": "skill_injected_channel_missing",
+            "detail": (
+                "no contrast available on this task, only the no-skill-injected "
+                "channel exists (the skill-injected channel is missing)"
+            ),
+        }
+    return {
+        "availability": "unavailable",
+        "reason": "both_channels_empty",
+        "detail": "no contrast available on this task: both channels are empty",
+    }
+
+
 def _delta_group_summary(deltas: Sequence[float]) -> dict[str, Any]:
     count = len(deltas)
     positive = sum(delta > DELTA_ABS_TOLERANCE for delta in deltas)
@@ -719,6 +1248,92 @@ def _delta_group_summary(deltas: Sequence[float]) -> dict[str, Any]:
         "positive_count": positive,
         "negative_count": negative,
         "zero_count": count - positive - negative,
+    }
+
+
+def _append_channel_group_lines(
+    lines: list[str], summary: Mapping[str, Any], *, indent: str
+) -> None:
+    for group_name, label in (
+        ("no_skill_injected", "no skill injected (noise floor)"),
+        ("skill_injected", "skill injected"),
+    ):
+        group = summary[group_name]
+        if group is None:
+            continue
+        mean = "null" if group["mean_delta"] is None else f"{group['mean_delta']:+.6g}"
+        sample_sd = (
+            "null"
+            if group["sample_standard_deviation"] is None
+            else f"{group['sample_standard_deviation']:.6g}"
+        )
+        lines.append(
+            f"{indent}{label}: n={group['n']}, mean={mean}, sample sd={sample_sd}, "
+            f"signs +{group['positive_count']} / 0:{group['zero_count']} / "
+            f"-{group['negative_count']}"
+        )
+
+
+def _retrieval_split(
+    candidates: Sequence[SkillAdmissionCandidate],
+    decisions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    retrieved = 0
+    never_retrieved = 0
+    unknown = 0
+    retrieved_admitted = 0
+    retrieved_unhelpful = 0
+    never_retrieved_admitted = 0
+    unknown_retrieval_admitted = 0
+    for candidate, decision in zip(candidates, decisions, strict=True):
+        if decision["status"] == SkillAdmissionStatus.INCOMPLETE.value:
+            continue
+        flags = candidate.injection_flags
+        if flags is None:
+            retrieval_status = "unknown"
+        else:
+            measured_flags = tuple(
+                flag
+                for delta, flag in zip(candidate.paired_deltas, flags, strict=True)
+                if delta is not None
+            )
+            if any(flag is True for flag in measured_flags):
+                retrieval_status = "retrieved"
+            elif measured_flags and all(flag is False for flag in measured_flags):
+                retrieval_status = "never_retrieved"
+            else:
+                retrieval_status = "unknown"
+        if retrieval_status == "retrieved":
+            retrieved += 1
+            if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
+                retrieved_admitted += 1
+            else:
+                retrieved_unhelpful += 1
+        elif retrieval_status == "never_retrieved":
+            never_retrieved += 1
+            if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
+                never_retrieved_admitted += 1
+        else:
+            unknown += 1
+            if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
+                unknown_retrieval_admitted += 1
+
+    if unknown and not retrieved and not never_retrieved:
+        availability = "unavailable"
+    elif unknown:
+        availability = "partial"
+    else:
+        availability = "available"
+    return {
+        "availability": availability,
+        "complete_candidate_count": retrieved + never_retrieved + unknown,
+        "retrieved_candidate_count": retrieved,
+        "never_retrieved_candidate_count": never_retrieved,
+        "unknown_retrieval_candidate_count": unknown,
+        "retrieved_admitted_candidate_count": retrieved_admitted,
+        "retrieved_and_unhelpful_candidate_count": retrieved_unhelpful,
+        "never_retrieved_admitted_candidate_count": never_retrieved_admitted,
+        "unknown_retrieval_admitted_candidate_count": unknown_retrieval_admitted,
     }
 
 
@@ -772,6 +1387,17 @@ def _validate_candidate_id(candidate_id: str) -> None:
         or _SAFE_CANDIDATE_ID.fullmatch(candidate_id) is None
     ):
         raise ValueError(f"unsafe candidate id: {candidate_id!r}")
+
+
+def _validate_optional_task_name(
+    task_name: str | None, candidate_id: str, field_name: str
+) -> None:
+    if task_name is not None and (
+        not isinstance(task_name, str) or not task_name.strip()
+    ):
+        raise ValueError(
+            f"candidate {candidate_id!r} {field_name} must be non-empty text or null"
+        )
 
 
 def _optional_delta(value: object, candidate_id: str, index: int) -> float | None:

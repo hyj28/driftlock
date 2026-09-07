@@ -866,10 +866,9 @@ def test_one_observation_has_null_sample_deviation_and_flags_do_not_gate() -> No
             ),
         ]
     )
-    assert (
-        report["null_channel"]["no_skill_injected"]["sample_standard_deviation"] is None
-    )
-    assert report["null_channel"]["skill_injected"]["sample_standard_deviation"] is None
+    task_group = report["null_channel"]["per_task"][0]
+    assert task_group["no_skill_injected"]["sample_standard_deviation"] is None
+    assert task_group["skill_injected"]["sample_standard_deviation"] is None
 
 
 def test_loader_preserves_missing_injection_flags_as_unknown(tmp_path: Path) -> None:
@@ -896,7 +895,7 @@ def test_loader_preserves_missing_injection_flags_as_unknown(tmp_path: Path) -> 
 
     assert candidates[0].injection_flags is None
     assert report["null_channel"]["availability"] == "unavailable"
-    assert report["null_channel"]["no_skill_injected"] is None
+    assert report["null_channel"]["per_task"][0]["no_skill_injected"] is None
     assert "null channel: unavailable" in render_admission_report(report)
 
 
@@ -987,8 +986,8 @@ def test_recorded_unknown_flags_differ_from_unrecorded_flags() -> None:
     assert (
         recorded["null_channel"]["unavailability_reason"] == "injection_flags_unknown"
     )
-    assert recorded["null_channel"]["no_skill_injected"] is None
-    assert recorded["null_channel"]["skill_injected"] is None
+    assert recorded["null_channel"]["per_task"][0]["no_skill_injected"] is None
+    assert recorded["null_channel"]["per_task"][0]["skill_injected"] is None
     assert (
         unrecorded["null_channel"]["unavailability_reason"]
         == "injection_flags_not_recorded"
@@ -1156,8 +1155,9 @@ def test_admit_skills_cli_reports_mixed_cohort_null_channel(
     assert result.returncode == 0, result.stderr
     report = json.loads(output.read_text(encoding="utf-8"))
     expected_null_n = 11 if missing_null_deltas else 15
-    assert report["null_channel"]["no_skill_injected"]["n"] == expected_null_n
-    assert report["null_channel"]["skill_injected"]["n"] == 15
+    task_group = report["null_channel"]["per_task"][0]
+    assert task_group["no_skill_injected"]["n"] == expected_null_n
+    assert task_group["skill_injected"]["n"] == 15
     decision_b = next(
         decision
         for decision in report["decisions"]
