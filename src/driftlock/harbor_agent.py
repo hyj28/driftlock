@@ -741,6 +741,9 @@ class LHTBDriftlockAgent(Terminus2):
                         bool(checkpoint.unstable_paths)
                         for checkpoint in result.checkpoints
                     ),
+                    "non_restorable_checkpoint_count": sum(
+                        not checkpoint.restorable for checkpoint in result.checkpoints
+                    ),
                     "coarse_triggers": [
                         trigger.to_dict() for trigger in result.coarse_triggers
                     ],
@@ -844,6 +847,12 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
         previous_result = self._driftlock_last_result
         if previous_result is None:
             raise RuntimeError("cannot retry without a completed prior attempt")
+        if not checkpoint.restorable:
+            self._set_retry_metadata(
+                context,
+                skipped_reason="initial checkpoint is not eligible for restore",
+            )
+            return
         guard_root = self._driftlock_store_root / (
             f"retry-guard-{self._driftlock_retry_count}"
         )
@@ -859,6 +868,19 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
             step=0,
             label="pre-retry",
         )
+        if not guard_checkpoint.restorable:
+            # The guard is the only way to undo a refused, non-billable retry.
+            # Starting without a restorable guard could strand the workspace at
+            # phase zero and let the cleanup error replace the in-flight failure.
+            shutil.rmtree(guard_root, ignore_errors=True)
+            self._set_retry_metadata(
+                context,
+                skipped_reason=(
+                    "pre-retry guard checkpoint is not eligible for restore: "
+                    f"{guard_checkpoint.unaccounted_archive_output}"
+                ),
+            )
+            return
         phase_root = checkpoint.path.parent.parent
         store = RemoteArchiveCheckpointStore(
             self._driftlock_environment,
@@ -895,13 +917,21 @@ class LHTBBlindRetryAgent(LHTBDriftlockAgent):
     def _retain_phase_checkpoints(self, phase: int) -> bool:
         return phase == 0
 
-    def _set_retry_metadata(self, context: Any) -> None:
+    def _set_retry_metadata(
+        self,
+        context: Any,
+        *,
+        skipped_reason: str | None = None,
+    ) -> None:
         metadata = dict(context.metadata or {})
-        metadata["driftlock_blind_retry"] = {
+        retry_metadata: dict[str, Any] = {
             "retries_started": self._driftlock_retry_count,
             "verifier_feedback_used": False,
             "restart_checkpoint": "initial",
         }
+        if skipped_reason is not None:
+            retry_metadata["retry_skipped_reason"] = skipped_reason
+        metadata["driftlock_blind_retry"] = retry_metadata
         context.metadata = metadata
 
     async def _driftlock_finalize_after_agent_run(self) -> None:

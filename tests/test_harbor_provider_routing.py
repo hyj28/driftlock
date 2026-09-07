@@ -16,6 +16,7 @@ from driftlock.lhtb import openrouter_provider_from_call_kwargs
 from driftlock.lhtb_experiment import build_job_config
 from driftlock.models import (
     Checkpoint,
+    CheckpointRestoreStatus,
     DriftSignal,
     DriftTriggerOutcome,
     DriftTriggerRecord,
@@ -1166,6 +1167,61 @@ def test_phase_record_counts_checkpoints_with_unstable_paths(
     assert native_phase["unstable_checkpoint_count"] == 1
 
 
+def test_phase_record_counts_non_restorable_checkpoints(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    harbor_agent, native_agent = harbor_agent_modules
+    created_at = datetime(2026, 9, 6, tzinfo=UTC)
+    eligible = Checkpoint(
+        checkpoint_id="eligible-checkpoint",
+        step=0,
+        created_at=created_at,
+        digest="eligible-digest",
+        path=tmp_path / "eligible-checkpoint",
+    )
+    ineligible = Checkpoint(
+        checkpoint_id="ineligible-checkpoint",
+        step=1,
+        created_at=created_at,
+        digest="ineligible-digest",
+        path=tmp_path / "ineligible-checkpoint",
+        restore_status=CheckpointRestoreStatus.INELIGIBLE,
+        unaccounted_archive_output="tar: ./ignored.sock: socket ignored",
+    )
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={"done": True},
+        steps=(),
+        rollbacks=(),
+        checkpoints=(eligible, ineligible),
+        tokens_used=0,
+        agent_tokens_used=0,
+        judge_tokens_used=0,
+    )
+    agent = object.__new__(harbor_agent.LHTBDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._driftlock_phases = []
+
+    agent._write_phase_record(result, tmp_path / "phase-0", retained=True)
+
+    phase = json.loads((tmp_path / "driftlock-result.json").read_text())["phases"][0]
+    assert phase["checkpoint_count"] == 2
+    assert phase["non_restorable_checkpoint_count"] == 1
+
+    native = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    native.logs_dir = tmp_path
+    native._native_phases = []
+    native._native_retain_checkpoints = False
+    native._write_phase_record(result)
+
+    native_phase = json.loads((tmp_path / "driftlock-native-result.json").read_text())[
+        "phases"
+    ][0]
+    assert native_phase["checkpoint_count"] == 2
+    assert native_phase["non_restorable_checkpoint_count"] == 1
+
+
 def test_phase_record_names_uncheckpointable_boundary_reason(
     tmp_path: Path,
     harbor_agent_modules: tuple[Any, Any],
@@ -1212,3 +1268,72 @@ def test_phase_record_names_uncheckpointable_boundary_reason(
             ),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_blind_retry_declines_ineligible_guard_without_mutating_workspace(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harbor_agent, _native_agent = harbor_agent_modules
+    created_at = datetime(2026, 9, 6, tzinfo=UTC)
+    initial_checkpoint = Checkpoint(
+        checkpoint_id="initial-checkpoint",
+        step=0,
+        created_at=created_at,
+        digest="initial-digest",
+        path=tmp_path / "phase-0" / "checkpoints" / "initial-checkpoint",
+    )
+    guard_checkpoint = Checkpoint(
+        checkpoint_id="guard-checkpoint",
+        step=0,
+        created_at=created_at,
+        digest="guard-digest",
+        path=tmp_path / "retry-guard-0" / "checkpoints" / "guard-checkpoint",
+        restore_status=CheckpointRestoreStatus.INELIGIBLE,
+        unaccounted_archive_output="tar: ./private: Cannot savedir: Permission denied",
+    )
+
+    class GuardStore:
+        instances: ClassVar[list[GuardStore]] = []
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.restore_calls: list[str] = []
+            self.instances.append(self)
+
+        async def create(self, *_args: Any, **_kwargs: Any) -> Checkpoint:
+            return guard_checkpoint
+
+        async def restore(self, checkpoint: Checkpoint) -> dict[str, Any]:
+            self.restore_calls.append(checkpoint.checkpoint_id)
+            raise AssertionError("an ineligible guard must never be restored")
+
+    monkeypatch.setattr(harbor_agent, "RemoteArchiveCheckpointStore", GuardStore)
+    agent = object.__new__(harbor_agent.LHTBBlindRetryAgent)
+    context = SimpleNamespace(metadata={})
+    agent._driftlock_retry_checkpoint = initial_checkpoint
+    agent._driftlock_environment = SimpleNamespace(default_user="root")
+    agent._driftlock_last_context_id = id(context)
+    agent._driftlock_step = SimpleNamespace(before_workspace_restore=lambda _path: None)
+    agent._driftlock_runner_config = RunnerConfig(max_tokens=None)
+    agent._driftlock_tokens_consumed = 0
+    agent._driftlock_runtime = SimpleNamespace()
+    agent._driftlock_last_result = SimpleNamespace(state={"workspace": "live"})
+    agent._driftlock_store_root = tmp_path
+    agent._driftlock_workspace = "/app"
+    agent._driftlock_retry_count = 0
+
+    await agent.resume_after_verifier_rejection("retry", context)
+
+    assert len(GuardStore.instances) == 1
+    assert GuardStore.instances[0].restore_calls == []
+    assert context.metadata["driftlock_blind_retry"] == {
+        "retries_started": 0,
+        "verifier_feedback_used": False,
+        "restart_checkpoint": "initial",
+        "retry_skipped_reason": (
+            "pre-retry guard checkpoint is not eligible for restore: "
+            "tar: ./private: Cannot savedir: Permission denied"
+        ),
+    }

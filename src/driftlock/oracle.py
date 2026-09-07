@@ -13,7 +13,7 @@ from uuid import UUID
 
 from driftlock.checkpoints import SnapshotIntegrityError
 from driftlock.lhtb import openrouter_provider_from_call_kwargs
-from driftlock.models import Checkpoint
+from driftlock.models import Checkpoint, CheckpointRestoreStatus
 from driftlock.usage import ReplayUsage, UsageAccountingError, load_trial_usage
 
 _HEX_32 = re.compile(r"[0-9a-f]{32}")
@@ -27,7 +27,11 @@ _MANIFEST_FIELDS = {
     "label",
     "remote_workspace",
 }
-_OPTIONAL_MANIFEST_FIELDS = {"unstable_paths"}
+_OPTIONAL_MANIFEST_FIELDS = {
+    "restore_status",
+    "unaccounted_archive_output",
+    "unstable_paths",
+}
 
 
 class OracleCheckpointError(SnapshotIntegrityError):
@@ -261,6 +265,17 @@ def load_remote_checkpoint_bundle(
         not isinstance(path, str) or not path for path in unstable_paths
     ):
         raise OracleCheckpointError("checkpoint unstable paths are invalid")
+    try:
+        restore_status = CheckpointRestoreStatus(
+            manifest.get("restore_status", CheckpointRestoreStatus.ELIGIBLE.value)
+        )
+    except (TypeError, ValueError) as error:
+        raise OracleCheckpointError("checkpoint restore status is invalid") from error
+    unaccounted_archive_output = manifest.get("unaccounted_archive_output")
+    if unaccounted_archive_output is not None and not isinstance(
+        unaccounted_archive_output, str
+    ):
+        raise OracleCheckpointError("checkpoint unaccounted archive output is invalid")
 
     try:
         state_text = state_path.read_text(encoding="utf-8")
@@ -282,7 +297,7 @@ def load_remote_checkpoint_bundle(
         )
 
     return RemoteCheckpointBundle(
-        checkpoint=Checkpoint(
+        checkpoint=_checkpoint_from_manifest(
             checkpoint_id=checkpoint_id,
             step=step,
             created_at=created_at,
@@ -291,12 +306,23 @@ def load_remote_checkpoint_bundle(
             parent_id=parent_id,
             label=label,
             unstable_paths=tuple(unstable_paths),
+            restore_status=restore_status,
+            unaccounted_archive_output=unaccounted_archive_output,
         ),
         state=state,
         remote_workspace=workspace,
         archive_sha256=archive_sha256,
         state_sha256=hashlib.sha256(state_text.encode()).hexdigest(),
     )
+
+
+def _checkpoint_from_manifest(**values: Any) -> Checkpoint:
+    try:
+        return Checkpoint(**values)
+    except ValueError as error:
+        raise OracleCheckpointError(
+            "checkpoint restore eligibility metadata is inconsistent"
+        ) from error
 
 
 def _direct_file(directory: Path, name: str) -> Path:

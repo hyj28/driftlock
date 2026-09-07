@@ -310,6 +310,9 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             "unstable_checkpoint_count": sum(
                 bool(checkpoint.unstable_paths) for checkpoint in result.checkpoints
             ),
+            "non_restorable_checkpoint_count": sum(
+                not checkpoint.restorable for checkpoint in result.checkpoints
+            ),
             "checkpoints_retained": self._native_retain_checkpoints,
             "coarse_triggers": [
                 trigger.to_dict() for trigger in result.coarse_triggers

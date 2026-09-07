@@ -241,6 +241,10 @@ class WorkspaceDelta:
     diff: str = ""
 
 
+class _WorkspaceObservationUnavailable(RuntimeError):
+    """Raised when optional workspace evidence cannot be captured reliably."""
+
+
 class WorkspaceDeltaObserver(Protocol):
     """Capture remote workspace state without mutating the task."""
 
@@ -408,15 +412,24 @@ PY
             cwd=workspace,
             user=self.user,
         )
-        _require_remote_success(manifest_result, "hash remote workspace")
+        # Manifest and Git-view capture are observations: losing either makes this
+        # boundary unobservable, but neither is a precondition for running the agent.
+        _require_workspace_observation(manifest_result, "hash remote workspace")
+        try:
+            files = _parse_sha256_manifest(manifest_result.stdout or "")
+        except RuntimeError as error:
+            raise _WorkspaceObservationUnavailable(
+                f"failed to hash remote workspace: manifest could not be parsed: "
+                f"{error}"
+            ) from error
         git_result = await self.environment.exec(
             self._GIT_VIEW_COMMAND,
             cwd=workspace,
             user=self.user,
         )
-        _require_remote_success(git_result, "capture remote Git view")
+        _require_workspace_observation(git_result, "capture remote Git view")
         return WorkspaceSnapshot(
-            files=_parse_sha256_manifest(manifest_result.stdout or ""),
+            files=files,
             git_view=git_result.stdout or "",
         )
 
@@ -751,7 +764,15 @@ class LHTBTerminusRuntime:
         tokens_remaining: int | None,
     ) -> TerminusBoundary:
         _validate_token_ceiling(tokens_remaining)
-        before = await self.observer.snapshot()
+        # Reset before the first observation so a degraded boundary cannot taint
+        # later boundaries and a stale terminal-quiescence reason cannot taint this one.
+        self.agent._driftlock_boundary_uncheckpointable_reason = None
+        observation_error: str | None = None
+        before: WorkspaceSnapshot | None = None
+        try:
+            before = await self.observer.snapshot()
+        except _WorkspaceObservationUnavailable as error:
+            observation_error = str(error)
         calls_before = self.provider_call_count
         rate_limited_before = self.rate_limited_call_count
         steps_before = len(self.agent._trajectory_steps)
@@ -787,8 +808,6 @@ class LHTBTerminusRuntime:
         self.agent._llm_call_kwargs["num_retries"] = 0
         self.agent._llm_call_kwargs["max_retries"] = 0
         self.agent._max_episodes = self.agent._n_episodes + 1
-        self.agent._driftlock_boundary_uncheckpointable_reason = None
-
         truncation: BaseException | None = None
         try:
             await self.agent._run_agent_loop(
@@ -835,18 +854,38 @@ class LHTBTerminusRuntime:
 
         self.agent._update_context_from_state(self.context)
         self.agent._dump_trajectory()
-        observation_error = getattr(
+        terminal_observation_error = getattr(
             self.agent, "_driftlock_boundary_uncheckpointable_reason", None
         )
-        if observation_error is not None and not isinstance(observation_error, str):
+        if terminal_observation_error is not None and not isinstance(
+            terminal_observation_error, str
+        ):
             raise LHTBRuntimeCompatibilityError(
                 "patched terminal boundary reason must be a string or None"
             )
+        if terminal_observation_error is not None:
+            if observation_error is None:
+                observation_error = terminal_observation_error
+            else:
+                observation_error = (
+                    f"{observation_error}; terminal boundary was also unobservable: "
+                    f"{terminal_observation_error}"
+                )
         if observation_error is None:
-            after = await self.observer.snapshot()
-            delta = self.observer.compare(before, after)
-            changed_paths = delta.changed_paths
-            diff = delta.diff
+            try:
+                after = await self.observer.snapshot()
+            except _WorkspaceObservationUnavailable as error:
+                observation_error = str(error)
+                changed_paths = ()
+                diff = ""
+            else:
+                if before is None:  # pragma: no cover - guarded by observation_error
+                    raise AssertionError(
+                        "observed boundary must have a before snapshot"
+                    )
+                delta = self.observer.compare(before, after)
+                changed_paths = delta.changed_paths
+                diff = delta.diff
         else:
             changed_paths = ()
             diff = ""
@@ -900,6 +939,7 @@ class LHTBTerminusRuntime:
             user=user,
             timeout_sec=30,
         )
+        # Killing the rejected process tree is a restore-safety precondition.
         _require_remote_success(result, "quiesce rejected tmux process tree")
         self._recording_generation += 1
         _rotate_session_recording(session, self._recording_generation)
@@ -914,6 +954,7 @@ class LHTBTerminusRuntime:
             user=user,
             timeout_sec=10,
         )
+        # The replacement shell's cwd is a restore-safety precondition.
         _require_remote_success(cwd_result, "verify replacement tmux cwd")
         actual_cwd = (cwd_result.stdout or "").strip()
         if actual_cwd != canonical:
@@ -932,6 +973,7 @@ class LHTBTerminusRuntime:
             user=getattr(session, "_user", None),
             timeout_sec=30,
         )
+        # A process baseline is required to identify safe rollback kill targets.
         _require_remote_success(result, "capture pre-agent process baseline")
         identities: list[str] = []
         for line in (result.stdout or "").splitlines():
@@ -1128,6 +1170,7 @@ async def _canonical_remote_workspace(
         user=user,
         timeout_sec=10,
     )
+    # Canonical workspace identity is a run invariant, not optional evidence.
     _require_remote_success(result, "canonicalize remote workspace")
     lines = (getattr(result, "stdout", None) or "").splitlines()
     if len(lines) != 1:
@@ -1326,10 +1369,52 @@ def _parse_sha256_manifest(output: str) -> dict[str, str]:
 
 
 def _require_remote_success(result: Any, operation: str) -> None:
+    """Require a remote precondition whose failure must stop the operation."""
+
     return_code = getattr(result, "return_code", None)
     if return_code != 0:
         stderr = (getattr(result, "stderr", None) or "").strip()
         raise RuntimeError(f"failed to {operation}: {stderr or f'exit {return_code}'}")
+
+
+# These diagnostics identify path disappearance or a path-type transition while
+# an observation walked the workspace; other non-zero output remains unaccounted.
+_CONCURRENT_OBSERVATION_MARKERS = (
+    "file changed as we read it",
+    "file removed before we read it",
+    "filenotfounderror",
+    "isadirectoryerror",
+    "no such file or directory",
+    "not a directory",
+    "notadirectoryerror",
+    "stale file handle",
+    "unable to read file",
+)
+
+
+def _require_workspace_observation(result: Any, operation: str) -> None:
+    """Turn failed evidence collection into a boundary-scoped observation error."""
+
+    return_code = getattr(result, "return_code", None)
+    if return_code == 0:
+        return
+    stderr = getattr(result, "stderr", None)
+    stdout = getattr(result, "stdout", None)
+    diagnostic = next(
+        (
+            output.strip()
+            for output in (stderr, stdout)
+            if isinstance(output, str) and output.strip()
+        ),
+        f"exit {return_code}",
+    )
+    if any(marker in diagnostic.lower() for marker in _CONCURRENT_OBSERVATION_MARKERS):
+        reason = "workspace changed during observation"
+    else:
+        reason = "cause was not accounted for"
+    raise _WorkspaceObservationUnavailable(
+        f"failed to {operation} with exit code {return_code}: {reason}: {diagnostic}"
+    )
 
 
 def _process_baseline_command(session_name: str) -> str:

@@ -46,6 +46,13 @@ class FineJudgeStatus(StrEnum):
     NOT_INVOKED = "not_invoked"
 
 
+class CheckpointRestoreStatus(StrEnum):
+    """Whether a checkpoint archive is eligible to mutate a workspace."""
+
+    ELIGIBLE = "eligible"
+    INELIGIBLE = "ineligible"
+
+
 class DriftTriggerOutcome(StrEnum):
     """What happened after the coarse detector fired."""
 
@@ -73,6 +80,31 @@ class Checkpoint:
     parent_id: str | None = None
     label: str | None = None
     unstable_paths: tuple[str, ...] = ()
+    restore_status: CheckpointRestoreStatus = CheckpointRestoreStatus.ELIGIBLE
+    unaccounted_archive_output: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.restore_status, CheckpointRestoreStatus):
+            raise TypeError("restore_status must be a CheckpointRestoreStatus")
+        if self.unaccounted_archive_output is not None and not isinstance(
+            self.unaccounted_archive_output, str
+        ):
+            raise TypeError("unaccounted_archive_output must be a string or None")
+        if self.restore_status is CheckpointRestoreStatus.ELIGIBLE:
+            if self.unaccounted_archive_output is not None:
+                raise ValueError(
+                    "a restorable checkpoint cannot have unaccounted archive output"
+                )
+        elif not self.unaccounted_archive_output:
+            raise ValueError(
+                "a non-restorable checkpoint needs unaccounted archive output"
+            )
+
+    @property
+    def restorable(self) -> bool:
+        """Whether restoring this checkpoint is safe enough to attempt."""
+
+        return self.restore_status is CheckpointRestoreStatus.ELIGIBLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +267,7 @@ class DriftTriggerRecord:
     outcome: DriftTriggerOutcome
     rollback_checkpoint_id: str | None = None
     rollback_checkpoint_step: int | None = None
+    rollback_refusal_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.sequence <= 0:
@@ -302,6 +335,13 @@ class DriftTriggerRecord:
             raise ValueError(
                 "only a completed rollback may identify a target checkpoint"
             )
+        if self.rollback_refusal_reason is not None:
+            if not self.rollback_refusal_reason:
+                raise ValueError("rollback refusal reason cannot be empty")
+            if self.outcome is not DriftTriggerOutcome.ROLLBACK_LIMIT_REFUSED:
+                raise ValueError(
+                    "a rollback refusal reason requires a refused rollback outcome"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable JSON representation used by phase audit records."""
@@ -311,7 +351,7 @@ class DriftTriggerRecord:
                 "checkpoint_id": self.rollback_checkpoint_id,
                 "step": self.rollback_checkpoint_step,
             }
-        return {
+        payload: dict[str, Any] = {
             "sequence": self.sequence,
             "logical_step": self.logical_step,
             "signals": [
@@ -332,6 +372,9 @@ class DriftTriggerRecord:
             "outcome": self.outcome.value,
             "rollback_checkpoint": checkpoint,
         }
+        if self.rollback_refusal_reason is not None:
+            payload["rollback_refusal_reason"] = self.rollback_refusal_reason
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

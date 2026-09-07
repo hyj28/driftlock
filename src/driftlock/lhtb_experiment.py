@@ -1070,6 +1070,14 @@ class _HarborSkillValidationRunner:
                 f"{type(error).__name__}: {error}"
             )
         try:
+            audit["non_restorable_checkpoint_count"] = (
+                _validation_non_restorable_checkpoint_count(run_record)
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            audit["non_restorable_checkpoint_evidence_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+        try:
             reward = (
                 single_job_reward(job_dir)
                 if (job_dir / "result.json").is_file()
@@ -1341,6 +1349,29 @@ def _validation_uncheckpointable_boundary_count(run_record: Path) -> int:
                 f"validation uncheckpointable boundaries must be a list: {run_record}"
             )
         total += len(boundaries)
+    return total
+
+
+def _validation_non_restorable_checkpoint_count(run_record: Path) -> int:
+    """Count checkpoints barred from restore across all validation phases."""
+
+    data = json.loads(run_record.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"validation run record must be an object: {run_record}")
+    phases = data.get("phases", [])
+    if not isinstance(phases, list):
+        raise ValueError(f"validation run phases must be a list: {run_record}")
+    total = 0
+    for phase in phases:
+        if not isinstance(phase, dict):
+            raise ValueError(f"validation run phase must be an object: {run_record}")
+        count = phase.get("non_restorable_checkpoint_count", 0)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(
+                "validation non-restorable checkpoint count must be a "
+                f"non-negative integer: {run_record}"
+            )
+        total += count
     return total
 
 
