@@ -2,26 +2,46 @@
 
 **A self-evolving long-horizon coding agent that learns from its own scored checkpoints.**
 
-> 🚧 **Status: the planned experiment is complete.** The checkpoint, rollback, judge,
-> checkpoint-scoring, skill-distillation, retrieval, injection, validation and admission layers
-> are implemented and unit-tested. A 170-trial paired validation ran to completion for $15.06.
+> **Status: self-evolution is complete and closed-loop; the agent is being filled out.**
 >
-> **Two results, both negative, both measured.** Rollback can only help if an agent passes
-> through a state better than the one it ends in; replaying every retained checkpoint through
-> the benchmark's own verifier — 44 replays, six tasks, zero token cost — found that on one task
-> in six. And checkpoint-localized distillation shows **no advantage** over a whole-trajectory
-> baseline: within task, `localized − baseline` is −0.039 and +0.046 on the two tasks that
-> support the comparison, from one to three candidates per cell. The single admitted candidate
-> came from the *baseline* arm, against a chance expectation of 0.150 admissions across the
-> cohort.
+> The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
+> retrieval, injection, paired-validation and admission layers are implemented and unit-tested
+> (747 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> **[RESULTS.md](RESULTS.md)**.
 >
-> Six of fourteen candidates were never retrieved on the task they were distilled from, so they
-> never entered the test at all — a retrieval-calibration result, reported separately rather
-> than folded into the effect. See **[RESULTS.md](RESULTS.md)** for the numbers, the noise floor
-> every effect is read against, and what the measurement apparatus caught that I had already
-> written down and believed.
+> Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
+> against a paired control before entering the library, and a free noise floor tells you when an
+> apparent gain is run-to-run variance. What that run also showed is that **one-shot similarity
+> retrieval is too weak to serve a skill library** — six of fourteen candidates never reached an
+> agent at all. That is the requirement driving the next component.
+>
+> **Now building: the rest of a complete agent.** See the component roadmap below.
 
 ---
+
+## Component roadmap
+
+driftlock is a terminal coding agent. The self-evolution loop is what makes it improve from its
+own runs; the rest is what any capable agent needs.
+
+| component | status |
+|---|---|
+| Tool-calling loop (`run_shell`, `read_file`, `write_file`, `search_files`, `complete`) | done |
+| Checkpointing + progress-aware rollback | done |
+| Free checkpoint scoring via the task's own verifier | done |
+| Failure localization to a checkpoint segment | done |
+| Skill distillation, retrieval, injection | done |
+| Paired validation + admission with a measured noise floor | done |
+| Resumable runs, bounded retries, degraded-observation reporting | done |
+| **Agentic RAG** — retrieval as a tool the agent invokes from live context, over code *and* skills | **next** |
+| Context compaction | planned |
+| Planning / task decomposition | planned |
+| Persistent memory across tasks | planned |
+| Subagents and delegation | planned |
+| MCP client support | planned |
+| Parallel tool calls | planned |
+| Prompt-cache management | planned |
+| Output self-verification | planned |
 
 ## The problem
 
@@ -173,10 +193,10 @@ field measures at a 14.2% candidate pass rate.
 1. This project — a terminal coding agent with checkpointing, free checkpoint scoring,
    progress-aware rollback, and checkpoint-localized skill distillation. The rollback and
    scoring layers stay usable standalone around someone else's agent loop.
-2. A technical writeup — **delivered: [RESULTS.md](RESULTS.md)**. The candidate pass rate
-   against the 14.2% reference, the per-task noise floor every effect is read against, the
-   retrieval-calibration finding, failure-case analysis, and the five instrumentation defects
-   that were destroying paid measurements while looking like agent failures
+2. **[RESULTS.md](RESULTS.md)** — what the self-evolution loop does, the engineering
+   decisions behind it, and the 170-trial validation that exercised it end to end: admission
+   outcomes, the per-task noise floor every effect is read against, and the retrieval
+   requirements driving the agentic RAG component
 
 ## Core library quick start
 

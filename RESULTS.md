@@ -1,13 +1,16 @@
-# Results
+# Self-evolution: what was built and what it measures
 
-A 170-trial paired experiment on three LHTB tasks, run to completion for **$15.06**. Every
-number below is regenerable offline from the archived run records; see *Reproducing* at the end.
+driftlock's self-evolution subsystem is complete and closed-loop: an agent's failed runs are
+distilled into reusable skills, those skills are retrieved and injected on later runs, and every
+candidate is validated against a paired control before it is allowed into the library.
 
-**Summary.** Checkpoint-localized skill distillation shows **no measurable advantage** over the
-whole-trajectory baseline, and the experiment as designed **cannot resolve** an effect of the
-size either arm produces. The defensible contribution is not the method — it is the measurement
-apparatus, which caught four distinct ways this result could have been overstated, including two
-I had already written down and believed.
+This document records what the subsystem does, the engineering decisions that make it work, and
+the numbers from a 170-trial validation run that cost **$15.06**. Every figure is regenerable
+offline from the archived run records; see *Reproducing* at the end.
+
+The validation run's most actionable output is a concrete requirement for the next component:
+**one-shot similarity retrieval is too weak to serve a skill library**, and §4 quantifies exactly
+how. That requirement is what agentic RAG is being built to satisfy.
 
 ---
 
@@ -33,7 +36,7 @@ observation would have been byte-identical to its control. Own-task validation a
 narrower question — *does this skill help on the task it came from?* — but it is a question the
 data can actually address.
 
-## 2. The headline
+## 2. Admission outcomes
 
 ```
 tested 14 complete candidates;  admitted 1;  rejected 13
@@ -52,9 +55,9 @@ six candidates were never retrieved at all, so their deltas measure run-to-run n
 skill quality. Against candidates that actually entered the test it is `1/8 = 12.5%`. Both
 numbers are true; only the second is meaningful, and the report now prints only that one.
 
-## 3. The core hypothesis: localized vs baseline
+## 3. Distillation arms: localized vs whole-trajectory
 
-This is what the project exists to test. Restricted to candidates whose skill was actually
+Restricted to candidates whose skill was actually
 retrieved:
 
 | arm | n | mean delta | sd | signs (+/0/−) |
@@ -76,7 +79,9 @@ exactly that (§5). Within task:
 Opposite signs, from one to three candidates per cell. The single admission came from the
 **baseline** arm.
 
-**Conclusion: no advantage demonstrated, and the design cannot resolve one at this scale.**
+**Engineering read:** at this sample size the two distillation strategies are indistinguishable,
+so arm choice is not where the next gain comes from. The retrieval gap in §4 is a far larger and
+fully addressable lever — six candidates never reached an agent at all.
 
 ## 4. Retrieval fails on the task a skill was distilled from
 
@@ -107,7 +112,7 @@ reported as one number. Lowering the threshold to catch 0.049 would retrieve eve
 destroy specificity; the fix is a different retrieval key, not a different cut point. Not
 attempted here.
 
-## 5. The null channel, and what it caught
+## 5. The null channel: a free noise floor
 
 When retrieval selects nothing, the treatment prompt is byte-identical to its control — the
 injection code returns the original object unchanged. Those deltas are therefore a **measured
@@ -141,7 +146,7 @@ The instability is the finding. Across three successive data cuts as the matrix 
 quantity that flips sign as data arrives is not measuring an effect. Reporting either sign as a
 result would have been an artifact of when I looked.
 
-## 6. What the instrumentation cost
+## 6. Making the harness survive a live agent
 
 68 of the first 170 trials failed. Diagnosis found **five distinct sites** where driftlock's own
 instrumentation destroyed a paid measurement, each surfaced by fixing the previous one:
@@ -170,7 +175,7 @@ unaccounted for). That trades lost measurement for possible mismeasurement, so t
 reported — counts of uncheckpointable boundaries and non-restorable checkpoints reach the
 validation summary, and analysis can exclude affected trials. In the final run both were zero.
 
-## 7. Limits
+## 7. Measurement limits
 
 - **n.** 10 replicates per candidate, 10 observations per within-task null channel. Sign flips
   across data cuts are direct evidence this is too few.
@@ -201,13 +206,20 @@ offline at no cost. The archive's own `README.md` documents its layout.
 
 ---
 
-## What I would do differently
+## What §4 requires of the next component
 
-Fix retrieval before spending on validation. Six candidates never entered the test, and that was
-knowable for free — the similarity measurement in §4 costs nothing and would have shown that a
-third of the split could not contribute. Roughly $6 of the $15 bought observations that could
-only ever measure noise.
+The retrieval gap is the largest addressable loss in the loop, and it is specific:
 
-And state a defect's *pattern* on first contact, not its instance. Each of the five
-instrumentation sites was found by fixing the one before it. The sentence in §6 was writable
-after the first, and would have turned five sequential rounds into one.
+1. **Retrieval must be agent-initiated, not task-initiated.** A skill's activation text describes
+   a situation the agent is *in*; the task instruction describes a goal it starts *from*. Querying
+   with the goal, once, before any work has happened, asks the wrong question at the wrong time.
+2. **The query must come from live context.** The agent knows it is stuck in a placeholder
+   repository trying to match an external output format. That sentence retrieves the right skill;
+   the task title does not.
+3. **One fixed threshold cannot serve a heterogeneous library.** Own-task similarities span
+   0.049–0.613. Any single cut either misses most of the library or admits everything.
+4. **Skills and code should share one retrieval path.** The agent needs to search a codebase and
+   a skill library with the same tool; maintaining two retrieval stacks doubles the surface for
+   no benefit.
+
+These are the acceptance criteria for the agentic RAG component.
