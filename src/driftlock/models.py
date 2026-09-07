@@ -126,6 +126,8 @@ class StepOutcome:
 
     ``state`` must be JSON-serializable because it is stored with checkpoints.
     ``changed_paths`` and ``diff`` should describe only the just-finished step.
+    ``tool_audits`` retains diagnostics that are deliberately not fed back into
+    the agent conversation.
     """
 
     action: str
@@ -137,6 +139,7 @@ class StepOutcome:
     commands_run: int = 0
     commands_failed: int = 0
     tool_observations: tuple[str, ...] = ()
+    tool_audits: tuple[Mapping[str, Any], ...] = ()
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -166,6 +169,10 @@ class StepOutcome:
             not isinstance(observation, str) for observation in self.tool_observations
         ):
             raise TypeError("tool_observations must be a tuple of strings")
+        if not isinstance(self.tool_audits, tuple) or any(
+            not isinstance(audit, Mapping) for audit in self.tool_audits
+        ):
+            raise TypeError("tool_audits must be a tuple of mappings")
 
 
 @dataclass(frozen=True, slots=True)
