@@ -182,9 +182,12 @@ def test_render_qualifies_field_reference_beside_our_pass_rate() -> None:
     first_line = render_admission_report(report).splitlines()[0]
 
     assert first_line == (
-        "tested 2 complete candidate(s); admitted 1; rejected 1; incomplete 0; "
-        "pass rate 50.0%; field reference 55/388 (14.2%) under a different "
-        "validation filter (not like-for-like)"
+        "tested 2 complete candidate(s); admitted 1 admission verdict(s); rejected "
+        "1; incomplete 0; retrieval split among complete candidates: never "
+        "retrieved 0; retrieved and unhelpful 0; retrieved and admitted 0; "
+        "retrieval unknown 2; retrieval could not be determined; pass rate 1/2 "
+        "(50.0%) among all complete candidates; field reference 55/388 (14.2%) "
+        "under a different validation filter (not like-for-like)"
     )
     assert report["field_reference"]["comparison_note"] == (
         "The study used a different validation filter; its pass rate and this "
