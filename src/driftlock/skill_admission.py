@@ -103,6 +103,14 @@ class TaskMetadataCondition(StrEnum):
     SUMMARY_TOP_LEVEL_DISAGREEMENT = "summary_top_level_task_name_disagreement"
 
 
+class CandidateRetrievalStatus(StrEnum):
+    """Whether any measured observation established skill retrieval."""
+
+    RETRIEVED = "retrieved"
+    NEVER_RETRIEVED = "never_retrieved"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class SkillAdmissionCandidate:
     """One distilled skill and its already-paired per-task reward deltas."""
@@ -488,7 +496,7 @@ def render_admission_report(report: Mapping[str, Any]) -> str:
             else:
                 lines.append(f"  task {task_label}:")
             if task_group["identity_condition"] != (
-                "fully_qualified_task_identity_recorded"
+                "fully_qualified_task_identity_established"
             ):
                 lines.append(
                     f"    task identity condition: {task_group['identity_condition']}"
@@ -875,11 +883,11 @@ def _load_task_metadata(
             )
         return (
             top_level_task_name,
-            summary_source_task_name or top_level_task_name,
+            summary_source_task_name,
             TaskMetadataCondition.TOP_LEVEL_FALLBACK_SUMMARY_TASK_NULL,
         )
 
-    if summary_source_task_name is None and top_level_task_name is None:
+    if summary_source_task_name is None:
         return (
             summary_task_name,
             None,
@@ -963,6 +971,9 @@ def _task_null_channel_summary(
             {
                 **identity,
                 "candidate_count": len(members),
+                "candidate_ids": sorted(
+                    candidate.candidate_id for candidate, _ in members
+                ),
                 "complete_candidate_count": sum(
                     decision["status"] != SkillAdmissionStatus.INCOMPLETE.value
                     for _, decision in members
@@ -978,7 +989,7 @@ def _task_null_channel_summary(
                 ],
                 "no_skill_injected": flat["no_skill_injected"],
                 "skill_injected": flat["skill_injected"],
-                "within_task_contrast": _within_task_contrast(flat),
+                "within_task_contrast": _contrast_for_task_identity(flat, identity),
             }
         )
 
@@ -1046,13 +1057,21 @@ def _task_null_channel_summary(
 
 def _task_identity_key(candidate: SkillAdmissionCandidate) -> str:
     if candidate.source_task_name is not None:
+        if candidate.task_metadata_condition in {
+            TaskMetadataCondition.TOP_LEVEL_FALLBACK_SUMMARY_ABSENT,
+            TaskMetadataCondition.TOP_LEVEL_FALLBACK_SUMMARY_TASK_NULL,
+        }:
+            return (
+                f"fallback:{_normalize_task_name(candidate.source_task_name)}:"
+                f"{candidate.candidate_id}"
+            )
         return f"recorded:{_normalize_task_name(candidate.source_task_name)}"
     if candidate.task_name is not None:
         return (
             f"unqualified:{_normalize_task_name(candidate.task_name)}:"
             f"{candidate.candidate_id}"
         )
-    return f"unknown:{candidate.task_metadata_condition.value}"
+    return f"unknown:{candidate.candidate_id}"
 
 
 def _task_identity_report(
@@ -1069,7 +1088,6 @@ def _task_identity_report(
         {candidate.task_metadata_condition.value for candidate in candidates}
     )
     if identity_key.startswith("unknown:"):
-        unknown_reason = identity_key.removeprefix("unknown:")
         return {
             "task_identity": "unknown",
             "task_label": UNKNOWN_TASK_LABEL,
@@ -1079,7 +1097,7 @@ def _task_identity_report(
             "source_task_names": [],
             "top_level_task_names": top_level_names,
             "task_metadata_conditions": metadata_conditions,
-            "identity_condition": unknown_reason,
+            "identity_condition": "task_identity_unknown",
         }
     if identity_key.startswith("unqualified:"):
         return {
@@ -1091,11 +1109,19 @@ def _task_identity_report(
             "source_task_names": [],
             "top_level_task_names": top_level_names,
             "task_metadata_conditions": metadata_conditions,
-            "identity_condition": "fully_qualified_source_task_name_missing",
+            "identity_condition": "fully_qualified_task_identity_missing",
         }
 
     normalized_sources = {_normalize_task_name(name) for name in source_names}
     normalized_tasks = {_normalize_task_name(name) for name in task_names}
+    conflicting_metadata = any(
+        condition
+        not in {
+            TaskMetadataCondition.DIRECT.value,
+            TaskMetadataCondition.SUMMARY_RECORDED.value,
+        }
+        for condition in metadata_conditions
+    )
     if len(normalized_tasks) > 1:
         identity_condition = "task_name_disagreement_within_source_identity"
     elif (
@@ -1113,11 +1139,17 @@ def _task_identity_report(
         for condition in metadata_conditions
     ):
         identity_condition = "summary_and_top_level_task_name_disagree"
+    elif conflicting_metadata:
+        identity_condition = "task_identity_metadata_not_fully_verified"
     else:
-        identity_condition = "fully_qualified_task_identity_recorded"
+        identity_condition = "fully_qualified_task_identity_established"
     task_label = source_names[0] if source_names else task_names[0]
     return {
-        "task_identity": "recorded",
+        "task_identity": (
+            "fully_qualified"
+            if identity_condition == "fully_qualified_task_identity_established"
+            else "conflicted"
+        ),
         "task_label": task_label,
         "task_name": task_names[0] if len(task_names) == 1 else None,
         "source_task_name": source_names[0] if len(source_names) == 1 else None,
@@ -1191,6 +1223,25 @@ def _flat_null_channel_summary(
             [delta for delta, flag in known if flag is True]
         ),
     }
+
+
+def _contrast_for_task_identity(
+    summary: Mapping[str, Any], identity: Mapping[str, Any]
+) -> dict[str, Any]:
+    if not (
+        identity["task_identity"] == "fully_qualified"
+        and identity["identity_condition"]
+        == "fully_qualified_task_identity_established"
+    ):
+        return {
+            "availability": "unavailable",
+            "reason": "task_identity_not_established",
+            "detail": (
+                "no contrast available for this group because a shared, "
+                "fully-qualified task identity was not established"
+            ),
+        }
+    return _within_task_contrast(summary)
 
 
 def _within_task_contrast(summary: Mapping[str, Any]) -> dict[str, Any]:
@@ -1288,28 +1339,16 @@ def _retrieval_split(
     for candidate, decision in zip(candidates, decisions, strict=True):
         if decision["status"] == SkillAdmissionStatus.INCOMPLETE.value:
             continue
-        flags = candidate.injection_flags
-        if flags is None:
-            retrieval_status = "unknown"
-        else:
-            measured_flags = tuple(
-                flag
-                for delta, flag in zip(candidate.paired_deltas, flags, strict=True)
-                if delta is not None
-            )
-            if any(flag is True for flag in measured_flags):
-                retrieval_status = "retrieved"
-            elif measured_flags and all(flag is False for flag in measured_flags):
-                retrieval_status = "never_retrieved"
-            else:
-                retrieval_status = "unknown"
-        if retrieval_status == "retrieved":
+        retrieval_status = _measured_retrieval_status(
+            candidate.injection_flags, candidate.paired_deltas
+        )
+        if retrieval_status is CandidateRetrievalStatus.RETRIEVED:
             retrieved += 1
             if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
                 retrieved_admitted += 1
             else:
                 retrieved_unhelpful += 1
-        elif retrieval_status == "never_retrieved":
+        elif retrieval_status is CandidateRetrievalStatus.NEVER_RETRIEVED:
             never_retrieved += 1
             if decision["status"] == SkillAdmissionStatus.ADMITTED.value:
                 never_retrieved_admitted += 1
@@ -1357,12 +1396,16 @@ def _skill_application_report(
         for delta, flag in zip(paired_deltas, injection_flags, strict=True)
         if delta is not None
     )
-    measured_observed = tuple(flag for flag in measured_flags if flag is not None)
     all_observed = tuple(flag for flag in injection_flags if flag is not None)
-    if not measured_observed:
+    retrieval_status = _measured_retrieval_status(injection_flags, paired_deltas)
+    if retrieval_status is CandidateRetrievalStatus.UNKNOWN:
         status = "unmeasured"
-    elif any(measured_observed):
-        status = "always_injected" if all(measured_observed) else "mixed_injection"
+    elif retrieval_status is CandidateRetrievalStatus.RETRIEVED:
+        status = (
+            "mixed_injection"
+            if any(flag is False for flag in measured_flags)
+            else "always_injected"
+        )
     else:
         status = "never_injected"
     ever_injected = True if any(all_observed) else False if all_observed else None
@@ -1379,6 +1422,24 @@ def _skill_application_report(
             for delta, flag in zip(paired_deltas, injection_flags, strict=True)
         ),
     }
+
+
+def _measured_retrieval_status(
+    injection_flags: tuple[bool | None, ...] | None,
+    paired_deltas: tuple[float | None, ...],
+) -> CandidateRetrievalStatus:
+    if injection_flags is None:
+        return CandidateRetrievalStatus.UNKNOWN
+    measured_flags = tuple(
+        flag
+        for delta, flag in zip(paired_deltas, injection_flags, strict=True)
+        if delta is not None
+    )
+    if any(flag is True for flag in measured_flags):
+        return CandidateRetrievalStatus.RETRIEVED
+    if any(flag is False for flag in measured_flags):
+        return CandidateRetrievalStatus.NEVER_RETRIEVED
+    return CandidateRetrievalStatus.UNKNOWN
 
 
 def _validate_candidate_id(candidate_id: str) -> None:

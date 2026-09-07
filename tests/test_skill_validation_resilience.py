@@ -1155,9 +1155,15 @@ def test_admit_skills_cli_reports_mixed_cohort_null_channel(
     assert result.returncode == 0, result.stderr
     report = json.loads(output.read_text(encoding="utf-8"))
     expected_null_n = 11 if missing_null_deltas else 15
-    task_group = report["null_channel"]["per_task"][0]
-    assert task_group["no_skill_injected"]["n"] == expected_null_n
-    assert task_group["skill_injected"]["n"] == 15
+    task_groups = report["null_channel"]["per_task"]
+    assert (
+        sum(group["no_skill_injected"]["n"] for group in task_groups) == expected_null_n
+    )
+    assert sum(group["skill_injected"]["n"] for group in task_groups) == 15
+    assert all(
+        group["within_task_contrast"]["availability"] == "unavailable"
+        for group in task_groups
+    )
     decision_b = next(
         decision
         for decision in report["decisions"]

@@ -7,6 +7,7 @@ import pytest
 
 from driftlock.lhtb_experiment import main
 from driftlock.skill_admission import (
+    CandidateRetrievalStatus,
     SkillAdmissionCandidate,
     TaskMetadataCondition,
     assemble_admission_report,
@@ -221,6 +222,7 @@ def test_headline_uses_retrieved_complete_candidates_as_pass_rate_denominator() 
     assert "never retrieved 5" in headline
     assert "retrieved and unhelpful 7" in headline
     assert "retrieved and admitted 1" in headline
+    assert "retrieval could not be determined for 1 complete candidate(s)" in headline
     assert "pass rate 1/8 (12.5%) among retrieved complete candidates" in headline
     assert (
         "field reference 55/388 (14.2%) under a different validation filter "
@@ -270,9 +272,10 @@ def test_loader_threads_task_metadata_and_missing_task_is_explicit(
     unknown = _task_groups(report)[None]
     assert unknown["task_label"] == "task unknown"
     assert unknown["task_identity"] == "unknown"
-    assert (
-        "task unknown (validation_observation_summary_missing)"
-        in render_admission_report(report)
+    rendered = render_admission_report(report)
+    assert "task unknown (task_identity_unknown)" in rendered
+    assert "task metadata condition(s): validation_observation_summary_missing" in (
+        rendered
     )
 
 
@@ -517,10 +520,9 @@ def test_cli_missing_task_metadata_exits_zero_and_uses_unknown_group(
     unknown = _task_groups(report)[None]
     assert unknown["task_label"] == "task unknown"
     assert unknown["no_skill_injected"]["n"] == 10
-    assert (
-        "task unknown (validation_observation_summary_missing)"
-        in capsys.readouterr().out
-    )
+    rendered = capsys.readouterr().out
+    assert "task unknown (task_identity_unknown)" in rendered
+    assert "validation_observation_summary_missing" in rendered
 
 
 def test_cli_task_and_flags_leave_admission_result_byte_identical(
@@ -617,7 +619,9 @@ def test_task_identity_normalizes_case_and_whitespace_before_grouping() -> None:
         "availability": "available",
         "injected_minus_no_skill_mean_delta": 4.0,
     }
-    assert groups[0]["identity_condition"] == ("fully_qualified_task_identity_recorded")
+    assert groups[0]["identity_condition"] == (
+        "fully_qualified_task_identity_established"
+    )
 
 
 def test_same_source_with_disagreeing_short_names_is_one_stated_condition() -> None:
@@ -651,6 +655,14 @@ def test_same_source_with_disagreeing_short_names_is_one_stated_condition() -> N
     assert groups[0]["identity_condition"] == (
         "task_name_disagreement_within_source_identity"
     )
+    assert groups[0]["within_task_contrast"] == {
+        "availability": "unavailable",
+        "reason": "task_identity_not_established",
+        "detail": (
+            "no contrast available for this group because a shared, "
+            "fully-qualified task identity was not established"
+        ),
+    }
     assert "task identity condition: task_name_disagreement" in (
         render_admission_report(report)
     )
@@ -709,7 +721,7 @@ def test_loader_uses_top_level_fallback_and_splits_unknown_conditions(
     groups = report["null_channel"]["per_task"]
     assert len(groups) == 4
     unknown_conditions = {
-        group["identity_condition"]
+        group["task_metadata_conditions"][0]
         for group in groups
         if group["task_identity"] == "unknown"
     }
@@ -720,8 +732,9 @@ def test_loader_uses_top_level_fallback_and_splits_unknown_conditions(
     rendered = render_admission_report(report)
     assert "task metadata condition(s): top_level_fallback_summary_missing" in rendered
     assert "summary_and_top_level_task_name_disagree" in rendered
-    assert "task unknown (validation_observation_summary_missing)" in rendered
-    assert "task unknown (validation_observation_summary_task_name_null)" in rendered
+    assert rendered.count("task unknown (task_identity_unknown)") == 2
+    assert "validation_observation_summary_missing" in rendered
+    assert "validation_observation_summary_task_name_null" in rendered
 
 
 @pytest.mark.parametrize("flags", [None, [None] * 10])
@@ -742,13 +755,16 @@ def test_no_flags_headline_and_json_state_all_complete_denominator(
     assert "pass rate 0/1 (0.0%) among all complete candidates" in headline
 
 
-def test_never_retrieved_admission_is_explained_outside_rate_denominator() -> None:
+@pytest.mark.parametrize("flags", [[False] * 10, [False] * 9 + [None]])
+def test_never_retrieved_admission_is_explained_outside_rate_denominator(
+    flags: list[bool | None],
+) -> None:
     report = assemble_admission_report(
         [
             _candidate(
                 "noise-admission",
                 [0.02] * 9 + [0.0],
-                [False] * 10,
+                flags,
                 task_name="task",
             )
         ]
@@ -763,6 +779,8 @@ def test_never_retrieved_admission_is_explained_outside_rate_denominator() -> No
     assert "pass rate 0/0 (not defined) among retrieved complete candidates" in headline
     assert "admitted outside the retrieval pass-rate denominator 1" in headline
     assert "(never retrieved 1, retrieval unknown 0)" in headline
+    candidate_line = render_admission_report(report).splitlines()[-1]
+    assert "skill never retrieved/injected" in candidate_line
 
 
 def test_null_channel_shape_is_constant_and_task_entries_are_not_nested_reports() -> (
@@ -809,7 +827,250 @@ def test_null_channel_states_incomplete_observation_scope() -> None:
     )
 
 
-def test_task_metadata_condition_values_do_not_alias() -> None:
-    values = [member.value for member in TaskMetadataCondition.__members__.values()]
+def test_unknown_candidates_are_separate_and_never_receive_a_contrast() -> None:
+    skill = _skill("unknown identity")
+    report = assemble_admission_report(
+        [
+            SkillAdmissionCandidate(
+                candidate_id="unknown-null",
+                arm="localized",
+                skill=skill,
+                paired_deltas=(1.0, 3.0),
+                injection_flags=(False, False),
+            ),
+            SkillAdmissionCandidate(
+                candidate_id="unknown-injected",
+                arm="localized",
+                skill=skill,
+                paired_deltas=(5.0, 7.0),
+                injection_flags=(True, True),
+            ),
+        ]
+    )
 
-    assert len(values) == len(set(values))
+    groups = report["null_channel"]["per_task"]
+    assert len(groups) == 2
+    assert [group["candidate_count"] for group in groups] == [1, 1]
+    assert [group["candidate_ids"] for group in groups] == [
+        ["unknown-injected"],
+        ["unknown-null"],
+    ]
+    assert {group["task_identity"] for group in groups} == {"unknown"}
+    assert {group["identity_condition"] for group in groups} == {
+        "task_identity_unknown"
+    }
+    assert {tuple(group["task_metadata_conditions"]) for group in groups} == {
+        ("direct_candidate_metadata",)
+    }
+    assert all(
+        group["within_task_contrast"]["reason"] == "task_identity_not_established"
+        for group in groups
+    )
+    assert "within-task difference" not in render_admission_report(report)
+
+
+def test_same_unqualified_short_name_never_groups_or_contrasts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "unqualified.json"
+    source.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidates": [
+                    {
+                        **_raw_candidate(
+                            "short-null", None, [1.0, 3.0], [False, False]
+                        ),
+                        "task_name": "same-label",
+                        "validation_observation_summary": {
+                            "task_name": "same-label",
+                            "source_task_name": None,
+                        },
+                    },
+                    {
+                        **_raw_candidate(
+                            "short-injected", None, [5.0, 7.0], [True, True]
+                        ),
+                        "task_name": "same-label",
+                        "validation_observation_summary": {
+                            "task_name": "same-label",
+                            "source_task_name": None,
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    candidates = load_admission_candidates(source)
+    report = assemble_admission_report(candidates)
+
+    assert [candidate.source_task_name for candidate in candidates] == [None, None]
+    groups = report["null_channel"]["per_task"]
+    assert len(groups) == 2
+    assert [group["candidate_count"] for group in groups] == [1, 1]
+    assert [group["source_task_name"] for group in groups] == [None, None]
+    groups_by_candidate = {group["candidate_ids"][0]: group for group in groups}
+    assert groups_by_candidate["short-null"]["no_skill_injected"]["n"] == 2
+    assert groups_by_candidate["short-null"]["no_skill_injected"]["mean_delta"] == 2.0
+    assert groups_by_candidate["short-null"]["skill_injected"]["n"] == 0
+    assert groups_by_candidate["short-injected"]["no_skill_injected"]["n"] == 0
+    assert groups_by_candidate["short-injected"]["skill_injected"]["n"] == 2
+    assert groups_by_candidate["short-injected"]["skill_injected"]["mean_delta"] == 6.0
+    assert {group["task_identity"] for group in groups} == {"unqualified"}
+    assert {group["identity_condition"] for group in groups} == {
+        "fully_qualified_task_identity_missing"
+    }
+    assert all(
+        group["within_task_contrast"]["reason"] == "task_identity_not_established"
+        for group in groups
+    )
+    rendered = render_admission_report(report)
+    assert "task identity condition: fully_qualified_task_identity_missing" in rendered
+    assert "within-task difference" not in rendered
+
+
+def test_recorded_qualified_source_groups_and_contrasts(tmp_path: Path) -> None:
+    source = tmp_path / "qualified.json"
+    source.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidates": [
+                    {
+                        **_raw_candidate(
+                            "qualified-null", None, [1.0, 3.0], [False, False]
+                        ),
+                        "task_name": "same-label",
+                        "validation_observation_summary": {
+                            "task_name": "same-label",
+                            "source_task_name": "suite/same-label",
+                        },
+                    },
+                    {
+                        **_raw_candidate(
+                            "qualified-injected", None, [5.0, 7.0], [True, True]
+                        ),
+                        "task_name": "same-label",
+                        "validation_observation_summary": {
+                            "task_name": "same-label",
+                            "source_task_name": "suite/same-label",
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    candidates = load_admission_candidates(source)
+    report = assemble_admission_report(candidates)
+
+    assert [candidate.source_task_name for candidate in candidates] == [
+        "suite/same-label",
+        "suite/same-label",
+    ]
+    groups = report["null_channel"]["per_task"]
+    assert len(groups) == 1
+    assert groups[0]["candidate_count"] == 2
+    assert groups[0]["source_task_name"] == "suite/same-label"
+    assert groups[0]["task_identity"] == "fully_qualified"
+    assert groups[0]["identity_condition"] == (
+        "fully_qualified_task_identity_established"
+    )
+    assert groups[0]["within_task_contrast"] == {
+        "availability": "available",
+        "injected_minus_no_skill_mean_delta": 4.0,
+    }
+
+
+def test_unknown_injection_flags_do_not_enter_either_channel() -> None:
+    report = assemble_admission_report(
+        [
+            _candidate(
+                "pure-channels",
+                [100.0, 1.0, 3.0, 5.0, 7.0] + [None] * 5,
+                [None, False, False, True, True] + [None] * 5,
+                task_name="suite/pure",
+            )
+        ]
+    )
+
+    group = report["null_channel"]["per_task"][0]
+    assert group["unknown_injection_observation_count"] == 1
+    assert group["no_skill_injected"] == {
+        "n": 2,
+        "mean_delta": 2.0,
+        "sample_standard_deviation": pytest.approx(1.4142135623730951),
+        "positive_count": 2,
+        "negative_count": 0,
+        "zero_count": 0,
+    }
+    assert group["skill_injected"] == {
+        "n": 2,
+        "mean_delta": 6.0,
+        "sample_standard_deviation": pytest.approx(1.4142135623730951),
+        "positive_count": 2,
+        "negative_count": 0,
+        "zero_count": 0,
+    }
+
+
+def test_retrieval_split_excludes_incomplete_candidates() -> None:
+    report = assemble_admission_report(
+        [
+            _candidate(
+                "complete",
+                [0.0] * 10,
+                [True] * 10,
+                task_name="suite/task",
+            ),
+            _candidate(
+                "incomplete",
+                [0.0] * 9,
+                [True] * 9,
+                task_name="suite/task",
+            ),
+        ]
+    )
+
+    assert report["retrieval_split"]["complete_candidate_count"] == 1
+    assert report["retrieval_split"]["retrieved_candidate_count"] == 1
+    assert report["retrieval_split"]["retrieved_and_unhelpful_candidate_count"] == 1
+    assert report["incomplete_candidate_count"] == 1
+
+
+def test_pooling_reason_ordering_and_candidate_counts_are_pinned() -> None:
+    report = assemble_admission_report(
+        [
+            _candidate("z-one", [0.0] * 10, [False] * 10, task_name="Suite/Z"),
+            _candidate("a-one", [0.0] * 10, [False] * 10, task_name="Suite/A"),
+            _candidate("a-two", [0.0] * 10, [True] * 10, task_name="suite/a "),
+        ]
+    )
+
+    null_channel = report["null_channel"]
+    assert null_channel["pooling"]["reason"] == (
+        "The injected and no-skill-injected channels can contain different task "
+        "mixtures, so a pooled cross-task mean difference would confound channel "
+        "with task composition."
+    )
+    assert [group["task_label"] for group in null_channel["per_task"]] == [
+        "Suite/A",
+        "Suite/Z",
+    ]
+    assert [group["candidate_count"] for group in null_channel["per_task"]] == [2, 1]
+
+
+def test_task_metadata_condition_values_do_not_alias() -> None:
+    metadata_values = [
+        member.value for member in TaskMetadataCondition.__members__.values()
+    ]
+    retrieval_values = [
+        member.value for member in CandidateRetrievalStatus.__members__.values()
+    ]
+
+    assert len(metadata_values) == len(set(metadata_values))
+    assert len(retrieval_values) == len(set(retrieval_values))
