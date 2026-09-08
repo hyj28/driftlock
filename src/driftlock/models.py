@@ -128,6 +128,7 @@ class StepOutcome:
     ``changed_paths`` and ``diff`` should describe only the just-finished step.
     ``tool_audits`` retains diagnostics that are deliberately not fed back into
     the agent conversation.
+    ``context_compactions`` records lossy conversation rewrites at this step.
     """
 
     action: str
@@ -140,6 +141,7 @@ class StepOutcome:
     commands_failed: int = 0
     tool_observations: tuple[str, ...] = ()
     tool_audits: tuple[Mapping[str, Any], ...] = ()
+    context_compactions: tuple[Mapping[str, Any], ...] = ()
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -173,6 +175,10 @@ class StepOutcome:
             not isinstance(audit, Mapping) for audit in self.tool_audits
         ):
             raise TypeError("tool_audits must be a tuple of mappings")
+        if not isinstance(self.context_compactions, tuple) or any(
+            not isinstance(audit, Mapping) for audit in self.context_compactions
+        ):
+            raise TypeError("context_compactions must be a tuple of mappings")
 
 
 @dataclass(frozen=True, slots=True)
