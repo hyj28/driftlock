@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
+from driftlock.agentic_retrieval import AgenticRetrievalTool
 from driftlock.lhtb import WorkspaceDelta, WorkspaceDeltaObserver
 from driftlock.models import StepContext, StepOutcome, StepTokenBudgetExhausted
 from driftlock.remote import RemoteEnvironment
@@ -129,6 +130,7 @@ class _ToolObservation:
     completed: bool = False
     summary: str = ""
     command_return_code: int | None = None
+    audit: Mapping[str, Any] | None = None
 
 
 class AgentConversationCodec:
@@ -216,6 +218,7 @@ class ToolCallingAgent:
         shell_timeout_sec: int = 60,
         codec: AgentConversationCodec | None = None,
         user: str | int | None = None,
+        retrieval_tool: AgenticRetrievalTool | None = None,
     ) -> None:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -239,6 +242,7 @@ class ToolCallingAgent:
         self.shell_timeout_sec = shell_timeout_sec
         self.codec = codec or AgentConversationCodec()
         self.user = user
+        self.retrieval_tool = retrieval_tool
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state()
@@ -247,7 +251,14 @@ class ToolCallingAgent:
         history, completed_steps = self.codec.decode(context.state)
         request = AgentCompletionRequest(
             messages=self._request_messages(context, history),
-            tools=_TOOL_DEFINITIONS,
+            # Preserve the exact legacy five-tool request whenever agentic
+            # retrieval is not configured; completed skill-injection runs must
+            # remain replayable without a prompt-surface change.
+            tools=(
+                _TOOL_DEFINITIONS
+                if self.retrieval_tool is None
+                else (*_TOOL_DEFINITIONS, _RETRIEVAL_TOOL_DEFINITION)
+            ),
             max_output_tokens=self.max_output_tokens,
         )
         request = replace(
@@ -331,6 +342,11 @@ class ToolCallingAgent:
             tool_observations=tuple(
                 _render_tool_observation(observation) for observation in observations
             ),
+            tool_audits=tuple(
+                observation.audit
+                for observation in observations
+                if observation.audit is not None
+            ),
             error="; ".join(errors) or None,
             tokens=completion.tokens,
             completed=completed,
@@ -407,6 +423,11 @@ class ToolCallingAgent:
             return WorkspaceDelta(), f"Workspace delta observation failed: {error}"
 
     async def _execute_tool(self, call: ToolCall, workspace: str) -> _ToolObservation:
+        if call.name == "retrieve_context":
+            try:
+                return self._retrieve_context(call)
+            except Exception as error:
+                return self._record_unexpected_retrieval_failure(call, error)
         try:
             arguments = _decode_arguments(call.arguments)
             if call.name == "run_shell":
@@ -551,6 +572,65 @@ class ToolCallingAgent:
         output = result.stdout or "(no matches)"
         return _ToolObservation(call, _truncate(output, self.max_tool_output_chars))
 
+    def _retrieve_context(self, call: ToolCall) -> _ToolObservation:
+        if self.retrieval_tool is None:
+            return _tool_error(call, "retrieve_context is not configured for this task")
+        malformed_error: str | None = None
+        try:
+            arguments = _decode_arguments(call.arguments)
+            _require_keys(arguments, required={"query"})
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            malformed_error = f"malformed arguments for {call.name}: {error}"
+            result = self.retrieval_tool.record_rejected_attempt(
+                call.arguments, malformed_error
+            )
+        else:
+            result = self.retrieval_tool.retrieve(arguments["query"])
+        audit = {
+            "schema_version": 1,
+            "tool_call": {
+                "id": call.call_id,
+                "name": call.name,
+                "arguments": _json_safe(call.arguments),
+            },
+            "result": result.to_report(),
+        }
+        return _ToolObservation(
+            call,
+            result.to_observation(max_characters=self.max_tool_output_chars),
+            error=malformed_error,
+            audit=audit,
+        )
+
+    def _record_unexpected_retrieval_failure(
+        self, call: ToolCall, error: Exception
+    ) -> _ToolObservation:
+        message = f"retrieve_context failed: {type(error).__name__}: {error}"
+        if self.retrieval_tool is None:
+            return _tool_error(call, message)
+        try:
+            result = self.retrieval_tool.record_rejected_attempt(
+                call.arguments,
+                message,
+                reason="retrieval_execution_failed",
+            )
+            audit = {
+                "schema_version": 1,
+                "tool_call": {
+                    "id": call.call_id,
+                    "name": call.name,
+                    "arguments": _json_safe(call.arguments),
+                },
+                "result": result.to_report(),
+            }
+            content = result.to_observation(max_characters=self.max_tool_output_chars)
+        except Exception as audit_error:
+            return _tool_error(
+                call,
+                f"{message}; retrieval failure audit also failed: {audit_error}",
+            )
+        return _ToolObservation(call, content, error=message, audit=audit)
+
     def _complete_task(
         self, call: ToolCall, arguments: dict[str, Any]
     ) -> _ToolObservation:
@@ -637,6 +717,18 @@ _TOOL_DEFINITIONS = (
         "Signal that the task is complete, with a concise result summary.",
         _object_schema({"summary": _STRING}, ["summary"]),
     ),
+)
+
+# Keep the new definition separate so unconfigured legacy runs receive the exact
+# historical five-tool request, while configured agents see it alongside all five.
+_RETRIEVAL_TOOL_DEFINITION = ToolDefinition(
+    "retrieve_context",
+    (
+        "Retrieve ranked relevant skills and workspace text using a description "
+        "of the situation you are currently in. Re-query with a different "
+        "description when the first query is not useful."
+    ),
+    _object_schema({"query": _STRING}, ["query"]),
 )
 
 
@@ -756,6 +848,8 @@ def _describe_action(completion: AgentCompletion) -> str:
         return _shorten(f"Write file: {arguments.get('path', '')}", 160)
     if call.name == "search_files":
         return _shorten(f"Search files for: {arguments.get('query', '')}", 160)
+    if call.name == "retrieve_context":
+        return _shorten(f"Retrieve context for: {arguments.get('query', '')}", 160)
     if call.name == "complete":
         return "Signal task completion"
     return _shorten(f"Attempt unknown tool: {call.name}", 160)

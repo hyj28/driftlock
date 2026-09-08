@@ -319,6 +319,18 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             ],
             "signal_counts": result.signal_counts,
         }
+        tool_audits = [
+            {
+                "sequence": step.sequence,
+                "logical_step": step.logical_step,
+                "attempt": step.attempt,
+                "audits": [dict(audit) for audit in step.outcome.tool_audits],
+            }
+            for step in result.steps
+            if step.outcome.tool_audits
+        ]
+        if tool_audits:
+            record["tool_audits"] = tool_audits
         self._native_phases.append(record)
         output = Path(self.logs_dir) / "driftlock-native-result.json"
         output.write_text(

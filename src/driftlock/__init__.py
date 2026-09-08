@@ -12,6 +12,22 @@ from driftlock.agent import (
     ToolDefinition,
     conservative_prefill_estimate,
 )
+from driftlock.agentic_retrieval import (
+    AGENTIC_RETRIEVAL_RULE_ID,
+    DEFAULT_IGNORED_DIRECTORY_NAMES,
+    DEFAULT_MAX_CHARACTERS_PER_CALL,
+    DEFAULT_MAX_CHARACTERS_PER_TASK,
+    DEFAULT_MAX_RESULTS_PER_CALL,
+    AgenticRetrievalConfig,
+    AgenticRetrievalResult,
+    AgenticRetrievalStatus,
+    AgenticRetrievalTool,
+    RetrievalCorpus,
+    RetrievalCorpusBuilder,
+    RetrievalCorpusStatus,
+    RetrievalDocumentKind,
+    RetrievedContext,
+)
 from driftlock.checkpoints import DirectoryCheckpointStore, SnapshotIntegrityError
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import (
@@ -131,9 +147,14 @@ from driftlock.terminus import (
 
 __all__ = [
     "ADMISSION_RULE_ID",
+    "AGENTIC_RETRIEVAL_RULE_ID",
+    "DEFAULT_IGNORED_DIRECTORY_NAMES",
     "DEFAULT_JUDGE_MAX_OUTPUT_TOKENS",
+    "DEFAULT_MAX_CHARACTERS_PER_CALL",
+    "DEFAULT_MAX_CHARACTERS_PER_TASK",
     "DEFAULT_MAX_DIAGNOSTIC_CANDIDATES",
     "DEFAULT_MAX_INJECTION_CHARACTERS",
+    "DEFAULT_MAX_RESULTS_PER_CALL",
     "DEFAULT_MAX_SKILLS",
     "DEFAULT_MIN_SIMILARITY",
     "DEFAULT_MIN_SIMILARITY_CALIBRATION",
@@ -161,6 +182,10 @@ __all__ = [
     "AgentPrefillEstimator",
     "AgentProviderError",
     "AgentStateError",
+    "AgenticRetrievalConfig",
+    "AgenticRetrievalResult",
+    "AgenticRetrievalStatus",
+    "AgenticRetrievalTool",
     "CallableLLMJudge",
     "CallableSkillDistiller",
     "Checkpoint",
@@ -186,6 +211,11 @@ __all__ = [
     "LocalWorkspaceDeltaObserver",
     "RemoteArchiveCheckpointStore",
     "RemoteCheckpointError",
+    "RetrievalCorpus",
+    "RetrievalCorpusBuilder",
+    "RetrievalCorpusStatus",
+    "RetrievalDocumentKind",
+    "RetrievedContext",
     "RetrievedSkill",
     "RunResult",
     "RunStatus",
