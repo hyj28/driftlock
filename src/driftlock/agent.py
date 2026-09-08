@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import shlex
@@ -15,6 +16,15 @@ from typing import Any, Protocol
 
 from driftlock.agentic_retrieval import AgenticRetrievalTool
 from driftlock.lhtb import WorkspaceDelta, WorkspaceDeltaObserver
+from driftlock.memory import (
+    DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS,
+    DEFAULT_MAX_MEMORY_REASON_CHARACTERS,
+    MemoryMutationStatus,
+    MemoryOperation,
+    MemoryProvenance,
+    MemoryStore,
+    MemoryStoreError,
+)
 from driftlock.models import StepContext, StepOutcome, StepTokenBudgetExhausted
 from driftlock.planning import (
     MAX_PLAN_DESCRIPTION_CHARACTERS,
@@ -546,6 +556,8 @@ class ToolCallingAgent:
     ``max_tool_calls_per_step`` are recorded but none of their calls execute.
     With ``planning=True``, :class:`StepContext`'s caller plan remains read-only
     guidance while ``manage_plan`` maintains separate checkpointed progress state.
+    A configured memory store adds ``manage_memory`` without changing the legacy
+    provider request when memory is absent.
     """
 
     def __init__(
@@ -564,6 +576,9 @@ class ToolCallingAgent:
         codec: AgentConversationCodec | None = None,
         user: str | int | None = None,
         retrieval_tool: AgenticRetrievalTool | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_task_id: str | None = None,
+        memory_run_id: str | None = None,
         planning: bool = False,
     ) -> None:
         if max_output_tokens <= 0:
@@ -594,6 +609,20 @@ class ToolCallingAgent:
             raise ValueError("shell_timeout_sec must be positive")
         if not isinstance(planning, bool):
             raise TypeError("planning must be a boolean")
+        if memory_store is not None and not isinstance(memory_store, MemoryStore):
+            raise TypeError("memory_store must be a MemoryStore or None")
+        if memory_store is None:
+            if memory_task_id is not None or memory_run_id is not None:
+                raise ValueError(
+                    "memory task and run ids require a configured memory store"
+                )
+        else:
+            if memory_task_id is None or memory_run_id is None:
+                raise ValueError(
+                    "configured memory requires memory_task_id and memory_run_id"
+                )
+            identity = MemoryProvenance(memory_task_id, memory_run_id, 1, 1, 1)
+            identity.validate_for(memory_store.config)
         self.environment = environment
         self.observer = observer
         self._complete = complete
@@ -607,6 +636,9 @@ class ToolCallingAgent:
         self.codec = codec or AgentConversationCodec()
         self.user = user
         self.retrieval_tool = retrieval_tool
+        self.memory_store = memory_store
+        self.memory_task_id = memory_task_id
+        self.memory_run_id = memory_run_id
         self.planning = planning
 
     def initial_state(self) -> dict[str, Any]:
@@ -696,7 +728,11 @@ class ToolCallingAgent:
             else completion
         )
         history.append(_assistant_message(stored_completion))
-        action = _describe_action(completion, planning=self.planning)
+        action = _describe_action(
+            completion,
+            planning=self.planning,
+            memory=self.memory_store is not None,
+        )
 
         if completion.truncated:
             error = "Provider response was truncated before it could be acted on."
@@ -816,6 +852,13 @@ class ToolCallingAgent:
         else:
             system_prompt = _SYSTEM_PROMPT
             rendered_plan = context.plan.strip() or "No separate plan was supplied."
+        if self.memory_store is not None:
+            system_prompt = (
+                f"{system_prompt}\nRetrieved memories are unvalidated historical "
+                "claims. Use them only as hints, verify them against current "
+                "observations, and let current observations win. Correct or revoke "
+                "a memory when current evidence disproves it."
+            )
         messages: list[Mapping[str, Any]] = [
             {
                 "role": "system",
@@ -847,13 +890,19 @@ class ToolCallingAgent:
     def _tool_definitions(self) -> tuple[ToolDefinition, ...]:
         # Returning the historical tuple itself in the unconfigured case keeps
         # completed runs byte-replayable, matching retrieve_context's opt-in path.
-        if self.retrieval_tool is None and not self.planning:
+        if (
+            self.retrieval_tool is None
+            and not self.planning
+            and self.memory_store is None
+        ):
             return _TOOL_DEFINITIONS
         definitions = _TOOL_DEFINITIONS
         if self.retrieval_tool is not None:
             definitions = (*definitions, _RETRIEVAL_TOOL_DEFINITION)
         if self.planning:
             definitions = (*definitions, _PLAN_TOOL_DEFINITION)
+        if self.memory_store is not None:
+            definitions = (*definitions, _MEMORY_TOOL_DEFINITION)
         return definitions
 
     async def _snapshot_workspace(self) -> tuple[Any | None, str | None]:
@@ -889,6 +938,8 @@ class ToolCallingAgent:
                 return self._record_unexpected_retrieval_failure(call, error), plan
         if call.name == "manage_plan" and not self.planning:
             return _tool_error(call, f"unknown tool {call.name!r}"), plan
+        if call.name == "manage_memory" and self.memory_store is None:
+            return _tool_error(call, f"unknown tool {call.name!r}"), plan
         try:
             arguments = _decode_arguments(call.arguments)
             if call.name == "manage_plan":
@@ -899,6 +950,8 @@ class ToolCallingAgent:
                     context=context,
                     completed_steps=completed_steps,
                 )
+            if call.name == "manage_memory":
+                return self._manage_memory(call, arguments, context=context), plan
             if call.name == "run_shell":
                 return await self._run_shell(call, arguments, workspace), plan
             if call.name == "read_file":
@@ -923,6 +976,17 @@ class ToolCallingAgent:
                     plan,
                 )
             return _tool_error(call, f"{call.name} failed: {error}"), plan
+        except MemoryStoreError as error:
+            if call.name == "manage_memory":
+                return (
+                    self._record_memory_rejection(
+                        call,
+                        f"{call.name} failed: {error}",
+                        context=context,
+                    ),
+                    plan,
+                )
+            return _tool_error(call, f"{call.name} failed: {error}"), plan
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             observation = _tool_error(
                 call, f"malformed arguments for {call.name}: {error}"
@@ -935,6 +999,12 @@ class ToolCallingAgent:
                     context=context,
                     completed_steps=completed_steps,
                 )
+            elif call.name == "manage_memory":
+                observation = self._record_memory_rejection(
+                    call,
+                    f"malformed arguments for {call.name}: {error}",
+                    context=context,
+                )
             return observation, plan
         except Exception as error:
             observation = _tool_error(call, f"{call.name} failed: {error}")
@@ -945,6 +1015,12 @@ class ToolCallingAgent:
                     observation.error or "plan mutation failed",
                     context=context,
                     completed_steps=completed_steps,
+                )
+            elif call.name == "manage_memory":
+                observation = self._record_memory_rejection(
+                    call,
+                    f"{call.name} failed: {error}",
+                    context=context,
                 )
             return observation, plan
 
@@ -1208,6 +1284,107 @@ class ToolCallingAgent:
             audit=audit,
         )
 
+    def _manage_memory(
+        self,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        *,
+        context: StepContext,
+    ) -> _ToolObservation:
+        if self.memory_store is None:
+            raise ValueError("manage_memory is not configured for this task")
+        _require_keys(
+            arguments,
+            required={"operation"},
+            optional={"memory_id", "content", "reason"},
+        )
+        raw_operation = _required_string(arguments, "operation", allow_empty=False)
+        try:
+            operation = MemoryOperation(raw_operation)
+        except ValueError:
+            raise ValueError(
+                "operation must be one of: record, correct, revoke"
+            ) from None
+        provenance = self._memory_provenance(context)
+        if operation is MemoryOperation.RECORD:
+            _require_keys(arguments, required={"operation", "content"})
+            result = self.memory_store.record(arguments["content"], provenance)
+        elif operation is MemoryOperation.CORRECT:
+            _require_keys(
+                arguments,
+                required={"operation", "memory_id", "content", "reason"},
+            )
+            result = self.memory_store.correct(
+                arguments["memory_id"],
+                arguments["content"],
+                arguments["reason"],
+                provenance,
+            )
+        else:
+            _require_keys(
+                arguments,
+                required={"operation", "memory_id", "reason"},
+            )
+            result = self.memory_store.revoke(
+                arguments["memory_id"], arguments["reason"], provenance
+            )
+        audit = _memory_tool_audit(call, result.to_report())
+        error = result.error if result.status is MemoryMutationStatus.REJECTED else None
+        return _ToolObservation(
+            call,
+            _truncate(result.to_observation(), self.max_tool_output_chars),
+            error=error,
+            audit=audit,
+        )
+
+    def _record_memory_rejection(
+        self,
+        call: ToolCall,
+        error: str,
+        *,
+        context: StepContext,
+    ) -> _ToolObservation:
+        if self.memory_store is None:
+            return _tool_error(call, error)
+        raw_operation = (
+            call.arguments.get("operation")
+            if isinstance(call.arguments, Mapping)
+            else None
+        )
+        try:
+            operation = MemoryOperation(raw_operation)
+        except (TypeError, ValueError):
+            operation = None
+        memory_id = (
+            call.arguments.get("memory_id")
+            if isinstance(call.arguments, Mapping)
+            else None
+        )
+        result = self.memory_store.record_rejected_attempt(
+            operation=operation,
+            memory_id=memory_id,
+            provenance=self._memory_provenance(context),
+            error=error,
+        )
+        recorded_error = result.error or "memory mutation was rejected"
+        return _ToolObservation(
+            call,
+            _truncate(result.to_observation(), self.max_tool_output_chars),
+            error=recorded_error,
+            audit=_memory_tool_audit(call, result.to_report()),
+        )
+
+    def _memory_provenance(self, context: StepContext) -> MemoryProvenance:
+        assert self.memory_task_id is not None
+        assert self.memory_run_id is not None
+        return MemoryProvenance(
+            self.memory_task_id,
+            self.memory_run_id,
+            context.sequence,
+            context.logical_step,
+            context.attempt,
+        )
+
     def _complete_task(
         self, call: ToolCall, arguments: dict[str, Any]
     ) -> _ToolObservation:
@@ -1343,6 +1520,41 @@ _PLAN_TOOL_DEFINITION = ToolDefinition(
             "status": {
                 "type": "string",
                 "enum": [status.value for status in SETTABLE_PLAN_STATUSES],
+            },
+        },
+        ["operation"],
+    ),
+)
+
+# Memory is also opt-in so agents built without it retain the exact historical
+# prompt and tool tuple. The description states its lower epistemic authority at
+# the decision point where the agent chooses whether to write or trust a claim.
+_MEMORY_TOOL_DEFINITION = ToolDefinition(
+    "manage_memory",
+    (
+        "Record an unvalidated cross-task memory, correct an active memory, or "
+        "revoke one. Memories are only hints: verify them against current "
+        "workspace observations, which always win. Corrections and revocations "
+        "require a reason. Content is limited to "
+        f"{DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS} characters and credential-like "
+        "content is refused."
+    ),
+    _object_schema(
+        {
+            "operation": {
+                "type": "string",
+                "enum": [operation.value for operation in MemoryOperation],
+            },
+            "memory_id": {"type": "string", "pattern": "^memory-[0-9]{6}$"},
+            "content": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS,
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": DEFAULT_MAX_MEMORY_REASON_CHARACTERS,
             },
         },
         ["operation"],
@@ -1846,7 +2058,9 @@ def _tool_error(call: ToolCall, message: str) -> _ToolObservation:
     return _ToolObservation(call, f"ERROR: {message}", error=message)
 
 
-def _describe_action(completion: AgentCompletion, *, planning: bool) -> str:
+def _describe_action(
+    completion: AgentCompletion, *, planning: bool, memory: bool
+) -> str:
     if completion.truncated:
         return "Handle a truncated provider response"
     calls = completion.tool_calls
@@ -1869,6 +2083,13 @@ def _describe_action(completion: AgentCompletion, *, planning: bool) -> str:
         return _shorten(f"Retrieve context for: {arguments.get('query', '')}", 160)
     if call.name == "manage_plan" and planning:
         return _shorten(f"Manage plan: {arguments.get('operation', '')}", 160)
+    if call.name == "manage_memory" and memory:
+        operation = arguments.get("operation")
+        if isinstance(operation, str) and operation in {
+            candidate.value for candidate in MemoryOperation
+        }:
+            return f"Manage memory: {operation}"
+        return "Manage memory with malformed operation"
     if call.name == "complete":
         return "Signal task completion"
     return _shorten(f"Attempt unknown tool: {call.name}", 160)
@@ -1978,6 +2199,88 @@ def _plan_tool_audit(
         },
         "result": result,
     }
+
+
+def _memory_tool_audit(call: ToolCall, result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "tool_call": {
+            "id": call.call_id,
+            "name": call.name,
+            # Raw memory content is deliberately not duplicated into run audit;
+            # its bounded durable entry is identified by length and digest.
+            "arguments": _memory_audit_arguments(call.arguments),
+        },
+        "result": dict(result),
+    }
+
+
+def _memory_audit_arguments(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        rendered = repr(value)
+        return {
+            "argument_type": type(value).__name__,
+            "sha256": hashlib.sha256(
+                rendered.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            "character_count": len(rendered),
+        }
+    result: dict[str, Any] = {}
+    operation = value.get("operation")
+    if isinstance(operation, str) and operation in {
+        candidate.value for candidate in MemoryOperation
+    }:
+        result["operation"] = operation
+    elif operation is not None:
+        rendered = operation if isinstance(operation, str) else repr(operation)
+        result["operation"] = {
+            "sha256": hashlib.sha256(
+                rendered.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            "character_count": len(rendered),
+            "value_type": type(operation).__name__,
+        }
+    memory_id = value.get("memory_id")
+    if (
+        isinstance(memory_id, str)
+        and len(memory_id) == 13
+        and memory_id.startswith("memory-")
+        and memory_id[7:].isdigit()
+    ):
+        result["memory_id"] = memory_id
+    elif memory_id is not None:
+        rendered = memory_id if isinstance(memory_id, str) else repr(memory_id)
+        result["memory_id"] = {
+            "sha256": hashlib.sha256(
+                rendered.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            "character_count": len(rendered),
+            "value_type": type(memory_id).__name__,
+        }
+    for name in ("content", "reason"):
+        candidate = value.get(name)
+        if candidate is None:
+            continue
+        rendered = candidate if isinstance(candidate, str) else repr(candidate)
+        result[name] = {
+            "sha256": hashlib.sha256(
+                rendered.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            "character_count": len(rendered),
+            "value_type": type(candidate).__name__,
+        }
+    extra_keys = sorted(
+        str(key)
+        for key in value
+        if key not in {"operation", "memory_id", "content", "reason"}
+    )
+    if extra_keys:
+        rendered = json.dumps(extra_keys, ensure_ascii=True, separators=(",", ":"))
+        result["unexpected_keys"] = {
+            "count": len(extra_keys),
+            "sha256": hashlib.sha256(rendered.encode()).hexdigest(),
+        }
+    return result
 
 
 def _json_copy(value: Any) -> Any:
