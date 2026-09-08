@@ -16,6 +16,17 @@ from typing import Any, Protocol
 from driftlock.agentic_retrieval import AgenticRetrievalTool
 from driftlock.lhtb import WorkspaceDelta, WorkspaceDeltaObserver
 from driftlock.models import StepContext, StepOutcome, StepTokenBudgetExhausted
+from driftlock.planning import (
+    MAX_PLAN_DESCRIPTION_CHARACTERS,
+    MAX_PLAN_STEPS,
+    SETTABLE_PLAN_STATUSES,
+    AgentPlan,
+    PlanError,
+    PlanOperation,
+    PlanStatus,
+    PlanUpdateStatus,
+    apply_plan_operation,
+)
 from driftlock.remote import RemoteEnvironment
 
 
@@ -420,10 +431,9 @@ def compact_conversation_history(
 class AgentConversationCodec:
     """Versioned JSON codec for semantic tool-agent conversation state."""
 
-    # Message objects have always been open JSON mappings beyond role/content;
-    # compaction audit metadata uses that extension point, so the encoded
-    # {messages, steps} contract is unchanged and does not require a version bump.
-    schema_version = 1
+    # Version two adds the separately validated plan field. Version-one states
+    # migrate explicitly to a null plan, so old experiments are never misread.
+    schema_version = 2
     state_key = "driftlock_tool_agent"
 
     def initial_state(self) -> dict[str, Any]:
@@ -432,31 +442,61 @@ class AgentConversationCodec:
                 "schema_version": self.schema_version,
                 "messages": [],
                 "steps": 0,
+                "plan": None,
             }
         }
 
     def encode(
-        self, messages: Sequence[Mapping[str, Any]], *, steps: int
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        steps: int,
+        plan: AgentPlan | None = None,
     ) -> dict[str, Any]:
+        if plan is not None and not isinstance(plan, AgentPlan):
+            raise AgentStateError("tool-agent plan must be an AgentPlan or None")
         payload = {
             "schema_version": self.schema_version,
             "messages": list(messages),
             "steps": steps,
+            "plan": plan.to_dict() if plan is not None else None,
         }
         return {self.state_key: _json_copy(payload)}
 
     def decode(self, value: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
+        """Decode conversation fields while retaining the legacy return shape."""
+
+        messages, steps, _plan = self.decode_with_plan(value)
+        return messages, steps
+
+    def decode_with_plan(
+        self, value: Mapping[str, Any]
+    ) -> tuple[list[dict[str, Any]], int, AgentPlan | None]:
+        """Decode all checkpointed agent state, including the durable plan."""
+
         payload = value.get(self.state_key)
         if not isinstance(payload, Mapping):
             raise AgentStateError(
                 f"checkpoint state is missing the {self.state_key!r} object"
             )
         version = payload.get("schema_version")
-        if (
-            not isinstance(version, int)
-            or isinstance(version, bool)
-            or version != self.schema_version
-        ):
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise AgentStateError("unsupported tool-agent state schema version")
+        if version == 1:
+            if set(payload) != {"schema_version", "messages", "steps"}:
+                raise AgentStateError(
+                    "version-one tool-agent state fields are malformed"
+                )
+            raw_plan = None
+        elif version == self.schema_version:
+            if set(payload) != {"schema_version", "messages", "steps", "plan"}:
+                raise AgentStateError(
+                    "version-two tool-agent state fields are malformed"
+                )
+            if "plan" not in payload:
+                raise AgentStateError("tool-agent state is missing the plan field")
+            raw_plan = payload.get("plan")
+        else:
             raise AgentStateError("unsupported tool-agent state schema version")
         messages = payload.get("messages")
         if not isinstance(messages, list) or any(
@@ -486,7 +526,16 @@ class AgentConversationCodec:
             raise AgentStateError(
                 "tool-agent messages must be JSON-compatible"
             ) from error
-        return copied, steps
+        if raw_plan is None:
+            plan = None
+        else:
+            try:
+                plan = AgentPlan.from_dict(raw_plan)
+            except (PlanError, TypeError) as error:
+                raise AgentStateError(
+                    f"tool-agent plan is malformed: {error}"
+                ) from error
+        return copied, steps, plan
 
 
 class ToolCallingAgent:
@@ -495,6 +544,8 @@ class ToolCallingAgent:
     ``max_history_characters`` must be at least
     :data:`MIN_MAX_HISTORY_CHARACTERS`. Responses above
     ``max_tool_calls_per_step`` are recorded but none of their calls execute.
+    With ``planning=True``, :class:`StepContext`'s caller plan remains read-only
+    guidance while ``manage_plan`` maintains separate checkpointed progress state.
     """
 
     def __init__(
@@ -513,6 +564,7 @@ class ToolCallingAgent:
         codec: AgentConversationCodec | None = None,
         user: str | int | None = None,
         retrieval_tool: AgenticRetrievalTool | None = None,
+        planning: bool = False,
     ) -> None:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -540,6 +592,8 @@ class ToolCallingAgent:
             )
         if shell_timeout_sec <= 0:
             raise ValueError("shell_timeout_sec must be positive")
+        if not isinstance(planning, bool):
+            raise TypeError("planning must be a boolean")
         self.environment = environment
         self.observer = observer
         self._complete = complete
@@ -553,13 +607,21 @@ class ToolCallingAgent:
         self.codec = codec or AgentConversationCodec()
         self.user = user
         self.retrieval_tool = retrieval_tool
+        self.planning = planning
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state()
 
     async def __call__(self, context: StepContext) -> StepOutcome:
-        history, completed_steps = self.codec.decode(context.state)
+        history, completed_steps, plan = self.codec.decode_with_plan(context.state)
+        if not self.planning and plan is not None:
+            raise AgentStateError(
+                "checkpoint state contains a plan but planning is not enabled"
+            )
         try:
+            # Only provider-visible history is compacted and budgeted here. The
+            # bounded plan stays beside it in checkpoint state and is injected
+            # afterward, so it cannot be compacted away or starve recent turns.
             compaction = compact_conversation_history(
                 history,
                 max_characters=self.max_history_characters,
@@ -569,7 +631,7 @@ class ToolCallingAgent:
             message = f"Malformed conversation state: {error}"
             return StepOutcome(
                 action="Reject malformed conversation state",
-                state=self.codec.encode(history, steps=completed_steps + 1),
+                state=self.codec.encode(history, steps=completed_steps + 1, plan=plan),
                 error=message,
                 summary=message,
             )
@@ -578,15 +640,10 @@ class ToolCallingAgent:
             (compaction.audit.to_dict(),) if compaction.audit is not None else ()
         )
         request = AgentCompletionRequest(
-            messages=self._request_messages(context, history),
-            # Preserve the exact legacy five-tool request whenever agentic
-            # retrieval is not configured; completed skill-injection runs must
-            # remain replayable without a prompt-surface change.
-            tools=(
-                _TOOL_DEFINITIONS
-                if self.retrieval_tool is None
-                else (*_TOOL_DEFINITIONS, _RETRIEVAL_TOOL_DEFINITION)
-            ),
+            messages=self._request_messages(context, history, plan),
+            # Preserve the exact legacy request when neither optional tool is
+            # configured; completed runs remain replayable without a surface change.
+            tools=self._tool_definitions(),
             max_output_tokens=self.max_output_tokens,
         )
         request = replace(
@@ -614,7 +671,7 @@ class ToolCallingAgent:
             observation_error = before_error or observer_error
             return StepOutcome(
                 action="Provider call failed",
-                state=self.codec.encode(updated, steps=completed_steps + 1),
+                state=self.codec.encode(updated, steps=completed_steps + 1, plan=plan),
                 changed_paths=delta.changed_paths,
                 diff=delta.diff,
                 workspace_delta_observed=observation_error is None,
@@ -639,7 +696,7 @@ class ToolCallingAgent:
             else completion
         )
         history.append(_assistant_message(stored_completion))
-        action = _describe_action(completion)
+        action = _describe_action(completion, planning=self.planning)
 
         if completion.truncated:
             error = "Provider response was truncated before it could be acted on."
@@ -659,7 +716,13 @@ class ToolCallingAgent:
             history.append({"role": "user", "content": f"ERROR: {error}"})
         else:
             for call in completion.tool_calls:
-                observation = await self._execute_tool(call, workspace)
+                observation, plan = await self._execute_tool(
+                    call,
+                    workspace,
+                    plan=plan,
+                    context=context,
+                    completed_steps=completed_steps,
+                )
                 observations.append(observation)
                 history.append(_observation_message(observation))
                 if observation.error:
@@ -683,7 +746,7 @@ class ToolCallingAgent:
         )
         return StepOutcome(
             action=action,
-            state=self.codec.encode(history, steps=completed_steps + 1),
+            state=self.codec.encode(history, steps=completed_steps + 1, plan=plan),
             changed_paths=delta.changed_paths,
             diff=delta.diff,
             workspace_delta_observed=observation_error is None,
@@ -732,20 +795,38 @@ class ToolCallingAgent:
         return self.max_output_tokens
 
     def _request_messages(
-        self, context: StepContext, history: Sequence[Mapping[str, Any]]
+        self,
+        context: StepContext,
+        history: Sequence[Mapping[str, Any]],
+        plan: AgentPlan | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
-        plan = context.plan.strip() or "No separate plan was supplied."
+        if self.planning:
+            system_prompt = (
+                f"{_SYSTEM_PROMPT}\nTreat the caller-supplied plan as read-only "
+                "guidance. Use manage_plan to keep the durable progress plan current "
+                "as work advances."
+            )
+            caller_plan = (
+                context.plan.strip() or "No caller-supplied plan was provided."
+            )
+            rendered_plan = (
+                f"Caller-supplied plan (read-only guidance):\n{caller_plan}\n\n"
+                f"{_render_agent_plan(plan)}"
+            )
+        else:
+            system_prompt = _SYSTEM_PROMPT
+            rendered_plan = context.plan.strip() or "No separate plan was supplied."
         messages: list[Mapping[str, Any]] = [
             {
                 "role": "system",
                 "content": (
-                    f"{_SYSTEM_PROMPT}\nEmit no more than "
+                    f"{system_prompt}\nEmit no more than "
                     f"{self.max_tool_calls_per_step} tool calls in one response."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Goal:\n{context.goal}\n\nPlan:\n{plan}",
+                "content": f"Goal:\n{context.goal}\n\nPlan:\n{rendered_plan}",
             },
             *[_provider_message(message) for message in history],
         ]
@@ -762,6 +843,18 @@ class ToolCallingAgent:
                 }
             )
         return tuple(messages)
+
+    def _tool_definitions(self) -> tuple[ToolDefinition, ...]:
+        # Returning the historical tuple itself in the unconfigured case keeps
+        # completed runs byte-replayable, matching retrieve_context's opt-in path.
+        if self.retrieval_tool is None and not self.planning:
+            return _TOOL_DEFINITIONS
+        definitions = _TOOL_DEFINITIONS
+        if self.retrieval_tool is not None:
+            definitions = (*definitions, _RETRIEVAL_TOOL_DEFINITION)
+        if self.planning:
+            definitions = (*definitions, _PLAN_TOOL_DEFINITION)
+        return definitions
 
     async def _snapshot_workspace(self) -> tuple[Any | None, str | None]:
         try:
@@ -780,29 +873,80 @@ class ToolCallingAgent:
         except Exception as error:
             return WorkspaceDelta(), f"Workspace delta observation failed: {error}"
 
-    async def _execute_tool(self, call: ToolCall, workspace: str) -> _ToolObservation:
+    async def _execute_tool(
+        self,
+        call: ToolCall,
+        workspace: str,
+        *,
+        plan: AgentPlan | None,
+        context: StepContext,
+        completed_steps: int,
+    ) -> tuple[_ToolObservation, AgentPlan | None]:
         if call.name == "retrieve_context":
             try:
-                return self._retrieve_context(call)
+                return self._retrieve_context(call), plan
             except Exception as error:
-                return self._record_unexpected_retrieval_failure(call, error)
+                return self._record_unexpected_retrieval_failure(call, error), plan
+        if call.name == "manage_plan" and not self.planning:
+            return _tool_error(call, f"unknown tool {call.name!r}"), plan
         try:
             arguments = _decode_arguments(call.arguments)
+            if call.name == "manage_plan":
+                return self._manage_plan(
+                    call,
+                    arguments,
+                    plan,
+                    context=context,
+                    completed_steps=completed_steps,
+                )
             if call.name == "run_shell":
-                return await self._run_shell(call, arguments, workspace)
+                return await self._run_shell(call, arguments, workspace), plan
             if call.name == "read_file":
-                return await self._read_file(call, arguments, workspace)
+                return await self._read_file(call, arguments, workspace), plan
             if call.name == "write_file":
-                return await self._write_file(call, arguments, workspace)
+                return await self._write_file(call, arguments, workspace), plan
             if call.name == "search_files":
-                return await self._search_files(call, arguments, workspace)
+                return await self._search_files(call, arguments, workspace), plan
             if call.name == "complete":
-                return self._complete_task(call, arguments)
-            return _tool_error(call, f"unknown tool {call.name!r}")
+                return self._complete_task(call, arguments), plan
+            return _tool_error(call, f"unknown tool {call.name!r}"), plan
+        except PlanError as error:
+            if call.name == "manage_plan":
+                return (
+                    self._record_plan_rejection(
+                        call,
+                        plan,
+                        str(error),
+                        context=context,
+                        completed_steps=completed_steps,
+                    ),
+                    plan,
+                )
+            return _tool_error(call, f"{call.name} failed: {error}"), plan
         except (TypeError, ValueError, json.JSONDecodeError) as error:
-            return _tool_error(call, f"malformed arguments for {call.name}: {error}")
+            observation = _tool_error(
+                call, f"malformed arguments for {call.name}: {error}"
+            )
+            if call.name == "manage_plan":
+                observation = self._record_plan_rejection(
+                    call,
+                    plan,
+                    observation.error or "plan mutation was rejected",
+                    context=context,
+                    completed_steps=completed_steps,
+                )
+            return observation, plan
         except Exception as error:
-            return _tool_error(call, f"{call.name} failed: {error}")
+            observation = _tool_error(call, f"{call.name} failed: {error}")
+            if call.name == "manage_plan":
+                observation = self._record_plan_rejection(
+                    call,
+                    plan,
+                    observation.error or "plan mutation failed",
+                    context=context,
+                    completed_steps=completed_steps,
+                )
+            return observation, plan
 
     async def _run_shell(
         self,
@@ -989,6 +1133,81 @@ class ToolCallingAgent:
             )
         return _ToolObservation(call, content, error=message, audit=audit)
 
+    def _manage_plan(
+        self,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        plan: AgentPlan | None,
+        *,
+        context: StepContext,
+        completed_steps: int,
+    ) -> tuple[_ToolObservation, AgentPlan | None]:
+        if not self.planning:
+            raise PlanError("manage_plan is not configured for this task")
+        _require_keys(
+            arguments,
+            required={"operation"},
+            optional={"steps", "step_id", "description", "status"},
+        )
+        operation = PlanOperation(
+            _required_string(arguments, "operation", allow_empty=False)
+        )
+        raw_status = arguments.get("status")
+        status = PlanStatus(raw_status) if raw_status is not None else None
+        mutation = apply_plan_operation(
+            plan,
+            operation,
+            steps=arguments.get("steps"),
+            step_id=arguments.get("step_id"),
+            description=arguments.get("description"),
+            status=status,
+        )
+        audit = _plan_tool_audit(
+            call,
+            status=PlanUpdateStatus.APPLIED,
+            plan_before=plan,
+            plan_after=mutation.plan,
+            context=context,
+            completed_steps=completed_steps,
+            changes=mutation.changes,
+        )
+        content = json.dumps(audit["result"], ensure_ascii=False, separators=(",", ":"))
+        return (
+            _ToolObservation(
+                call,
+                _truncate(content, self.max_tool_output_chars),
+                audit=audit,
+            ),
+            mutation.plan,
+        )
+
+    def _record_plan_rejection(
+        self,
+        call: ToolCall,
+        plan: AgentPlan | None,
+        error: str,
+        *,
+        context: StepContext,
+        completed_steps: int,
+    ) -> _ToolObservation:
+        audit = _plan_tool_audit(
+            call,
+            status=PlanUpdateStatus.REJECTED,
+            plan_before=plan,
+            plan_after=plan,
+            context=context,
+            completed_steps=completed_steps,
+            changes=(),
+            error=error,
+        )
+        content = json.dumps(audit["result"], ensure_ascii=False, separators=(",", ":"))
+        return _ToolObservation(
+            call,
+            _truncate(content, self.max_tool_output_chars),
+            error=error,
+            audit=audit,
+        )
+
     def _complete_task(
         self, call: ToolCall, arguments: dict[str, Any]
     ) -> _ToolObservation:
@@ -1087,6 +1306,47 @@ _RETRIEVAL_TOOL_DEFINITION = ToolDefinition(
         "description when the first query is not useful."
     ),
     _object_schema({"query": _STRING}, ["query"]),
+)
+
+# Keep planning opt-in and separate for the same replayability reason as
+# retrieval: an unconfigured agent must retain the exact historical tool tuple.
+_PLAN_TOOL_DEFINITION = ToolDefinition(
+    "manage_plan",
+    (
+        "Maintain the durable ordered task plan. Create it with a non-empty steps "
+        "array; add steps; revise a non-terminal step by id; or set_status using "
+        "in_progress, done, or abandoned. not_started is assigned only when steps "
+        "are created. Each normalized description is limited to "
+        f"{MAX_PLAN_DESCRIPTION_CHARACTERS} characters. Completing or abandoning "
+        "the current step automatically starts the next not-started step."
+    ),
+    _object_schema(
+        {
+            "operation": {
+                "type": "string",
+                "enum": [operation.value for operation in PlanOperation],
+            },
+            "steps": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "minItems": 1,
+                "maxItems": MAX_PLAN_STEPS,
+            },
+            "step_id": {"type": "string", "minLength": 1},
+            "description": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "status": {
+                "type": "string",
+                "enum": [status.value for status in SETTABLE_PLAN_STATUSES],
+            },
+        },
+        ["operation"],
+    ),
 )
 
 
@@ -1586,7 +1846,7 @@ def _tool_error(call: ToolCall, message: str) -> _ToolObservation:
     return _ToolObservation(call, f"ERROR: {message}", error=message)
 
 
-def _describe_action(completion: AgentCompletion) -> str:
+def _describe_action(completion: AgentCompletion, *, planning: bool) -> str:
     if completion.truncated:
         return "Handle a truncated provider response"
     calls = completion.tool_calls
@@ -1607,6 +1867,8 @@ def _describe_action(completion: AgentCompletion) -> str:
         return _shorten(f"Search files for: {arguments.get('query', '')}", 160)
     if call.name == "retrieve_context":
         return _shorten(f"Retrieve context for: {arguments.get('query', '')}", 160)
+    if call.name == "manage_plan" and planning:
+        return _shorten(f"Manage plan: {arguments.get('operation', '')}", 160)
     if call.name == "complete":
         return "Signal task completion"
     return _shorten(f"Attempt unknown tool: {call.name}", 160)
@@ -1651,6 +1913,71 @@ def _json_safe(value: object) -> Any:
         return _json_copy(value)
     except (TypeError, ValueError):
         return repr(value)
+
+
+def _render_agent_plan(plan: AgentPlan | None) -> str:
+    """Render plan state outside compactable history and its character budget."""
+
+    if plan is None:
+        return (
+            "Agent-maintained durable plan: not created yet.\n"
+            "Call manage_plan with operation=create before substantive work."
+        )
+    lines = [
+        "Agent-maintained durable plan (checkpointed; terminal steps are not "
+        "outstanding):"
+    ]
+    for number, step in enumerate(plan.steps, 1):
+        marker = " <-- CURRENT" if step.status is PlanStatus.IN_PROGRESS else ""
+        label = step.status.value.replace("_", " ").upper()
+        lines.append(f"{number}. [{label}] {step.step_id}: {step.description}{marker}")
+    if plan.current_step is None:
+        if any(step.status is PlanStatus.NOT_STARTED for step in plan.steps):
+            lines.append(
+                "Current step: none; start a NOT STARTED step with manage_plan "
+                "set_status."
+            )
+        else:
+            lines.append("Current step: none; all plan steps are terminal.")
+    # The step-count, id-length, and normalized description-length invariants
+    # structurally bound this rendering; no second unreachable cap is needed.
+    return "\n".join(lines)
+
+
+def _plan_tool_audit(
+    call: ToolCall,
+    *,
+    status: PlanUpdateStatus,
+    plan_before: AgentPlan | None,
+    plan_after: AgentPlan | None,
+    context: StepContext,
+    completed_steps: int,
+    changes: Sequence[Mapping[str, Any]],
+    error: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status.value,
+        "at": {
+            "sequence": context.sequence,
+            "logical_step": context.logical_step,
+            "attempt": context.attempt,
+            "completed_agent_steps": completed_steps,
+        },
+        "changes": [dict(change) for change in changes],
+        "plan_before": plan_before.to_dict() if plan_before is not None else None,
+        "plan_after": plan_after.to_dict() if plan_after is not None else None,
+    }
+    if error is not None:
+        result["error"] = error
+    return {
+        "schema_version": 1,
+        "tool_call": {
+            "id": call.call_id,
+            "name": call.name,
+            "arguments": _json_safe(call.arguments),
+        },
+        "result": result,
+    }
 
 
 def _json_copy(value: Any) -> Any:

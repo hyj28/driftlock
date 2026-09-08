@@ -700,7 +700,7 @@ def append_verifier_feedback(state: Mapping[str, Any], feedback: str) -> dict[st
     from driftlock.agent import AgentConversationCodec
 
     codec = AgentConversationCodec()
-    messages, steps = codec.decode(state)
+    messages, steps, plan = codec.decode_with_plan(state)
     messages.append(
         {
             "role": "user",
@@ -710,7 +710,18 @@ def append_verifier_feedback(state: Mapping[str, Any], feedback: str) -> dict[st
             ),
         }
     )
-    return codec.encode(messages, steps=steps)
+    payload = state.get(codec.state_key)
+    if isinstance(payload, Mapping) and payload.get("schema_version") == 1:
+        # Preserve historical verifier-continuation bytes for completed runs;
+        # version one has no plan field to carry forward.
+        return {
+            codec.state_key: {
+                "schema_version": 1,
+                "messages": messages,
+                "steps": steps,
+            }
+        }
+    return codec.encode(messages, steps=steps, plan=plan)
 
 
 def _provider_prompt(request: AgentCompletionRequest) -> str:
