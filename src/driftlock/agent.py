@@ -6,8 +6,10 @@ import json
 import posixpath
 import shlex
 import tempfile
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
@@ -29,6 +31,134 @@ class AgentProviderError(RuntimeError):
             raise ValueError("tokens must be a non-negative integer")
         super().__init__(message)
         self.tokens = tokens
+
+
+class ConversationCompactionStatus(StrEnum):
+    """Whether one bounded compaction invocation rewrote history."""
+
+    UNCHANGED = "unchanged"
+    COMPACTED = "compacted"
+    SUMMARY_ONLY = "summary_only"
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationCompactionAudit:
+    """Durable evidence for one lossy conversation rewrite."""
+
+    status: ConversationCompactionStatus
+    step: int
+    before_characters: int
+    after_characters: int
+    affected_message_count: int
+    retained_message_count: int
+    summary: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, ConversationCompactionStatus):
+            raise TypeError("status must be a ConversationCompactionStatus")
+        if self.status not in {
+            ConversationCompactionStatus.COMPACTED,
+            ConversationCompactionStatus.SUMMARY_ONLY,
+        }:
+            raise ValueError("compaction audit status must describe a rewrite")
+        for name in (
+            "step",
+            "before_characters",
+            "after_characters",
+            "affected_message_count",
+            "retained_message_count",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.before_characters <= self.after_characters:
+            raise ValueError("compaction must reduce the conversation character count")
+        if self.affected_message_count == 0:
+            raise ValueError("compaction must affect at least one message")
+        if (
+            self.status is ConversationCompactionStatus.COMPACTED
+            and self.retained_message_count == 0
+        ):
+            raise ValueError("compacted audit must retain recent messages")
+        if (
+            self.status is ConversationCompactionStatus.SUMMARY_ONLY
+            and self.retained_message_count != 0
+        ):
+            raise ValueError("summary-only audit cannot retain recent messages")
+        if not isinstance(self.summary, str) or not self.summary:
+            raise ValueError("compaction summary must be a non-empty string")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "status": self.status.value,
+            "step": self.step,
+            "before_characters": self.before_characters,
+            "after_characters": self.after_characters,
+            "affected_message_count": self.affected_message_count,
+            "retained_message_count": self.retained_message_count,
+            "summary": self.summary,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationCompactionResult:
+    """History plus the audit produced by a single compaction attempt."""
+
+    messages: Sequence[Mapping[str, Any]]
+    status: ConversationCompactionStatus
+    audit: ConversationCompactionAudit | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, ConversationCompactionStatus):
+            raise TypeError("status must be a ConversationCompactionStatus")
+        if (
+            self.status is ConversationCompactionStatus.UNCHANGED
+            and self.audit is not None
+        ):
+            raise ValueError("unchanged compaction result cannot contain an audit")
+        if (
+            self.status is not ConversationCompactionStatus.UNCHANGED
+            and self.audit is None
+        ):
+            raise ValueError("rewritten compaction result must contain an audit")
+        if self.audit is not None and self.audit.status is not self.status:
+            raise ValueError("compaction result and audit statuses must agree")
+
+
+# Four times the per-observation cap leaves roughly three worst-case tool units
+# after JSON framing, while bounding well below common provider context windows.
+DEFAULT_MAX_HISTORY_CHARACTERS = 64_000
+
+# A useful local summary plus its JSON message framing fits at this floor; making
+# the supported range public prevents callers from discovering it by exception.
+MIN_MAX_HISTORY_CHARACTERS = 512
+
+# Summaries are supporting context, so cap them at half one tool observation;
+# recent verbatim tool-call units get the rest of the history budget.
+_MAX_COMPACTION_SUMMARY_CHARACTERS = 8_000
+
+# This short marker is the minimum summary cost reserved before verbatim turns;
+# the newest complete unit is guaranteed whenever it fits alongside this text.
+_MIN_COMPACTION_SUMMARY = "Earlier conversation compacted locally."
+
+# Sixteen exact events cover the runner's 12-step default judge window plus a
+# rollback margin; older events fold into fixed-size counters and extrema.
+_DURABLE_COMPACTION_RECENT_EVENT_LIMIT = 16
+
+# Version two replaces the former unbounded list of full-summary audit objects
+# with a bounded recent-event ledger and aggregate historical evidence.
+_DURABLE_COMPACTION_AUDIT_SCHEMA_VERSION = 2
+
+# This private message field stays in checkpoint state for audit but is removed
+# before provider requests because chat APIs reject unknown message properties.
+_COMPACTION_AUDIT_KEY = "driftlock_context_compactions"
+
+# The provider-visible summary identifies both its local provenance and purpose.
+_COMPACTION_SUMMARY_PREFIX = (
+    "Conversation context was compacted locally without a provider call. "
+    "Earlier activity summary:\n"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,9 +263,151 @@ class _ToolObservation:
     audit: Mapping[str, Any] | None = None
 
 
+def conversation_history_characters(
+    messages: Sequence[Mapping[str, Any]],
+) -> int:
+    """Return the canonical character count of JSON provider-visible history.
+
+    Malformed or non-JSON-compatible messages raise :class:`AgentStateError`.
+    Durable audit metadata is intentionally excluded because it is never sent.
+    """
+
+    try:
+        copied = _copy_conversation_messages(messages)
+        visible = [_provider_message(message) for message in copied]
+        return len(
+            json.dumps(
+                visible,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    except AgentStateError:
+        raise
+    except (RecursionError, TypeError, ValueError) as error:
+        raise AgentStateError(
+            "tool-agent messages must be JSON-compatible objects"
+        ) from error
+
+
+def compact_conversation_history(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    max_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
+    step: int,
+) -> ConversationCompactionResult:
+    """Bound history without splitting assistant tool calls from their results.
+
+    This is deliberately extractive and local: it makes no provider call, so it
+    has no token usage to add to the paid-step accounting. ``max_characters``
+    must be an integer of at least :data:`MIN_MAX_HISTORY_CHARACTERS`.
+
+    The newest complete unit is retained whenever it fits beside the minimum
+    compaction marker. ``SUMMARY_ONLY`` explicitly reports the degenerate case
+    where no complete unit can fit with that marker.
+    """
+
+    if (
+        not isinstance(max_characters, int)
+        or isinstance(max_characters, bool)
+        or max_characters < MIN_MAX_HISTORY_CHARACTERS
+    ):
+        raise ValueError(
+            "max_characters must be an integer of at least "
+            f"{MIN_MAX_HISTORY_CHARACTERS}"
+        )
+    if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+        raise ValueError("step must be a non-negative integer")
+    copied = _copy_conversation_messages(messages)
+    units = _conversation_units(copied)
+    before = conversation_history_characters(copied)
+    prior_ledger = _compaction_audit_ledger(copied)
+    if before <= max_characters:
+        if prior_ledger["total_event_count"]:
+            copied = _install_compaction_audit_ledger(copied, prior_ledger)
+        return ConversationCompactionResult(
+            messages=copied,
+            status=ConversationCompactionStatus.UNCHANGED,
+        )
+
+    if not units:
+        # The serialized empty list is always below the minimum accepted bound.
+        raise AgentStateError("oversized tool-agent history contains no messages")
+    units = _conversation_units(_remove_compaction_audits(copied))
+    summary_limit = min(
+        _MAX_COMPACTION_SUMMARY_CHARACTERS,
+        max(len(_MIN_COMPACTION_SUMMARY), max_characters // 4),
+    )
+    target = max_characters - 1
+    compacted: list[Mapping[str, Any]] | None = None
+    affected_message_count = 0
+    summary = ""
+    status = ConversationCompactionStatus.COMPACTED
+
+    # Try suffixes from largest to smallest, dynamically shrinking the summary.
+    # Adding older history therefore cannot cause a fixed-budget cliff that drops
+    # an otherwise fitting newest unit, and every iteration makes finite progress.
+    for dropped_unit_count in range(1, len(units)):
+        dropped = units[:dropped_unit_count]
+        retained = units[dropped_unit_count:]
+        full_summary = _summarize_conversation_units(dropped)
+        retained_messages = [message for unit in retained for message in unit]
+        fitted = _fit_summary_with_retained(
+            full_summary,
+            retained_messages,
+            target=target,
+            summary_limit=summary_limit,
+        )
+        if fitted is None:
+            continue
+        summary = fitted
+        compacted = [
+            {"role": "user", "content": summary},
+            *retained_messages,
+        ]
+        affected_message_count = sum(len(unit) for unit in dropped)
+        break
+
+    if compacted is None:
+        status = ConversationCompactionStatus.SUMMARY_ONLY
+        full_summary = _summarize_conversation_units(units)
+        summary = _fit_summary_to_history_bound(
+            full_summary,
+            target=target,
+            summary_limit=summary_limit,
+        )
+        compacted = [{"role": "user", "content": summary}]
+        affected_message_count = sum(len(unit) for unit in units)
+
+    after = conversation_history_characters(compacted)
+    audit = ConversationCompactionAudit(
+        status=status,
+        step=step,
+        before_characters=before,
+        after_characters=after,
+        affected_message_count=affected_message_count,
+        retained_message_count=len(compacted) - 1,
+        summary=summary,
+    )
+    summary_message = dict(compacted[0])
+    summary_message[_COMPACTION_AUDIT_KEY] = _append_compaction_audit(
+        prior_ledger, audit
+    )
+    compacted[0] = summary_message
+    return ConversationCompactionResult(
+        messages=compacted,
+        status=status,
+        audit=audit,
+    )
+
+
 class AgentConversationCodec:
     """Versioned JSON codec for semantic tool-agent conversation state."""
 
+    # Message objects have always been open JSON mappings beyond role/content;
+    # compaction audit metadata uses that extension point, so the encoded
+    # {messages, steps} contract is unchanged and does not require a version bump.
     schema_version = 1
     state_key = "driftlock_tool_agent"
 
@@ -195,7 +467,7 @@ class AgentConversationCodec:
             raise AgentStateError("tool-agent steps must be a non-negative integer")
         try:
             copied = _json_copy(messages)
-        except (TypeError, ValueError) as error:
+        except (RecursionError, TypeError, ValueError) as error:
             raise AgentStateError(
                 "tool-agent messages must be JSON-compatible"
             ) from error
@@ -203,7 +475,11 @@ class AgentConversationCodec:
 
 
 class ToolCallingAgent:
-    """Perform exactly one provider call and all tool calls emitted by it."""
+    """Perform one provider call and its tools with bounded conversation history.
+
+    ``max_history_characters`` must be at least
+    :data:`MIN_MAX_HISTORY_CHARACTERS`.
+    """
 
     def __init__(
         self,
@@ -215,6 +491,7 @@ class ToolCallingAgent:
         min_output_tokens: int = 64,
         prefill_estimator: AgentPrefillEstimator = conservative_prefill_estimate,
         max_tool_output_chars: int = 16_000,
+        max_history_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
         shell_timeout_sec: int = 60,
         codec: AgentConversationCodec | None = None,
         user: str | int | None = None,
@@ -230,6 +507,14 @@ class ToolCallingAgent:
             raise TypeError("prefill_estimator must be callable")
         if max_tool_output_chars < 128:
             raise ValueError("max_tool_output_chars must be at least 128")
+        if (
+            not isinstance(max_history_characters, int)
+            or isinstance(max_history_characters, bool)
+            or max_history_characters < MIN_MAX_HISTORY_CHARACTERS
+        ):
+            raise ValueError(
+                f"max_history_characters must be at least {MIN_MAX_HISTORY_CHARACTERS}"
+            )
         if shell_timeout_sec <= 0:
             raise ValueError("shell_timeout_sec must be positive")
         self.environment = environment
@@ -239,6 +524,7 @@ class ToolCallingAgent:
         self.min_output_tokens = min_output_tokens
         self._prefill_estimator = prefill_estimator
         self.max_tool_output_chars = max_tool_output_chars
+        self.max_history_characters = max_history_characters
         self.shell_timeout_sec = shell_timeout_sec
         self.codec = codec or AgentConversationCodec()
         self.user = user
@@ -249,6 +535,24 @@ class ToolCallingAgent:
 
     async def __call__(self, context: StepContext) -> StepOutcome:
         history, completed_steps = self.codec.decode(context.state)
+        try:
+            compaction = compact_conversation_history(
+                history,
+                max_characters=self.max_history_characters,
+                step=completed_steps + 1,
+            )
+        except AgentStateError as error:
+            message = f"Malformed conversation state: {error}"
+            return StepOutcome(
+                action="Reject malformed conversation state",
+                state=self.codec.encode(history, steps=completed_steps + 1),
+                error=message,
+                summary=message,
+            )
+        history = list(compaction.messages)
+        compaction_audits = (
+            (compaction.audit.to_dict(),) if compaction.audit is not None else ()
+        )
         request = AgentCompletionRequest(
             messages=self._request_messages(context, history),
             # Preserve the exact legacy five-tool request whenever agentic
@@ -294,6 +598,7 @@ class ToolCallingAgent:
                 error=message,
                 tokens=error.tokens,
                 summary="The provider failed before a usable response was returned.",
+                context_compactions=compaction_audits,
             )
 
         history.append(_assistant_message(completion))
@@ -347,6 +652,7 @@ class ToolCallingAgent:
                 for observation in observations
                 if observation.audit is not None
             ),
+            context_compactions=compaction_audits,
             error="; ".join(errors) or None,
             tokens=completion.tokens,
             completed=completed,
@@ -389,7 +695,7 @@ class ToolCallingAgent:
                 "role": "user",
                 "content": f"Goal:\n{context.goal}\n\nPlan:\n{plan}",
             },
-            *_json_copy(list(history)),
+            *[_provider_message(message) for message in history],
         ]
         if context.rollback_feedback:
             messages.append(
@@ -793,6 +1099,405 @@ def _require_keys(
         raise ValueError(f"missing required argument(s): {', '.join(sorted(missing))}")
     if unexpected:
         raise ValueError(f"unexpected argument(s): {', '.join(sorted(unexpected))}")
+
+
+def _provider_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    copied = dict(_json_copy(message))
+    copied.pop(_COMPACTION_AUDIT_KEY, None)
+    return copied
+
+
+def _copy_conversation_messages(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
+        raise AgentStateError("tool-agent messages must be a sequence of objects")
+    try:
+        copied = _json_copy(list(messages))
+    except (RecursionError, TypeError, ValueError) as error:
+        raise AgentStateError(
+            "tool-agent messages must be JSON-compatible objects"
+        ) from error
+    if not isinstance(copied, list) or any(
+        not isinstance(message, dict) for message in copied
+    ):
+        raise AgentStateError("tool-agent messages must be a sequence of objects")
+    for index, message in enumerate(copied):
+        role = message.get("role")
+        if role not in {"assistant", "system", "tool", "user"}:
+            raise AgentStateError(
+                f"tool-agent message {index} has unsupported role {role!r}"
+            )
+        if "content" not in message:
+            raise AgentStateError(f"tool-agent message {index} must contain content")
+    return copied
+
+
+def _empty_compaction_audit_ledger() -> dict[str, Any]:
+    return {
+        "schema_version": _DURABLE_COMPACTION_AUDIT_SCHEMA_VERSION,
+        "retention_policy": {
+            "recent_event_limit": _DURABLE_COMPACTION_RECENT_EVENT_LIMIT,
+            "older_events": "aggregate_counts_and_extrema",
+            "full_summary": "current_summary_message_only",
+        },
+        "total_event_count": 0,
+        "aggregated_event_count": 0,
+        "aggregated": None,
+        "recent_events": [],
+    }
+
+
+def _compaction_audit_ledger(
+    messages: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    values = [
+        message[_COMPACTION_AUDIT_KEY]
+        for message in messages
+        if _COMPACTION_AUDIT_KEY in message
+    ]
+    if not values:
+        return _empty_compaction_audit_ledger()
+    if len(values) != 1:
+        raise AgentStateError("conversation contains multiple compaction audit ledgers")
+    value = values[0]
+    if isinstance(value, list):
+        ledger = _empty_compaction_audit_ledger()
+        for raw_event in value:
+            ledger = _append_durable_compaction_event(
+                ledger,
+                _durable_compaction_event(
+                    raw_event, migrate_legacy_zero_retention=True
+                ),
+            )
+        return ledger
+    if not isinstance(value, Mapping):
+        raise AgentStateError("conversation compaction audit must be an object")
+    expected_policy = _empty_compaction_audit_ledger()["retention_policy"]
+    if (
+        value.get("schema_version") != _DURABLE_COMPACTION_AUDIT_SCHEMA_VERSION
+        or value.get("retention_policy") != expected_policy
+    ):
+        raise AgentStateError("unsupported conversation compaction audit schema")
+    total = _audit_nonnegative_integer(value, "total_event_count")
+    aggregated_count = _audit_nonnegative_integer(value, "aggregated_event_count")
+    recent = value.get("recent_events")
+    if not isinstance(recent, list) or len(recent) > (
+        _DURABLE_COMPACTION_RECENT_EVENT_LIMIT
+    ):
+        raise AgentStateError("conversation compaction recent events are malformed")
+    events = [_durable_compaction_event(event) for event in recent]
+    if total != aggregated_count + len(events):
+        raise AgentStateError("conversation compaction audit counts disagree")
+    aggregated = value.get("aggregated")
+    if aggregated_count == 0:
+        if aggregated is not None:
+            raise AgentStateError("empty compaction aggregate must be null")
+    else:
+        _validate_compaction_aggregate(aggregated, aggregated_count)
+    return dict(_json_copy(value))
+
+
+def _audit_nonnegative_integer(value: Mapping[str, Any], name: str) -> int:
+    result = value.get(name)
+    if not isinstance(result, int) or isinstance(result, bool) or result < 0:
+        raise AgentStateError(f"conversation compaction {name} is malformed")
+    return result
+
+
+def _durable_compaction_event(
+    value: object, *, migrate_legacy_zero_retention: bool = False
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AgentStateError("conversation compaction event must be an object")
+    status = value.get("status")
+    if status not in {
+        ConversationCompactionStatus.COMPACTED.value,
+        ConversationCompactionStatus.SUMMARY_ONLY.value,
+    }:
+        raise AgentStateError("conversation compaction event status is malformed")
+    event = {
+        "status": status,
+        "step": _audit_nonnegative_integer(value, "step"),
+        "before_characters": _audit_nonnegative_integer(value, "before_characters"),
+        "after_characters": _audit_nonnegative_integer(value, "after_characters"),
+        "affected_message_count": _audit_nonnegative_integer(
+            value, "affected_message_count"
+        ),
+        "retained_message_count": _audit_nonnegative_integer(
+            value, "retained_message_count"
+        ),
+    }
+    if (
+        migrate_legacy_zero_retention
+        and status == ConversationCompactionStatus.COMPACTED.value
+        and event["retained_message_count"] == 0
+    ):
+        status = ConversationCompactionStatus.SUMMARY_ONLY.value
+        event["status"] = status
+    if event["before_characters"] <= event["after_characters"]:
+        raise AgentStateError("conversation compaction event did not reduce history")
+    if event["affected_message_count"] == 0:
+        raise AgentStateError("conversation compaction event affected no messages")
+    if (
+        status == ConversationCompactionStatus.COMPACTED.value
+        and event["retained_message_count"] == 0
+    ):
+        raise AgentStateError("compacted event retained no recent messages")
+    if (
+        status == ConversationCompactionStatus.SUMMARY_ONLY.value
+        and event["retained_message_count"] != 0
+    ):
+        raise AgentStateError("summary-only event retained recent messages")
+    return event
+
+
+def _validate_compaction_aggregate(value: object, event_count: int) -> None:
+    if not isinstance(value, Mapping):
+        raise AgentStateError("conversation compaction aggregate must be an object")
+    expected_fields = {
+        "first_recorded_step",
+        "last_recorded_step",
+        "total_affected_message_count",
+        "minimum_before_characters",
+        "maximum_before_characters",
+        "minimum_after_characters",
+        "maximum_after_characters",
+        "summary_only_event_count",
+    }
+    if set(value) != expected_fields:
+        raise AgentStateError("conversation compaction aggregate fields are malformed")
+    numbers = {
+        name: _audit_nonnegative_integer(value, name) for name in expected_fields
+    }
+    if numbers["summary_only_event_count"] > event_count:
+        raise AgentStateError("conversation compaction aggregate counts disagree")
+    if numbers["minimum_before_characters"] > numbers["maximum_before_characters"]:
+        raise AgentStateError("conversation compaction before extrema disagree")
+    if numbers["minimum_after_characters"] > numbers["maximum_after_characters"]:
+        raise AgentStateError("conversation compaction after extrema disagree")
+
+
+def _append_compaction_audit(
+    ledger: Mapping[str, Any], audit: ConversationCompactionAudit
+) -> dict[str, Any]:
+    return _append_durable_compaction_event(
+        ledger, _durable_compaction_event(audit.to_dict())
+    )
+
+
+def _append_durable_compaction_event(
+    ledger: Mapping[str, Any], event: Mapping[str, Any]
+) -> dict[str, Any]:
+    updated = dict(_json_copy(ledger))
+    recent = list(updated["recent_events"])
+    recent.append(dict(event))
+    updated["total_event_count"] += 1
+    if len(recent) > _DURABLE_COMPACTION_RECENT_EVENT_LIMIT:
+        oldest = recent.pop(0)
+        updated["aggregated_event_count"] += 1
+        updated["aggregated"] = _fold_compaction_aggregate(
+            updated["aggregated"], oldest
+        )
+    updated["recent_events"] = recent
+    return updated
+
+
+def _fold_compaction_aggregate(
+    aggregate: Mapping[str, Any] | None, event: Mapping[str, Any]
+) -> dict[str, Any]:
+    if aggregate is None:
+        return {
+            "first_recorded_step": event["step"],
+            "last_recorded_step": event["step"],
+            "total_affected_message_count": event["affected_message_count"],
+            "minimum_before_characters": event["before_characters"],
+            "maximum_before_characters": event["before_characters"],
+            "minimum_after_characters": event["after_characters"],
+            "maximum_after_characters": event["after_characters"],
+            "summary_only_event_count": int(
+                event["status"] == ConversationCompactionStatus.SUMMARY_ONLY.value
+            ),
+        }
+    return {
+        "first_recorded_step": aggregate["first_recorded_step"],
+        "last_recorded_step": event["step"],
+        "total_affected_message_count": (
+            aggregate["total_affected_message_count"] + event["affected_message_count"]
+        ),
+        "minimum_before_characters": min(
+            aggregate["minimum_before_characters"], event["before_characters"]
+        ),
+        "maximum_before_characters": max(
+            aggregate["maximum_before_characters"], event["before_characters"]
+        ),
+        "minimum_after_characters": min(
+            aggregate["minimum_after_characters"], event["after_characters"]
+        ),
+        "maximum_after_characters": max(
+            aggregate["maximum_after_characters"], event["after_characters"]
+        ),
+        "summary_only_event_count": aggregate["summary_only_event_count"]
+        + int(event["status"] == ConversationCompactionStatus.SUMMARY_ONLY.value),
+    }
+
+
+def _remove_compaction_audits(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for message in messages:
+        copied = dict(message)
+        copied.pop(_COMPACTION_AUDIT_KEY, None)
+        cleaned.append(copied)
+    return cleaned
+
+
+def _install_compaction_audit_ledger(
+    messages: Sequence[Mapping[str, Any]], ledger: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    audit_index = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if _COMPACTION_AUDIT_KEY in message
+        ),
+        0,
+    )
+    cleaned = _remove_compaction_audits(messages)
+    cleaned[audit_index][_COMPACTION_AUDIT_KEY] = dict(_json_copy(ledger))
+    return cleaned
+
+
+def _conversation_units(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[tuple[Mapping[str, Any], ...]]:
+    units: list[tuple[Mapping[str, Any], ...]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = message.get("role")
+        if role == "tool":
+            raise AgentStateError(
+                f"tool-agent message {index} is an orphaned tool result"
+            )
+        raw_calls = message.get("tool_calls") if role == "assistant" else None
+        if not raw_calls:
+            units.append((message,))
+            index += 1
+            continue
+        if not isinstance(raw_calls, list) or any(
+            not isinstance(call, Mapping) or not isinstance(call.get("id"), str)
+            for call in raw_calls
+        ):
+            raise AgentStateError(
+                f"tool-agent message {index} has malformed tool_calls"
+            )
+        expected_ids = Counter(call["id"] for call in raw_calls)
+        end = index + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        results = messages[index + 1 : end]
+        if any(not isinstance(result.get("tool_call_id"), str) for result in results):
+            raise AgentStateError(
+                f"tool-agent message {index} has a malformed tool result"
+            )
+        result_ids = Counter(result["tool_call_id"] for result in results)
+        if result_ids != expected_ids:
+            raise AgentStateError(
+                f"tool-agent message {index} has unanswered or unexpected tool results"
+            )
+        units.append(tuple(messages[index:end]))
+        index = end
+    return units
+
+
+def _summarize_conversation_units(
+    units: Sequence[Sequence[Mapping[str, Any]]],
+) -> str:
+    lines = [_COMPACTION_SUMMARY_PREFIX.rstrip("\n")]
+    # When the cap truncates this extract, keep the most recent dropped facts;
+    # they immediately precede the verbatim suffix and best preserve continuity.
+    for unit in reversed(units):
+        for message in unit:
+            role = message.get("role", "unknown")
+            content = message.get("content", "")
+            rendered_content = (
+                content
+                if isinstance(content, str)
+                else json.dumps(content, ensure_ascii=False, sort_keys=True)
+            )
+            detail = _shorten(rendered_content, 240)
+            if role == "assistant" and message.get("tool_calls"):
+                calls = message["tool_calls"]
+                names = ", ".join(
+                    f"{call.get('name', 'unknown')}#{call.get('id', '')}"
+                    for call in calls
+                )
+                label = f"assistant tool calls ({names})"
+            elif role == "tool":
+                label = (
+                    f"tool result {message.get('name', 'unknown')}"
+                    f"#{message.get('tool_call_id', '')}"
+                )
+            else:
+                label = str(role)
+            lines.append(f"- {label}: {detail or '(empty)'}")
+    return "\n".join(lines)
+
+
+def _bounded_compaction_summary(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n[earlier summary truncated locally]"
+    if limit < len(_COMPACTION_SUMMARY_PREFIX) + len(marker):
+        return _MIN_COMPACTION_SUMMARY[:limit]
+    retained = max(0, limit - len(marker))
+    return value[:retained] + marker
+
+
+def _fit_summary_with_retained(
+    value: str,
+    retained: Sequence[Mapping[str, Any]],
+    *,
+    target: int,
+    summary_limit: int,
+) -> str | None:
+    minimum_candidate = [
+        {"role": "user", "content": _MIN_COMPACTION_SUMMARY},
+        *retained,
+    ]
+    if conversation_history_characters(minimum_candidate) > target:
+        return None
+    low = len(_MIN_COMPACTION_SUMMARY)
+    high = min(len(value), summary_limit)
+    best = _MIN_COMPACTION_SUMMARY
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _bounded_compaction_summary(value, middle)
+        size = conversation_history_characters(
+            [{"role": "user", "content": candidate}, *retained]
+        )
+        if size <= target:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _fit_summary_to_history_bound(
+    value: str, *, target: int, summary_limit: int
+) -> str:
+    fitted = _fit_summary_with_retained(
+        value,
+        (),
+        target=target,
+        summary_limit=summary_limit,
+    )
+    if fitted is None:
+        raise AgentStateError("history bound cannot fit the minimum compaction summary")
+    return fitted
 
 
 def _assistant_message(completion: AgentCompletion) -> dict[str, Any]:
