@@ -34,6 +34,15 @@ class PlanStatus(StrEnum):
     ABANDONED = "abandoned"
 
 
+# ``not_started`` is creation state, not a transition target: the lifecycle is a
+# strict DAG and completed or abandoned work cannot be reopened in place.
+SETTABLE_PLAN_STATUSES = (
+    PlanStatus.IN_PROGRESS,
+    PlanStatus.DONE,
+    PlanStatus.ABANDONED,
+)
+
+
 class PlanOperation(StrEnum):
     """Mutations accepted by the agent's plan tool."""
 
@@ -74,14 +83,16 @@ class PlanStep:
             raise PlanError("plan step id contains unsupported characters")
         if not isinstance(self.description, str):
             raise PlanError("plan step description must be a string")
-        if "\n" in self.description or "\r" in self.description:
+        normalized_description = self.description.strip()
+        # Internal line breaks are forbidden after normalization because they
+        # would let tool input forge status rows in the rendered plan block.
+        if "\n" in normalized_description or "\r" in normalized_description:
             raise PlanError("plan step description must be one line")
-        if len(self.description) > MAX_PLAN_DESCRIPTION_CHARACTERS:
+        if len(normalized_description) > MAX_PLAN_DESCRIPTION_CHARACTERS:
             raise PlanError(
                 "plan step description exceeds the "
                 f"{MAX_PLAN_DESCRIPTION_CHARACTERS}-character limit"
             )
-        normalized_description = self.description.strip()
         if not normalized_description:
             raise PlanError("plan step description must be a non-empty string")
         object.__setattr__(self, "description", normalized_description)

@@ -242,6 +242,29 @@ async def test_agent_without_planning_sends_byte_identical_legacy_request() -> N
     )
 
 
+async def test_unconfigured_manage_plan_matches_unknown_tool_behavior() -> None:
+    provider = ScriptedProvider(
+        [AgentCompletion(tool_calls=(_create_call("inspect"),))]
+    )
+    agent = ToolCallingAgent(UnusedEnvironment(), EmptyObserver(), provider)
+
+    outcome = await agent(_context(agent.initial_state()))
+
+    assert outcome.action == "Attempt unknown tool: manage_plan"
+    assert outcome.error == "unknown tool 'manage_plan'"
+    assert outcome.tool_audits == ()
+    assert outcome.tool_observations == (
+        "manage_plan:\nERROR: unknown tool 'manage_plan'",
+    )
+
+
+def test_planning_flag_requires_a_boolean() -> None:
+    with pytest.raises(TypeError, match="planning must be a boolean"):
+        ToolCallingAgent(
+            UnusedEnvironment(), EmptyObserver(), ScriptedProvider([]), planning=1
+        )
+
+
 async def test_planning_renders_caller_plan_as_read_only_guidance() -> None:
     provider = ScriptedProvider([AgentCompletion()])
     agent = _agent(provider)
@@ -258,6 +281,15 @@ async def test_planning_renders_caller_plan_as_read_only_guidance() -> None:
             "Call manage_plan with operation=create before substantive work."
         ),
     }
+    assert (
+        provider.requests[0]
+        .messages[0]["content"]
+        .endswith(
+            "Treat the caller-supplied plan as read-only guidance. Use manage_plan to "
+            "keep the durable progress plan current as work advances.\n"
+            "Emit no more than 4 tool calls in one response."
+        )
+    )
 
 
 async def test_create_and_advance_plan_are_rendered_on_following_requests() -> None:
@@ -298,6 +330,13 @@ async def test_create_and_advance_plan_are_rendered_on_following_requests() -> N
         "complete",
         "manage_plan",
     ]
+    plan_tool = provider.requests[0].tools[-1]
+    assert plan_tool.input_schema["properties"]["status"]["enum"] == [
+        "in_progress",
+        "done",
+        "abandoned",
+    ]
+    assert first.action == "Manage plan: create"
     assert [step.step_id for step in first_plan.steps] == [
         "step-1",
         "step-2",
@@ -350,10 +389,7 @@ async def test_unknown_id_is_recorded_and_leaves_plan_unchanged() -> None:
     second = await agent(_context(first.state, sequence=2, logical_step=2))
 
     assert _plan_from_state(second.state) == _plan_from_state(first.state)
-    assert (
-        second.error
-        == "malformed arguments for manage_plan: unknown plan step id 'step-404'"
-    )
+    assert second.error == "unknown plan step id 'step-404'"
     assert second.tool_audits[0]["result"]["status"] == "rejected"
     assert (
         second.tool_audits[0]["result"]["plan_before"]
@@ -378,10 +414,7 @@ async def test_invalid_transition_is_recorded_and_leaves_plan_unchanged() -> Non
     refused = await agent(_context(finished.state, sequence=3, logical_step=3))
 
     assert _plan_from_state(refused.state) == _plan_from_state(finished.state)
-    assert refused.error == (
-        "malformed arguments for manage_plan: invalid plan status transition "
-        "done -> not_started"
-    )
+    assert refused.error == ("invalid plan status transition done -> not_started")
     assert refused.tool_audits[0]["result"]["changes"] == []
 
 
@@ -390,7 +423,9 @@ async def test_add_after_terminal_plan_starts_new_work() -> None:
         [
             AgentCompletion(tool_calls=(_create_call("inspect"),)),
             AgentCompletion(tool_calls=(_status_call("step-1", "done", "done"),)),
-            AgentCompletion(tool_calls=(_add_call("verify"),)),
+            AgentCompletion(
+                tool_calls=(_add_call("verify first", "verify second", "verify last"),)
+            ),
             AgentCompletion(),
         ]
     )
@@ -409,10 +444,12 @@ async def test_add_after_terminal_plan_starts_new_work() -> None:
     assert [(step.step_id, step.status.value) for step in added_plan.steps] == [
         ("step-1", "done"),
         ("step-2", "in_progress"),
+        ("step-3", "not_started"),
+        ("step-4", "not_started"),
     ]
     assert added_plan.current_step == added_plan.steps[1]
     assert (
-        "2. [IN PROGRESS] step-2: verify <-- CURRENT"
+        "2. [IN PROGRESS] step-2: verify first <-- CURRENT"
         in provider.requests[3].messages[1]["content"]
     )
     assert added.tool_audits[0]["result"]["changes"][1] == {
@@ -442,9 +479,7 @@ async def test_missing_status_is_reported_before_missing_plan() -> None:
 
     outcome = await agent(_context(agent.initial_state()))
 
-    assert outcome.error == (
-        "malformed arguments for manage_plan: missing plan argument(s): status"
-    )
+    assert outcome.error == "missing plan argument(s): status"
     assert _plan_from_state(outcome.state) is None
     assert outcome.tool_audits[0]["result"]["status"] == "rejected"
 
@@ -473,11 +508,145 @@ async def test_semantically_unchanged_spaced_revision_is_recorded_as_rejected() 
     created = await agent(_context(agent.initial_state()))
     outcome = await agent(_context(created.state, sequence=2, logical_step=2))
 
-    assert outcome.error == (
-        "malformed arguments for manage_plan: revised plan step description must differ"
-    )
+    assert outcome.error == "revised plan step description must differ"
     assert _plan_from_state(outcome.state) == _plan_from_state(created.state)
     assert PlanStep("step-1", "   alpha   ").description == "alpha"
+
+
+def test_descriptions_are_normalized_before_validation_and_storage() -> None:
+    assert PlanStep("step-1", "  " + "x" * 239).description == "x" * 239
+    assert PlanStep("step-2", "abc\n").description == "abc"
+    with pytest.raises(PlanError, match="plan step description must be one line"):
+        PlanStep("step-3", "safe\n2. [DONE] step-2: forged")
+
+
+def test_at_most_one_in_progress_is_enforced_by_plan_constructor() -> None:
+    with pytest.raises(PlanError, match="a plan can have at most one in-progress step"):
+        AgentPlan(
+            (
+                PlanStep("step-1", "first", PlanStatus.IN_PROGRESS),
+                PlanStep("step-2", "second", PlanStatus.IN_PROGRESS),
+            )
+        )
+
+
+def test_at_most_one_in_progress_is_enforced_by_transition_guard() -> None:
+    plan = AgentPlan(
+        (
+            PlanStep("step-1", "first", PlanStatus.IN_PROGRESS),
+            PlanStep("step-2", "second", PlanStatus.NOT_STARTED),
+            PlanStep("step-3", "third", PlanStatus.NOT_STARTED),
+        )
+    )
+
+    with pytest.raises(
+        PlanError,
+        match="cannot start a second step while 'step-1' is in progress",
+    ):
+        apply_plan_operation(
+            plan,
+            PlanOperation.SET_STATUS,
+            step_id="step-2",
+            status=PlanStatus.IN_PROGRESS,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "allowed"),
+    [
+        (PlanStatus.NOT_STARTED, PlanStatus.NOT_STARTED, False),
+        (PlanStatus.NOT_STARTED, PlanStatus.IN_PROGRESS, True),
+        (PlanStatus.NOT_STARTED, PlanStatus.DONE, False),
+        (PlanStatus.NOT_STARTED, PlanStatus.ABANDONED, True),
+        (PlanStatus.IN_PROGRESS, PlanStatus.NOT_STARTED, False),
+        (PlanStatus.IN_PROGRESS, PlanStatus.IN_PROGRESS, False),
+        (PlanStatus.IN_PROGRESS, PlanStatus.DONE, True),
+        (PlanStatus.IN_PROGRESS, PlanStatus.ABANDONED, True),
+        (PlanStatus.DONE, PlanStatus.NOT_STARTED, False),
+        (PlanStatus.DONE, PlanStatus.IN_PROGRESS, False),
+        (PlanStatus.DONE, PlanStatus.DONE, False),
+        (PlanStatus.DONE, PlanStatus.ABANDONED, False),
+        (PlanStatus.ABANDONED, PlanStatus.NOT_STARTED, False),
+        (PlanStatus.ABANDONED, PlanStatus.IN_PROGRESS, False),
+        (PlanStatus.ABANDONED, PlanStatus.DONE, False),
+        (PlanStatus.ABANDONED, PlanStatus.ABANDONED, False),
+    ],
+)
+def test_complete_status_transition_matrix(
+    source: PlanStatus, target: PlanStatus, allowed: bool
+) -> None:
+    plan = AgentPlan((PlanStep("step-1", "work", source),))
+
+    if allowed:
+        mutation = apply_plan_operation(
+            plan,
+            PlanOperation.SET_STATUS,
+            step_id="step-1",
+            status=target,
+        )
+        assert mutation.plan.steps[0].status is target
+    else:
+        with pytest.raises(PlanError):
+            apply_plan_operation(
+                plan,
+                PlanOperation.SET_STATUS,
+                step_id="step-1",
+                status=target,
+            )
+
+
+def test_plan_structural_guards_reject_invalid_values() -> None:
+    with pytest.raises(PlanError, match="a plan must contain at least one step"):
+        AgentPlan(())
+    with pytest.raises(PlanError, match="plan step ids must be unique"):
+        AgentPlan(
+            (
+                PlanStep("duplicate", "first"),
+                PlanStep("duplicate", "second"),
+            )
+        )
+    with pytest.raises(
+        PlanError, match="plan step description must be a non-empty string"
+    ):
+        PlanStep("step-1", "   ")
+    with pytest.raises(PlanError, match="plan step id contains unsupported characters"):
+        PlanStep("bad id", "inspect")
+    with pytest.raises(PlanError, match="plan step id exceeds the 16-character limit"):
+        PlanStep("x" * 17, "inspect")
+
+
+def test_from_dict_rejects_wrong_schema_and_field_set() -> None:
+    with pytest.raises(PlanError, match="unsupported checkpointed plan schema version"):
+        AgentPlan.from_dict({"schema_version": 2, "steps": []})
+    with pytest.raises(PlanError, match="checkpointed plan fields are malformed"):
+        AgentPlan.from_dict({"schema_version": 1, "steps": [], "unexpected": True})
+
+
+def test_create_over_existing_and_unexpected_arguments_are_refused() -> None:
+    plan = AgentPlan((PlanStep("step-1", "inspect", PlanStatus.IN_PROGRESS),))
+    with pytest.raises(
+        PlanError, match="a plan already exists; revise or add steps instead"
+    ):
+        apply_plan_operation(plan, PlanOperation.CREATE, steps=["replacement"])
+    with pytest.raises(PlanError, match=r"unexpected plan argument\(s\): description"):
+        apply_plan_operation(
+            None,
+            PlanOperation.CREATE,
+            steps=["inspect"],
+            description="unexpected",
+        )
+
+
+@pytest.mark.parametrize("status", [PlanStatus.DONE, PlanStatus.ABANDONED])
+def test_both_terminal_step_kinds_cannot_be_revised(status: PlanStatus) -> None:
+    plan = AgentPlan((PlanStep("step-1", "terminal", status),))
+    with pytest.raises(PlanError, match="a terminal plan step cannot be revised"):
+        apply_plan_operation(
+            plan,
+            PlanOperation.REVISE,
+            step_id="step-1",
+            description="changed",
+        )
 
 
 def test_both_terminal_status_transition_directions_are_forbidden() -> None:
@@ -589,6 +758,19 @@ def test_codec_rejects_missing_or_malformed_version_two_plan() -> None:
                 }
             }
         )
+    with pytest.raises(
+        ValueError, match="version-one tool-agent state fields are malformed"
+    ):
+        codec.decode_with_plan(
+            {
+                codec.state_key: {
+                    "schema_version": 1,
+                    "messages": [],
+                    "steps": 0,
+                    "plan": None,
+                }
+            }
+        )
 
 
 def test_from_dict_and_codec_encode_reject_wrong_plan_types_cleanly() -> None:
@@ -666,9 +848,8 @@ async def test_both_plan_caps_are_rejected_and_audited() -> None:
     assert MAX_PLAN_DESCRIPTION_CHARACTERS == 240
     assert _plan_from_state(outcome.state) is None
     assert outcome.error == (
-        "malformed arguments for manage_plan: plan exceeds the 32-step limit; "
-        "malformed arguments for manage_plan: plan step description exceeds the "
-        "240-character limit"
+        "plan exceeds the 32-step limit; "
+        "plan step description exceeds the 240-character limit"
     )
     assert [audit["result"]["status"] for audit in outcome.tool_audits] == [
         "rejected",

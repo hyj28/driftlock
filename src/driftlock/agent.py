@@ -19,6 +19,7 @@ from driftlock.models import StepContext, StepOutcome, StepTokenBudgetExhausted
 from driftlock.planning import (
     MAX_PLAN_DESCRIPTION_CHARACTERS,
     MAX_PLAN_STEPS,
+    SETTABLE_PLAN_STATUSES,
     AgentPlan,
     PlanError,
     PlanOperation,
@@ -695,7 +696,7 @@ class ToolCallingAgent:
             else completion
         )
         history.append(_assistant_message(stored_completion))
-        action = _describe_action(completion)
+        action = _describe_action(completion, planning=self.planning)
 
         if completion.truncated:
             error = "Provider response was truncated before it could be acted on."
@@ -886,6 +887,8 @@ class ToolCallingAgent:
                 return self._retrieve_context(call), plan
             except Exception as error:
                 return self._record_unexpected_retrieval_failure(call, error), plan
+        if call.name == "manage_plan" and not self.planning:
+            return _tool_error(call, f"unknown tool {call.name!r}"), plan
         try:
             arguments = _decode_arguments(call.arguments)
             if call.name == "manage_plan":
@@ -907,6 +910,19 @@ class ToolCallingAgent:
             if call.name == "complete":
                 return self._complete_task(call, arguments), plan
             return _tool_error(call, f"unknown tool {call.name!r}"), plan
+        except PlanError as error:
+            if call.name == "manage_plan":
+                return (
+                    self._record_plan_rejection(
+                        call,
+                        plan,
+                        str(error),
+                        context=context,
+                        completed_steps=completed_steps,
+                    ),
+                    plan,
+                )
+            return _tool_error(call, f"{call.name} failed: {error}"), plan
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             observation = _tool_error(
                 call, f"malformed arguments for {call.name}: {error}"
@@ -1299,7 +1315,9 @@ _PLAN_TOOL_DEFINITION = ToolDefinition(
     (
         "Maintain the durable ordered task plan. Create it with a non-empty steps "
         "array; add steps; revise a non-terminal step by id; or set_status using "
-        "not_started, in_progress, done, or abandoned. Completing or abandoning "
+        "in_progress, done, or abandoned. not_started is assigned only when steps "
+        "are created. Each normalized description is limited to "
+        f"{MAX_PLAN_DESCRIPTION_CHARACTERS} characters. Completing or abandoning "
         "the current step automatically starts the next not-started step."
     ),
     _object_schema(
@@ -1313,7 +1331,6 @@ _PLAN_TOOL_DEFINITION = ToolDefinition(
                 "items": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": MAX_PLAN_DESCRIPTION_CHARACTERS,
                 },
                 "minItems": 1,
                 "maxItems": MAX_PLAN_STEPS,
@@ -1322,11 +1339,10 @@ _PLAN_TOOL_DEFINITION = ToolDefinition(
             "description": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": MAX_PLAN_DESCRIPTION_CHARACTERS,
             },
             "status": {
                 "type": "string",
-                "enum": [status.value for status in PlanStatus],
+                "enum": [status.value for status in SETTABLE_PLAN_STATUSES],
             },
         },
         ["operation"],
@@ -1830,7 +1846,7 @@ def _tool_error(call: ToolCall, message: str) -> _ToolObservation:
     return _ToolObservation(call, f"ERROR: {message}", error=message)
 
 
-def _describe_action(completion: AgentCompletion) -> str:
+def _describe_action(completion: AgentCompletion, *, planning: bool) -> str:
     if completion.truncated:
         return "Handle a truncated provider response"
     calls = completion.tool_calls
@@ -1851,7 +1867,7 @@ def _describe_action(completion: AgentCompletion) -> str:
         return _shorten(f"Search files for: {arguments.get('query', '')}", 160)
     if call.name == "retrieve_context":
         return _shorten(f"Retrieve context for: {arguments.get('query', '')}", 160)
-    if call.name == "manage_plan":
+    if call.name == "manage_plan" and planning:
         return _shorten(f"Manage plan: {arguments.get('operation', '')}", 160)
     if call.name == "complete":
         return "Signal task completion"
