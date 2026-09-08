@@ -126,9 +126,24 @@ class ConversationCompactionResult:
             raise ValueError("compaction result and audit statuses must agree")
 
 
-# Four times the per-observation cap leaves roughly three worst-case tool units
-# after JSON framing, while bounding well below common provider context windows.
-DEFAULT_MAX_HISTORY_CHARACTERS = 64_000
+# Four parallel calls preserve useful batching while giving one agent step a
+# finite maximum number of tool observations for history sizing and execution.
+DEFAULT_MAX_TOOL_CALLS_PER_STEP = 4
+
+# Sixteen thousand characters retains substantial command evidence without one
+# tool result monopolizing subsequent requests.
+DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS = 16_000
+
+# Four calls x 16,000 observation characters = 64,000; another 32,000 covers the
+# bounded provider response, four call/result JSON envelopes, and summary marker.
+_DEFAULT_MULTI_TOOL_HISTORY_RESERVE_CHARACTERS = 32_000
+
+# The shipped 96,000-character bound therefore holds one worst-case four-call
+# turn verbatim plus compaction framing instead of immediately becoming summary-only.
+DEFAULT_MAX_HISTORY_CHARACTERS = (
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP * DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS
+    + _DEFAULT_MULTI_TOOL_HISTORY_RESERVE_CHARACTERS
+)
 
 # A useful local summary plus its JSON message framing fits at this floor; making
 # the supported range public prevents callers from discovering it by exception.
@@ -478,7 +493,8 @@ class ToolCallingAgent:
     """Perform one provider call and its tools with bounded conversation history.
 
     ``max_history_characters`` must be at least
-    :data:`MIN_MAX_HISTORY_CHARACTERS`.
+    :data:`MIN_MAX_HISTORY_CHARACTERS`. Responses above
+    ``max_tool_calls_per_step`` are recorded but none of their calls execute.
     """
 
     def __init__(
@@ -490,7 +506,8 @@ class ToolCallingAgent:
         max_output_tokens: int = 4096,
         min_output_tokens: int = 64,
         prefill_estimator: AgentPrefillEstimator = conservative_prefill_estimate,
-        max_tool_output_chars: int = 16_000,
+        max_tool_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+        max_tool_calls_per_step: int = DEFAULT_MAX_TOOL_CALLS_PER_STEP,
         max_history_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
         shell_timeout_sec: int = 60,
         codec: AgentConversationCodec | None = None,
@@ -508,6 +525,12 @@ class ToolCallingAgent:
         if max_tool_output_chars < 128:
             raise ValueError("max_tool_output_chars must be at least 128")
         if (
+            not isinstance(max_tool_calls_per_step, int)
+            or isinstance(max_tool_calls_per_step, bool)
+            or max_tool_calls_per_step <= 0
+        ):
+            raise ValueError("max_tool_calls_per_step must be a positive integer")
+        if (
             not isinstance(max_history_characters, int)
             or isinstance(max_history_characters, bool)
             or max_history_characters < MIN_MAX_HISTORY_CHARACTERS
@@ -524,6 +547,7 @@ class ToolCallingAgent:
         self.min_output_tokens = min_output_tokens
         self._prefill_estimator = prefill_estimator
         self.max_tool_output_chars = max_tool_output_chars
+        self.max_tool_calls_per_step = max_tool_calls_per_step
         self.max_history_characters = max_history_characters
         self.shell_timeout_sec = shell_timeout_sec
         self.codec = codec or AgentConversationCodec()
@@ -601,15 +625,37 @@ class ToolCallingAgent:
                 context_compactions=compaction_audits,
             )
 
-        history.append(_assistant_message(completion))
         errors: list[str] = []
         observations: list[_ToolObservation] = []
         completed = False
         summary = completion.text.strip()
+        too_many_tool_calls = len(completion.tool_calls) > self.max_tool_calls_per_step
+        # Calls are persisted only when this step will answer all of them. A
+        # truncated or over-ceiling response keeps its text but stores no calls,
+        # avoiding both dangling pairs and synthetic observations that never ran.
+        stored_completion = (
+            replace(completion, tool_calls=())
+            if completion.truncated or too_many_tool_calls
+            else completion
+        )
+        history.append(_assistant_message(stored_completion))
+        action = _describe_action(completion)
 
         if completion.truncated:
             error = "Provider response was truncated before it could be acted on."
             errors.append(error)
+            history.append({"role": "user", "content": f"ERROR: {error}"})
+        elif too_many_tool_calls:
+            error = (
+                f"Provider emitted {len(completion.tool_calls)} tool calls; the "
+                f"per-step limit is {self.max_tool_calls_per_step}. No calls were "
+                "executed."
+            )
+            errors.append(error)
+            action = (
+                f"Reject {len(completion.tool_calls)} tool calls above the per-step "
+                "limit"
+            )
             history.append({"role": "user", "content": f"ERROR: {error}"})
         else:
             for call in completion.tool_calls:
@@ -636,7 +682,7 @@ class ToolCallingAgent:
             if observation.command_return_code is not None
         )
         return StepOutcome(
-            action=_describe_action(completion),
+            action=action,
             state=self.codec.encode(history, steps=completed_steps + 1),
             changed_paths=delta.changed_paths,
             diff=delta.diff,
@@ -690,7 +736,13 @@ class ToolCallingAgent:
     ) -> tuple[Mapping[str, Any], ...]:
         plan = context.plan.strip() or "No separate plan was supplied."
         messages: list[Mapping[str, Any]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    f"{_SYSTEM_PROMPT}\nEmit no more than "
+                    f"{self.max_tool_calls_per_step} tool calls in one response."
+                ),
+            },
             {
                 "role": "user",
                 "content": f"Goal:\n{context.goal}\n\nPlan:\n{plan}",

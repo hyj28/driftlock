@@ -10,6 +10,9 @@ from typing import Any
 import pytest
 
 from driftlock.agent import (
+    DEFAULT_MAX_HISTORY_CHARACTERS,
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+    DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
     MIN_MAX_HISTORY_CHARACTERS,
     AgentCompletion,
     AgentCompletionRequest,
@@ -57,6 +60,22 @@ class UnusedEnvironment:
         raise AssertionError("no environment tool should run")
 
 
+@dataclass(frozen=True, slots=True)
+class LargeExecResult:
+    return_code: int = 0
+    stdout: str = "z" * DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS
+    stderr: str = ""
+
+
+class LargeOutputEnvironment:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def exec(self, *args: object, **kwargs: object) -> LargeExecResult:
+        self.calls += 1
+        return LargeExecResult()
+
+
 def _context(
     state: Mapping[str, Any], *, sequence: int = 1, logical_step: int = 1
 ) -> StepContext:
@@ -77,17 +96,17 @@ def _paired_history(
 ) -> list[dict[str, Any]]:
     history: list[dict[str, Any]] = []
     for number in range(count):
-        call_id = f"read-{number}"
+        call_id = f"read-{number:02}"
         history.extend(
             (
                 {
                     "role": "assistant",
-                    "content": f"inspect file {number}",
+                    "content": f"inspect file {number:02}",
                     "tool_calls": [
                         {
                             "id": call_id,
                             "name": "read_file",
-                            "arguments": {"path": f"file-{number}.txt"},
+                            "arguments": {"path": f"file-{number:02}.txt"},
                         }
                     ],
                     "truncated": False,
@@ -162,8 +181,8 @@ def test_compaction_keeps_tool_calls_and_results_as_indivisible_units() -> None:
         "assistant",
         "tool",
     ]
-    assert result.messages[1]["tool_calls"][0]["id"] == "read-4"
-    assert result.messages[2]["tool_call_id"] == "read-4"
+    assert result.messages[1]["tool_calls"][0]["id"] == "read-04"
+    assert result.messages[2]["tool_call_id"] == "read-04"
     _assert_no_orphaned_tools(result.messages)
     assert conversation_history_characters(result.messages) < 900
     assert result.audit is not None
@@ -173,9 +192,7 @@ def test_compaction_keeps_tool_calls_and_results_as_indivisible_units() -> None:
     assert result.audit.summary.startswith("Conversation context was compacted locally")
 
 
-async def test_tool_agent_common_path_is_byte_identical_and_provider_free(
-    tmp_path: Path,
-) -> None:
+async def test_tool_agent_common_path_is_byte_identical_and_provider_free() -> None:
     history = [
         {"role": "assistant", "content": "established invariant", "tool_calls": []},
         {"role": "user", "content": "keep going"},
@@ -193,7 +210,108 @@ async def test_tool_agent_common_path_is_byte_identical_and_provider_free(
     )
     assert outcome.context_compactions == ()
     assert outcome.tokens == 7
-    assert tmp_path.exists()
+
+
+async def test_truncated_completion_with_calls_stores_no_dangling_tool_call() -> None:
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(
+                text="I will read",
+                tool_calls=(ToolCall("read_file", {"path": "a.txt"}, "call-1"),),
+                tokens=5,
+                truncated=True,
+            ),
+            _complete("continued after truncation"),
+        ]
+    )
+    agent = _agent(provider)
+
+    first = await agent(_context(agent.initial_state()))
+    stored, steps = AgentConversationCodec().decode(first.state)
+    second = await agent(_context(first.state, sequence=2, logical_step=2))
+
+    assert steps == 1
+    assert stored == [
+        {
+            "role": "assistant",
+            "content": "I will read",
+            "tool_calls": [],
+            "truncated": True,
+        },
+        {
+            "role": "user",
+            "content": (
+                "ERROR: Provider response was truncated before it could be acted on."
+            ),
+        },
+    ]
+    assert len(provider.requests) == 2
+    assert second.completed is True
+    _assert_no_orphaned_tools(provider.requests[1].messages[2:])
+
+
+async def test_over_ceiling_completion_is_rejected_without_dangling_calls() -> None:
+    calls = tuple(
+        ToolCall("read_file", {"path": f"file-{number}.txt"}, f"call-{number}")
+        for number in range(DEFAULT_MAX_TOOL_CALLS_PER_STEP + 1)
+    )
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(tool_calls=calls, tokens=9),
+            _complete("continued after rejected batch"),
+        ]
+    )
+    agent = ToolCallingAgent(UnusedEnvironment(), EmptyObserver(), provider)
+
+    first = await agent(_context(agent.initial_state()))
+    stored, steps = AgentConversationCodec().decode(first.state)
+    second = await agent(_context(first.state, sequence=2, logical_step=2))
+
+    assert steps == 1
+    assert stored[0]["tool_calls"] == []
+    assert stored[1]["content"] == (
+        "ERROR: Provider emitted 5 tool calls; the per-step limit is 4. "
+        "No calls were executed."
+    )
+    assert first.action == "Reject 5 tool calls above the per-step limit"
+    assert first.tokens == 9
+    assert len(provider.requests) == 2
+    assert second.completed is True
+
+
+async def test_shipped_defaults_retain_a_worst_case_multi_tool_turn_verbatim() -> None:
+    environment = LargeOutputEnvironment()
+    calls = tuple(
+        ToolCall("run_shell", {"command": "true"}, f"shell-{number}")
+        for number in range(DEFAULT_MAX_TOOL_CALLS_PER_STEP)
+    )
+    provider = ScriptedProvider(
+        [AgentCompletion(tool_calls=calls, tokens=11), _complete("done")]
+    )
+    agent = ToolCallingAgent(environment, EmptyObserver(), provider)
+
+    first = await agent(_context(agent.initial_state()))
+    stored, _steps = AgentConversationCodec().decode(first.state)
+    second = await agent(_context(first.state, sequence=2, logical_step=2))
+    sent = provider.requests[1].messages[2:]
+
+    assert DEFAULT_MAX_TOOL_CALLS_PER_STEP == 4
+    assert DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS == 16_000
+    assert DEFAULT_MAX_HISTORY_CHARACTERS == 96_000
+    assert environment.calls == 4
+    assert [
+        len(message["content"]) for message in stored if message["role"] == "tool"
+    ] == [
+        16_000,
+        16_000,
+        16_000,
+        16_000,
+    ]
+    assert json.dumps(sent, separators=(",", ":")) == json.dumps(
+        stored, separators=(",", ":")
+    )
+    assert conversation_history_characters(sent) < 96_000
+    assert second.context_compactions == ()
 
 
 async def test_tool_agent_compacts_before_request_and_records_the_step_audit() -> None:
@@ -365,57 +483,71 @@ def test_recompacting_oversized_compacted_history_terminates_nonempty() -> None:
     ]
 
 
-def test_recent_retention_degrades_predictably_without_a_unit_count_cliff() -> None:
-    retained_by_unit_count = [
-        compact_conversation_history(
-            _paired_history(unit_count),
-            max_characters=900,
-            step=unit_count,
-        ).audit.retained_message_count
-        for unit_count in range(9, 14)
-    ]
-    retained_by_bound = [
-        compact_conversation_history(
-            _paired_history(20),
-            max_characters=bound,
-            step=20,
-        )
-        for bound in (1_800, 1_500, 1_200, 1_000, 900, 700, 512)
-    ]
+def test_recent_retention_is_monotonic_across_sizes_bounds_and_counts() -> None:
+    content_sizes = (200, 225, 250, 275, 300, 325, 350, 375)
+    bounds = (512, 600, 700, 800, 900, 1_000, 1_200, 1_500, 1_800)
+    retained_by_case: dict[tuple[int, int, int], int] = {}
 
-    assert retained_by_unit_count == [2, 2, 2, 2, 2]
-    assert [result.audit.retained_message_count for result in retained_by_bound] == [
-        6,
-        4,
-        4,
-        2,
-        2,
-        2,
-        0,
-    ]
-    assert [result.status.value for result in retained_by_bound] == [
-        "compacted",
-        "compacted",
-        "compacted",
-        "compacted",
-        "compacted",
-        "compacted",
-        "summary_only",
-    ]
+    for content_size in content_sizes:
+        for bound in bounds:
+            compacted_counts: list[int] = []
+            for unit_count in range(1, 31):
+                result = compact_conversation_history(
+                    _paired_history(unit_count, content_characters=content_size),
+                    max_characters=bound,
+                    step=unit_count,
+                )
+                retained = (
+                    len(result.messages)
+                    if result.audit is None
+                    else result.audit.retained_message_count
+                )
+                retained_by_case[(content_size, bound, unit_count)] = retained
+                if result.audit is not None:
+                    compacted_counts.append(retained)
+                    if result.status is ConversationCompactionStatus.SUMMARY_ONLY:
+                        newest_unit = _paired_history(
+                            1, content_characters=content_size
+                        )
+                        minimum_with_newest = [
+                            {
+                                "role": "user",
+                                "content": "Earlier conversation compacted locally.",
+                            },
+                            *newest_unit,
+                        ]
+                        assert (
+                            conversation_history_characters(minimum_with_newest)
+                            >= bound
+                        )
+            assert compacted_counts == sorted(compacted_counts)
+
+        for unit_count in range(1, 31):
+            retained_as_bound_grows = [
+                retained_by_case[(content_size, bound, unit_count)] for bound in bounds
+            ]
+            assert retained_as_bound_grows == sorted(retained_as_bound_grows)
+
+    assert retained_by_case[(300, 900, 10)] == 2
+    assert retained_by_case[(300, 900, 11)] == 2
 
 
 def test_durable_compaction_audit_is_a_bounded_ledger() -> None:
     messages: Sequence[Mapping[str, Any]] = _paired_history(5)
+    event_audits = []
     for step in range(1, 201):
         messages = [
             *messages,
             {"role": "user", "content": "z" * 1_000},
         ]
-        messages = compact_conversation_history(
+        result = compact_conversation_history(
             messages,
             max_characters=900,
             step=step,
-        ).messages
+        )
+        assert result.audit is not None
+        event_audits.append(result.audit)
+        messages = result.messages
 
     ledger = messages[0]["driftlock_context_compactions"]
     raw_state = json.dumps(messages, separators=(",", ":"), ensure_ascii=False)
@@ -436,7 +568,27 @@ def test_durable_compaction_audit_is_a_bounded_ledger() -> None:
     assert len(ledger["recent_events"]) == 16
     assert ledger["aggregated"]["first_recorded_step"] == 1
     assert ledger["aggregated"]["last_recorded_step"] == 184
-    assert ledger["aggregated"]["total_affected_message_count"] == 377
+    aggregated_events = event_audits[:184]
+    aggregate = ledger["aggregated"]
+    assert aggregate["total_affected_message_count"] == sum(
+        event.affected_message_count for event in aggregated_events
+    )
+    assert aggregate["minimum_before_characters"] == min(
+        event.before_characters for event in aggregated_events
+    )
+    assert aggregate["maximum_before_characters"] == max(
+        event.before_characters for event in aggregated_events
+    )
+    assert aggregate["minimum_after_characters"] == min(
+        event.after_characters for event in aggregated_events
+    )
+    assert aggregate["maximum_after_characters"] == max(
+        event.after_characters for event in aggregated_events
+    )
+    assert aggregate["summary_only_event_count"] == sum(
+        event.status is ConversationCompactionStatus.SUMMARY_ONLY
+        for event in aggregated_events
+    )
     assert len(raw_state) < 4_000
     assert unchanged.status is ConversationCompactionStatus.UNCHANGED
     assert unchanged.messages == messages
@@ -451,7 +603,7 @@ def test_under_bound_legacy_unbounded_audits_migrate_to_the_bounded_ledger() -> 
             "before_characters": 1_000,
             "after_characters": 100,
             "affected_message_count": 2,
-            "retained_message_count": 2,
+            "retained_message_count": 0,
             "summary": "s" * 300,
         }
         for step in range(1, 201)
@@ -476,6 +628,8 @@ def test_under_bound_legacy_unbounded_audits_migrate_to_the_bounded_ledger() -> 
     assert ledger["total_event_count"] == 200
     assert ledger["aggregated_event_count"] == 184
     assert len(ledger["recent_events"]) == 16
+    assert ledger["aggregated"]["summary_only_event_count"] == 184
+    assert {event["status"] for event in ledger["recent_events"]} == {"summary_only"}
     assert len(json.dumps(result.messages, separators=(",", ":"))) < 4_000
 
 
@@ -493,6 +647,100 @@ def test_orphaned_tool_result_is_rejected_consistently_at_every_size(
     ]
 
     with pytest.raises(AgentStateError, match="orphaned tool result"):
+        compact_conversation_history(history, max_characters=900, step=1)
+
+
+@pytest.mark.parametrize(
+    ("history", "message"),
+    [
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "call without result",
+                    "tool_calls": [
+                        {"id": "missing", "name": "read_file", "arguments": {}}
+                    ],
+                }
+            ],
+            "unanswered or unexpected tool results",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "one call",
+                    "tool_calls": [{"id": "one", "name": "read_file", "arguments": {}}],
+                },
+                {"role": "tool", "content": "one", "tool_call_id": "one"},
+                {"role": "tool", "content": "extra", "tool_call_id": "extra"},
+            ],
+            "unanswered or unexpected tool results",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "bad call container",
+                    "tool_calls": "not-an-array",
+                }
+            ],
+            "malformed tool_calls",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "missing call id",
+                    "tool_calls": [{"name": "read_file", "arguments": {}}],
+                }
+            ],
+            "malformed tool_calls",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "non-string call id",
+                    "tool_calls": [{"id": 7, "name": "read_file", "arguments": {}}],
+                }
+            ],
+            "malformed tool_calls",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "bad result id",
+                    "tool_calls": [{"id": "one", "name": "read_file", "arguments": {}}],
+                },
+                {"role": "tool", "content": "bad", "tool_call_id": 7},
+            ],
+            "malformed tool result",
+        ),
+    ],
+)
+def test_tool_pair_validation_rejects_every_malformed_shape(
+    history: list[dict[str, Any]], message: str
+) -> None:
+    with pytest.raises(AgentStateError, match=message):
+        compact_conversation_history(history, max_characters=900, step=1)
+
+
+@pytest.mark.parametrize(
+    ("history", "message"),
+    [
+        (
+            [{"role": "wizard", "content": "invalid"}],
+            "unsupported role 'wizard'",
+        ),
+        ([{"role": "user"}], "must contain content"),
+    ],
+)
+def test_compaction_validates_roles_and_required_content_under_bound(
+    history: list[dict[str, Any]], message: str
+) -> None:
+    with pytest.raises(AgentStateError, match=message):
         compact_conversation_history(history, max_characters=900, step=1)
 
 
@@ -554,6 +802,91 @@ def test_circular_content_has_one_public_agent_state_error() -> None:
         compact_conversation_history(history, max_characters=900, step=1)
 
 
+def test_history_bound_is_inclusive_and_compacted_output_is_strictly_below_it() -> None:
+    exactly_at_floor = [{"role": "user", "content": "x" * 482}]
+    one_over_floor = [{"role": "user", "content": "x" * 483}]
+    tightly_fitted = [
+        {"role": "user", "content": "old" * 1_000},
+        {"role": "user", "content": "r" * 801},
+    ]
+
+    unchanged = compact_conversation_history(
+        exactly_at_floor,
+        max_characters=512,
+        step=1,
+    )
+    compacted = compact_conversation_history(
+        one_over_floor,
+        max_characters=512,
+        step=1,
+    )
+    fitted = compact_conversation_history(
+        tightly_fitted,
+        max_characters=900,
+        step=2,
+    )
+
+    assert conversation_history_characters(exactly_at_floor) == 512
+    assert conversation_history_characters(one_over_floor) == 513
+    assert unchanged.status is ConversationCompactionStatus.UNCHANGED
+    assert compacted.status is ConversationCompactionStatus.SUMMARY_ONLY
+    assert compacted.audit.after_characters == 69
+    assert fitted.status is ConversationCompactionStatus.COMPACTED
+    assert fitted.audit.retained_message_count == 1
+    assert fitted.audit.summary == "Earlier conversation compacted locally."
+    assert fitted.audit.after_characters == 899
+
+
+def test_summary_shape_caps_and_prioritizes_recent_dropped_facts() -> None:
+    recent_first = compact_conversation_history(
+        _paired_history(20),
+        max_characters=900,
+        step=20,
+    )
+    shortened = compact_conversation_history(
+        [{"role": "user", "content": "a" * 5_000}],
+        max_characters=2_000,
+        step=1,
+    )
+    calls = [
+        {"id": f"call-{number:02}", "name": "read_file", "arguments": {}}
+        for number in range(40)
+    ]
+    oversized_unit = [
+        {
+            "role": "assistant",
+            "content": "assistant" * 10_000,
+            "tool_calls": calls,
+        },
+        *[
+            {
+                "role": "tool",
+                "content": "result" * 1_000,
+                "tool_call_id": call["id"],
+            }
+            for call in calls
+        ],
+    ]
+    capped = compact_conversation_history(
+        oversized_unit,
+        max_characters=64_000,
+        step=1,
+    )
+    quarter_capped = compact_conversation_history(
+        oversized_unit,
+        max_characters=2_000,
+        step=1,
+    )
+
+    assert "read_file#read-18" in recent_first.audit.summary
+    assert "read_file#read-00" not in recent_first.audit.summary
+    assert "a" * 239 + "…" in shortened.audit.summary
+    assert len(capped.audit.summary) == 8_000
+    assert capped.audit.summary.endswith("[earlier summary truncated locally]")
+    assert len(quarter_capped.audit.summary) == 500
+    assert quarter_capped.audit.summary.endswith("[earlier summary truncated locally]")
+
+
 def test_minimum_history_bound_is_public_and_documented() -> None:
     assert MIN_MAX_HISTORY_CHARACTERS == 512
     assert "MIN_MAX_HISTORY_CHARACTERS" in compact_conversation_history.__doc__
@@ -563,6 +896,14 @@ def test_minimum_history_bound_is_public_and_documented() -> None:
         ValueError, match="max_characters must be an integer of at least 512"
     ):
         compact_conversation_history([], max_characters=511, step=0)
+
+    with pytest.raises(ValueError, match="max_history_characters must be at least 512"):
+        ToolCallingAgent(
+            UnusedEnvironment(),
+            EmptyObserver(),
+            ScriptedProvider([]),
+            max_history_characters=511,
+        )
 
 
 async def test_far_over_bound_keeps_non_history_prompt_turns_for_next_request() -> None:
