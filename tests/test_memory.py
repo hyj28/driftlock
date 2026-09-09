@@ -15,6 +15,7 @@ from driftlock.agent import (
     ToolCallingAgent,
 )
 from driftlock.agentic_retrieval import (
+    AgenticRetrievalConfig,
     AgenticRetrievalTool,
     RetrievalCorpusBuilder,
     RetrievalDocumentKind,
@@ -23,6 +24,7 @@ from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
 from driftlock.memory import (
+    DEFAULT_MAX_MEMORY_PROVENANCE_COUNTER,
     MemoryEntryStatus,
     MemoryMutationStatus,
     MemoryOperation,
@@ -357,6 +359,15 @@ def test_correction_cannot_consume_terminal_revocation_headroom(
     )
     assert revoked.status is MemoryMutationStatus.APPLIED
     assert store.read("memory-000001").status is MemoryEntryStatus.REVOKED
+
+
+@pytest.mark.parametrize("field", ["sequence", "logical_step", "attempt"])
+def test_every_memory_provenance_counter_is_bounded(field: str) -> None:
+    values = {"sequence": 1, "logical_step": 1, "attempt": 1}
+    values[field] = DEFAULT_MAX_MEMORY_PROVENANCE_COUNTER + 1
+
+    with pytest.raises(MemoryStoreError, match=f"memory provenance {field} exceeds"):
+        MemoryProvenance("task", "run", **values)
 
 
 @pytest.mark.parametrize(
@@ -918,6 +929,30 @@ def test_memory_never_survives_as_the_only_match_when_workspace_is_eligible(
     )
 
 
+def test_absolute_memory_character_cap_survives_a_larger_custom_task_budget(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    content = "memoryneedle " + ("x" * 1_880)
+    query = "memoryneedle"
+    store = MemoryStore(tmp_path / "memory")
+    store.record(content, _provenance())
+    tool = AgenticRetrievalTool.from_workspace(
+        workspace,
+        SkillLibrary(tmp_path / "library"),
+        LiteralEmbedder({content: _vector(0.95), query: _RELATED_QUERY_VECTOR}),
+        config=AgenticRetrievalConfig(max_characters_per_task=60_000),
+        memory_store=store,
+    )
+
+    results = [tool.retrieve(query) for _ in range(4)]
+
+    assert [len(result.matches) for result in results] == [1, 1, 0, 0]
+    assert results[0].memory_character_limit == 6_000
+    assert tool.returned_memory_characters == 4_278
+
+
 @pytest.mark.parametrize("operation", ["record", "correct", "revoke"])
 def test_memory_checkpoint_restore_covers_every_mutation(
     tmp_path: Path, operation: str
@@ -946,6 +981,83 @@ def test_memory_checkpoint_restore_covers_every_mutation(
         restored = store.read("memory-000001")
         assert restored.current_content == "Original fact."
         assert restored.revision == 1
+
+
+def test_memory_checkpoint_truncates_only_this_runs_suffix(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    checkpoint = store.checkpoint_state()
+    other = _provenance("other-task", "other-run")
+    current = _provenance("task-parser", "run-07")
+    store.record("Other run fact.", other)
+    store.correct("memory-000001", "Rejected correction.", "Bad branch.", current)
+
+    store.restore_checkpoint_state(checkpoint, task_id="task-parser", run_id="run-07")
+
+    restored = store.read("memory-000001")
+    assert restored.current_content == "Other run fact."
+    assert restored.revision == 1
+
+
+def test_memory_checkpoint_refuses_another_runs_dependent_suffix(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory")
+    checkpoint = store.checkpoint_state()
+    current = _provenance("task-parser", "run-07")
+    other = _provenance("other-task", "other-run")
+    store.record("Rejected new fact.", current)
+    store.correct("memory-000001", "Other run correction.", "Observed.", other)
+
+    with pytest.raises(
+        MemoryStoreError,
+        match="cannot restore memory checkpoint across another run's write",
+    ):
+        store.restore_checkpoint_state(
+            checkpoint, task_id="task-parser", run_id="run-07"
+        )
+
+
+def test_memory_checkpoint_rejects_entry_count_before_decoding_entries(
+    tmp_path: Path,
+) -> None:
+    store = MemoryStore(tmp_path / "memory", config=MemoryStoreConfig(max_entries=1))
+    oversized = {
+        "schema_version": 1,
+        "entries": [object(), object()],
+    }
+
+    with pytest.raises(
+        MemoryStoreFormatError,
+        match="exceeds the configured entry-count bound",
+    ):
+        store.restore_checkpoint_state(
+            oversized, task_id="task-parser", run_id="run-07"
+        )
+
+
+def test_memory_checkpoint_rejects_event_count_before_materializing_events(
+    tmp_path: Path,
+) -> None:
+    source = MemoryStore(
+        tmp_path / "source",
+        config=MemoryStoreConfig(max_events_per_entry=2),
+    )
+    provenance = _provenance()
+    source.record("Original.", provenance)
+    source.correct("memory-000001", "Corrected.", "Observed.", provenance)
+    checkpoint = source.checkpoint_state()
+    target = MemoryStore(
+        tmp_path / "target",
+        config=MemoryStoreConfig(max_events_per_entry=1),
+    )
+
+    with pytest.raises(
+        MemoryStoreFormatError,
+        match="exceeds the configured event-count bound",
+    ):
+        target.restore_checkpoint_state(
+            checkpoint, task_id="task-parser", run_id="run-07"
+        )
 
 
 async def test_runner_rollback_restores_memory_before_retry(tmp_path: Path) -> None:
@@ -1015,6 +1127,129 @@ async def test_runner_rollback_restores_memory_before_retry(tmp_path: Path) -> N
     terminal = json.dumps(result.state, sort_keys=True)
     assert "memory-000001" not in terminal
     assert "memory-000002" not in terminal
+
+
+async def test_runner_rollback_hook_restores_memory_even_without_a_retry(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        *(
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "manage_memory",
+                        {"operation": "record", "content": f"Rejected {index}."},
+                        f"memory-{index}",
+                    ),
+                )
+            )
+            for index in (1, 2)
+        )
+    )
+    store = MemoryStore(tmp_path / "memory")
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        memory_store=store,
+        memory_task_id="task-parser",
+        memory_run_id="run-07",
+    )
+    runner = DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=2,
+                loop_window=2,
+                loop_repetitions=2,
+                error_window=10,
+                reward_stall_steps=10,
+                corroborating_signals=frozenset(),
+            )
+        ),
+        config=RunnerConfig(max_steps=2, max_rollbacks=1),
+    )
+
+    result = await runner.run(
+        goal="repair parser", step=agent, initial_state=agent.initial_state()
+    )
+
+    assert result.status is RunStatus.STEP_LIMIT
+    assert len(result.rollbacks) == 1
+    assert store.current_entries() == ()
+
+
+async def test_retry_can_record_memory_with_attempt_two_provenance(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall(
+                    "manage_memory",
+                    {"operation": "record", "content": "Rejected one."},
+                    "memory-1",
+                ),
+            )
+        ),
+        AgentCompletion(
+            tool_calls=(
+                ToolCall(
+                    "manage_memory",
+                    {"operation": "record", "content": "Rejected two."},
+                    "memory-2",
+                ),
+            )
+        ),
+        AgentCompletion(
+            tool_calls=(
+                ToolCall(
+                    "manage_memory",
+                    {"operation": "record", "content": "Accepted retry fact."},
+                    "memory-3",
+                ),
+            )
+        ),
+        AgentCompletion(
+            tool_calls=(ToolCall("complete", {"summary": "Done."}, "done"),)
+        ),
+    )
+    store = MemoryStore(tmp_path / "memory")
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        memory_store=store,
+        memory_task_id="task-parser",
+        memory_run_id="run-07",
+    )
+    runner = DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=10,
+                loop_window=2,
+                loop_repetitions=2,
+                error_window=10,
+                reward_stall_steps=10,
+                corroborating_signals=frozenset(),
+            )
+        ),
+        config=RunnerConfig(max_steps=4, max_rollbacks=1),
+    )
+
+    result = await runner.run(
+        goal="repair parser", step=agent, initial_state=agent.initial_state()
+    )
+
+    assert result.status is RunStatus.COMPLETED
+    entry = store.current_entries()[0]
+    assert entry.current_content == "Accepted retry fact."
+    assert entry.current_provenance.attempt == 2
 
 
 def test_corrected_memory_is_retrieved_without_superseded_content(

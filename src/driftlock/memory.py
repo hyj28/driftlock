@@ -50,6 +50,15 @@ DEFAULT_MAX_MEMORY_REASON_CHARACTERS = 500
 # bounding provenance independently of memory content and total serialized size.
 DEFAULT_MAX_MEMORY_PROVENANCE_ID_CHARACTERS = 128
 
+# Runner counters are small in practice; this explicit ceiling also bounds their
+# decimal JSON representation inside revocation-reserve calculations.
+DEFAULT_MAX_MEMORY_PROVENANCE_COUNTER = 999_999_999
+
+# A task cannot legitimately revise one claim this many times. The independent
+# ceiling lets checkpoint and disk decoders reject adversarial event arrays before
+# materializing them.
+DEFAULT_MAX_MEMORY_EVENTS_PER_ENTRY = 1_024
+
 # Five hundred characters retain actionable tool failures while explicit length
 # and digest metadata represents larger errors without silently truncating them.
 DEFAULT_MAX_MEMORY_AUDIT_ERROR_CHARACTERS = 500
@@ -134,6 +143,7 @@ class MemoryStoreConfig:
     max_remediation_bytes: int = DEFAULT_MAX_MEMORY_REMEDIATION_BYTES
     max_reason_characters: int = DEFAULT_MAX_MEMORY_REASON_CHARACTERS
     max_provenance_id_characters: int = DEFAULT_MAX_MEMORY_PROVENANCE_ID_CHARACTERS
+    max_events_per_entry: int = DEFAULT_MAX_MEMORY_EVENTS_PER_ENTRY
 
     def __post_init__(self) -> None:
         for name in (
@@ -143,6 +153,7 @@ class MemoryStoreConfig:
             "max_remediation_bytes",
             "max_reason_characters",
             "max_provenance_id_characters",
+            "max_events_per_entry",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -179,6 +190,11 @@ class MemoryProvenance:
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise MemoryStoreError(
                     f"memory provenance {name} must be a positive integer"
+                )
+            if value > DEFAULT_MAX_MEMORY_PROVENANCE_COUNTER:
+                raise MemoryStoreError(
+                    f"memory provenance {name} exceeds the "
+                    f"{DEFAULT_MAX_MEMORY_PROVENANCE_COUNTER} limit"
                 )
 
     def validate_for(self, config: MemoryStoreConfig) -> None:
@@ -677,7 +693,7 @@ class MemoryStore:
         rather than silently overwritten.
         """
 
-        snapshot = _decode_checkpoint_state(value)
+        snapshot = _decode_checkpoint_state(value, self.config)
         snapshot_by_id = {entry.memory_id: entry for entry in snapshot}
         with self._mutation_lock():
             current = self.all_entries()
@@ -712,11 +728,23 @@ class MemoryStore:
             for memory_id, present in current_by_id.items():
                 if memory_id in snapshot_by_id:
                     continue
-                if all(
+                ownership = tuple(
                     event.provenance.task_id == task_id
                     and event.provenance.run_id == run_id
                     for event in present.events
-                ):
+                )
+                if not any(ownership):
+                    continue
+                first_owned = ownership.index(True)
+                if not all(ownership[first_owned:]):
+                    raise MemoryStoreError(
+                        "cannot restore memory checkpoint across another run's "
+                        f"write to {memory_id!r}"
+                    )
+                retained = present.events[:first_owned]
+                if retained:
+                    replacements.append(MemoryEntry(memory_id, retained))
+                else:
                     removals.append(memory_id)
 
             for entry in replacements:
@@ -954,6 +982,17 @@ class MemoryStore:
                 content_length=_safe_length(normalized_content),
             )
         revision = prior.revision + 1
+        if revision > self.config.max_events_per_entry:
+            return self._reject(
+                operation,
+                memory_id,
+                provenance,
+                "memory entry reached the configured event-count bound "
+                f"({self.config.max_events_per_entry})",
+                entry_count,
+                before_bytes,
+                content_length=_safe_length(normalized_content),
+            )
         status_after = (
             MemoryEntryStatus.ACTIVE
             if operation is MemoryOperation.CORRECT
@@ -1152,6 +1191,10 @@ class MemoryStore:
         }
 
     def _validate_loaded_entry(self, entry: MemoryEntry, path: Path) -> None:
+        if len(entry.events) > self.config.max_events_per_entry:
+            raise MemoryStoreFormatError(
+                f"memory entry exceeds the event-count bound: {path}"
+            )
         for event in entry.events:
             try:
                 event.provenance.validate_for(self.config)
@@ -1311,7 +1354,9 @@ def _validate_memory_id(memory_id: object) -> None:
         raise MemoryStoreFormatError("memory id has invalid format")
 
 
-def _decode_checkpoint_state(value: object) -> tuple[MemoryEntry, ...]:
+def _decode_checkpoint_state(
+    value: object, config: MemoryStoreConfig
+) -> tuple[MemoryEntry, ...]:
     if not isinstance(value, Mapping) or set(value) != {"schema_version", "entries"}:
         raise MemoryStoreFormatError("memory checkpoint state fields are malformed")
     if value.get("schema_version") != MEMORY_SCHEMA_VERSION:
@@ -1319,7 +1364,47 @@ def _decode_checkpoint_state(value: object) -> tuple[MemoryEntry, ...]:
     raw_entries = value.get("entries")
     if not isinstance(raw_entries, list):
         raise MemoryStoreFormatError("memory checkpoint entries must be a list")
-    entries = tuple(MemoryEntry.from_dict(entry) for entry in raw_entries)
+    if len(raw_entries) > config.max_entries:
+        raise MemoryStoreFormatError(
+            "memory checkpoint exceeds the configured entry-count bound"
+        )
+    entries_list: list[MemoryEntry] = []
+    serialized_bytes = 0
+    for raw_entry in raw_entries:
+        raw_events = raw_entry.get("events") if isinstance(raw_entry, Mapping) else None
+        if (
+            isinstance(raw_events, list)
+            and len(raw_events) > config.max_events_per_entry
+        ):
+            raise MemoryStoreFormatError(
+                "memory checkpoint entry exceeds the configured event-count bound"
+            )
+        entry = MemoryEntry.from_dict(raw_entry)
+        if len(entry.events) > config.max_events_per_entry:
+            raise MemoryStoreFormatError(
+                "memory checkpoint entry exceeds the configured event-count bound"
+            )
+        for event in entry.events:
+            event.provenance.validate_for(config)
+            if event.content is not None:
+                _checkpoint_text_guard(
+                    event.content,
+                    config.max_content_characters,
+                    "content",
+                )
+            if event.reason is not None:
+                _checkpoint_text_guard(
+                    event.reason,
+                    config.max_reason_characters,
+                    "reason",
+                )
+        serialized_bytes += len(_serialize_entry(entry))
+        if serialized_bytes > config.max_store_bytes + config.max_remediation_bytes:
+            raise MemoryStoreFormatError(
+                "memory checkpoint exceeds the absolute store byte limit"
+            )
+        entries_list.append(entry)
+    entries = tuple(entries_list)
     identifiers = tuple(entry.memory_id for entry in entries)
     if identifiers != tuple(sorted(identifiers)) or len(identifiers) != len(
         set(identifiers)
@@ -1336,6 +1421,22 @@ def _required_revocation_reserve(config: MemoryStoreConfig) -> int:
     return 2_048 + 6 * (
         config.max_reason_characters + 2 * config.max_provenance_id_characters
     )
+
+
+def _checkpoint_text_guard(value: str, limit: int, name: str) -> None:
+    if (
+        not value.strip()
+        or len(value) > limit
+        or "\x00" in value
+        or not _is_valid_utf8(value)
+    ):
+        raise MemoryStoreFormatError(
+            f"memory checkpoint {name} violates its configured bound"
+        )
+    if _looks_like_credential(value):
+        raise MemoryStoreFormatError(
+            f"memory checkpoint {name} looks like a credential"
+        )
 
 
 def _serialize_entry(entry: MemoryEntry) -> bytes:
