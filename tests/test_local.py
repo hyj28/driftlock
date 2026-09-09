@@ -49,9 +49,13 @@ import time
 child = os.fork()
 if child == 0:
     os.setsid()
-    pathlib.Path("detached.pid").write_text(str(os.getpid()), encoding="utf-8")
-    time.sleep(0.3)
-    pathlib.Path("late.txt").write_text("escaped timeout", encoding="utf-8")
+    grandchild = os.fork()
+    if grandchild == 0:
+        pathlib.Path("detached.pid").write_text(str(os.getpid()), encoding="utf-8")
+        time.sleep(0.3)
+        pathlib.Path("late.txt").write_text("escaped timeout", encoding="utf-8")
+    else:
+        os._exit(0)
 else:
     time.sleep(30)
 """

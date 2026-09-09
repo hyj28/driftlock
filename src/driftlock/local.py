@@ -96,6 +96,7 @@ class LocalEnvironment:
     async def _exec_process(
         self, command: str, timeout: int, environment: dict[str, str]
     ) -> LocalExecResult:
+        baseline_processes = frozenset(pid for pid, _ in _process_parent_pairs())
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=self.root,
@@ -125,7 +126,10 @@ class LocalEnvironment:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGSTOP)
             descendants = await asyncio.to_thread(_descendant_process_ids, process.pid)
-            _kill_processes(descendants)
+            workspace_processes = await asyncio.to_thread(
+                _new_workspace_process_ids, self.root, baseline_processes
+            )
+            _kill_processes(tuple(dict.fromkeys((*descendants, *workspace_processes))))
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             _close_process_pipes(process)
@@ -147,7 +151,10 @@ class LocalEnvironment:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGSTOP)
             descendants = await asyncio.to_thread(_descendant_process_ids, process.pid)
-            _kill_processes(descendants)
+            workspace_processes = await asyncio.to_thread(
+                _new_workspace_process_ids, self.root, baseline_processes
+            )
+            _kill_processes(tuple(dict.fromkeys((*descendants, *workspace_processes))))
             try:
                 os.killpg(process.pid, signal.SIGKILL)
                 process_group_terminated = True
@@ -346,6 +353,55 @@ def _kill_processes(process_ids: tuple[int, ...]) -> None:
     for pid in process_ids:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, signal.SIGKILL)
+
+
+def _new_workspace_process_ids(
+    workspace: Path, baseline: frozenset[int]
+) -> tuple[int, ...]:
+    current = {pid for pid, _parent in _process_parent_pairs()}
+    candidates = current - baseline - {os.getpid()}
+    if sys.platform == "darwin":
+        return _darwin_workspace_process_ids(candidates, workspace)
+    result: list[int] = []
+    for pid in candidates:
+        try:
+            cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if cwd == workspace or cwd.is_relative_to(workspace):
+            result.append(pid)
+    return tuple(result)
+
+
+def _darwin_workspace_process_ids(
+    candidates: set[int], workspace: Path
+) -> tuple[int, ...]:
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        return ()
+    root = os.fsencode(workspace.resolve())
+    result: list[int] = []
+    for pid in candidates:
+        info = ctypes.create_string_buffer(4096)
+        try:
+            copied = libproc.proc_pidinfo(pid, 9, 0, info, len(info))
+        except (OSError, ValueError):
+            continue
+        if copied <= 0:
+            continue
+        paths = info.raw[:copied].split(b"\0")
+        if any(path == root or path.startswith(root + b"/") for path in paths):
+            result.append(pid)
+    return tuple(result)
 
 
 async def _read_capped(stream: asyncio.StreamReader, limit: int) -> bytes:

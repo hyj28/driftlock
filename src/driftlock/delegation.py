@@ -24,6 +24,7 @@ DEFAULT_MAX_DELEGATION_TOKENS_PER_TASK = 64_000
 DEFAULT_DELEGATION_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_DELEGATION_ERROR_CHARACTERS = 1_000
 MAX_DELEGATION_ACCOUNTED_TOKENS = 1_000_000_000_000
+_MAX_DELEGATION_LEDGER_TOKENS = 2 * MAX_DELEGATION_ACCOUNTED_TOKENS
 
 # A checkpoint contains at most one compact record per admitted call. Keeping a
 # separate bound on its serialized representation also rejects hostile nested
@@ -725,7 +726,7 @@ def _decode_state(
     if (
         not isinstance(tokens, int)
         or isinstance(tokens, bool)
-        or not 0 <= tokens <= MAX_DELEGATION_ACCOUNTED_TOKENS
+        or not 0 <= tokens <= _MAX_DELEGATION_LEDGER_TOKENS
     ):
         raise ValueError("delegation checkpoint token count is invalid")
     if not isinstance(records, list) or len(records) != calls:
@@ -815,7 +816,7 @@ def _validate_checkpoint_record(
         or not _is_nonnegative_int(contributed)
         or not _is_nonnegative_int(after)
         or after != before + contributed
-        or after > MAX_DELEGATION_ACCOUNTED_TOKENS
+        or after > _MAX_DELEGATION_LEDGER_TOKENS
         or not isinstance(token_report.get("accounting_known"), bool)
     ):
         raise ValueError("delegation checkpoint token report is invalid")

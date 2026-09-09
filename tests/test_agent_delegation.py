@@ -19,6 +19,7 @@ from driftlock.agent import (
 )
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.delegation import (
+    MAX_DELEGATION_ACCOUNTED_TOKENS,
     DelegationConfig,
     DelegationExecutionResult,
     DelegationRequest,
@@ -250,6 +251,29 @@ async def test_known_token_overshoot_is_counted_and_checkpointed() -> None:
     assert restored.tokens_used == 10
 
 
+async def test_checkpoint_accepts_maximum_cumulative_overshoot() -> None:
+    executor = RecordingExecutor(
+        _result(tokens=1),
+        _result(tokens=MAX_DELEGATION_ACCOUNTED_TOKENS),
+    )
+    tool = DelegationTool(
+        executor,
+        config=DelegationConfig(
+            max_tokens_per_call=MAX_DELEGATION_ACCOUNTED_TOKENS,
+            max_tokens_per_task=MAX_DELEGATION_ACCOUNTED_TOKENS,
+        ),
+    )
+
+    await _delegate(tool)
+    outcome = await _delegate(tool)
+
+    assert outcome.status is DelegationStatus.TOKEN_LIMIT
+    assert tool.tokens_used == MAX_DELEGATION_ACCOUNTED_TOKENS + 1
+    restored = DelegationTool(RecordingExecutor(_result()), config=tool.config)
+    restored.restore_checkpoint_state(tool.checkpoint_state())
+    assert restored.tokens_used == MAX_DELEGATION_ACCOUNTED_TOKENS + 1
+
+
 async def test_timeout_cannot_be_suppressed_by_executor_cancellation() -> None:
     returned = asyncio.Event()
 
@@ -271,6 +295,49 @@ async def test_timeout_cannot_be_suppressed_by_executor_cancellation() -> None:
     assert outcome.status is DelegationStatus.TIMED_OUT
     assert not returned.is_set()
     await asyncio.wait_for(returned.wait(), timeout=0.2)
+
+
+async def test_cancelled_builtin_child_cannot_execute_late_provider_tool(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider_returned = asyncio.Event()
+
+    async def swallowing_provider(_: AgentCompletionRequest) -> AgentCompletion:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            provider_returned.set()
+            return AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "write_file",
+                        {"path": "late.txt", "content": "late mutation"},
+                        "write-late",
+                    ),
+                )
+            )
+
+    environment = LocalEnvironment(workspace)
+    executor = ToolCallingSubagentExecutor(
+        environment,
+        LocalWorkspaceDeltaObserver(workspace),
+        swallowing_provider,
+        min_output_tokens=1,
+        prefill_estimator=lambda _: 0,
+    )
+    tool = DelegationTool(
+        executor,
+        config=DelegationConfig(timeout_seconds=0.001),
+    )
+
+    outcome = await _delegate(tool)
+    await asyncio.wait_for(provider_returned.wait(), timeout=0.2)
+    await asyncio.sleep(0.05)
+
+    assert outcome.status is DelegationStatus.TIMED_OUT
+    assert not (workspace / "late.txt").exists()
 
 
 async def test_executor_exception_with_broken_string_is_contained() -> None:

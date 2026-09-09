@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import posixpath
@@ -954,6 +955,13 @@ class ToolCallingAgent:
                 summary="The provider failed before a usable response was returned.",
                 context_compactions=compaction_audits,
             )
+
+        # A provider may accidentally swallow cancellation and return a value.
+        # Preserve the outer deadline as a hard execution fence: no tool call may
+        # run after this agent task has been asked to stop.
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise asyncio.CancelledError
 
         errors: list[str] = []
         observations: list[_ToolObservation] = []
