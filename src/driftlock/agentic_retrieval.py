@@ -22,6 +22,7 @@ from pathlib import Path
 from statistics import NormalDist, median
 from typing import Any
 
+from driftlock.memory import MemoryStore
 from driftlock.skill_admission import SkillLibrary
 from driftlock.skill_distillation import serialize_skill
 from driftlock.skill_retrieval import (
@@ -73,6 +74,16 @@ DEFAULT_MAX_QUERY_CHARACTERS = 2_000
 # Twenty exclusion examples are enough for the ordinary agent observation; the
 # complete per-document decisions remain in the out-of-context step audit.
 DEFAULT_MAX_OBSERVATION_EXCLUSIONS = 20
+
+# One memory leaves result slots for validated skills and current workspace
+# observations; the effective cap drops to zero if the overall result cap is one,
+# so an unvalidated hint can never crowd out the whole call under custom limits.
+DEFAULT_MAX_MEMORY_RESULTS_PER_CALL = 1
+
+# Six thousand characters cap memory at one third of the default task budget. The
+# effective cap is also limited to one third of a custom overall task budget, so
+# repeated memory-only queries always preserve capacity for non-memory evidence.
+DEFAULT_MAX_MEMORY_CHARACTERS_PER_TASK = 6_000
 
 # A one-in-one-hundred-thousand family-wise null-match allowance makes semantic
 # retrieval conservative enough to abstain on unrelated MiniLM queries while the
@@ -149,6 +160,7 @@ class RetrievalDocumentKind(StrEnum):
 
     SKILL = "skill"
     WORKSPACE = "workspace"
+    MEMORY = "memory"
 
 
 class RetrievalCorpusStatus(StrEnum):
@@ -294,6 +306,8 @@ class _CorpusDocument:
     sha256: str
     chunk_start: int | None = None
     chunk_end: int | None = None
+    epistemic_status: str | None = None
+    provenance: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,11 +320,13 @@ class _UnembeddedDocument:
     returned_text: str
     chunk_start: int | None = None
     chunk_end: int | None = None
+    epistemic_status: str | None = None
+    provenance: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RetrievedContext:
-    """One ranked agent-facing skill or workspace excerpt."""
+    """One ranked agent-facing skill, workspace excerpt, or memory hint."""
 
     document_id: str
     kind: RetrievalDocumentKind
@@ -324,6 +340,8 @@ class RetrievedContext:
     content: str
     chunk_start: int | None = None
     chunk_end: int | None = None
+    epistemic_status: str | None = None
+    provenance: Mapping[str, Any] | None = None
 
     def to_report(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -347,6 +365,10 @@ class RetrievedContext:
                 "start_character": self.chunk_start,
                 "end_character": self.chunk_end,
             }
+        if self.epistemic_status is not None:
+            result["epistemic_status"] = self.epistemic_status
+        if self.provenance is not None:
+            result["provenance"] = dict(self.provenance)
         return result
 
 
@@ -368,6 +390,12 @@ class AgenticRetrievalResult:
     per_call_result_cap_hit: bool = False
     per_call_character_cap_hit: bool = False
     per_task_character_budget_hit: bool = False
+    task_memory_characters_before: int | None = None
+    task_memory_characters_after: int | None = None
+    memory_result_limit: int | None = None
+    memory_character_limit: int | None = None
+    per_call_memory_result_cap_hit: bool = False
+    per_task_memory_character_budget_hit: bool = False
     refusal: Mapping[str, str] | None = None
 
     @property
@@ -433,6 +461,27 @@ class AgenticRetrievalResult:
         }
         if self.refusal is not None:
             report["refusal"] = dict(self.refusal)
+        if self.task_memory_characters_before is not None:
+            report["limits"]["per_call_memory_result_cap"] = {
+                "limit": self.memory_result_limit,
+                "hit": self.per_call_memory_result_cap_hit,
+                "excluded_count": self.exclusion_reason_counts.get(
+                    "per_call_memory_result_cap", 0
+                ),
+            }
+            report["limits"]["per_task_memory_character_budget"] = {
+                "limit": self.memory_character_limit,
+                "before": self.task_memory_characters_before,
+                "contributed": (
+                    (self.task_memory_characters_after or 0)
+                    - self.task_memory_characters_before
+                ),
+                "after": self.task_memory_characters_after,
+                "hit": self.per_task_memory_character_budget_hit,
+                "excluded_count": self.exclusion_reason_counts.get(
+                    "per_task_memory_character_budget", 0
+                ),
+            }
         return report
 
     def to_observation(self, *, max_characters: int | None = None) -> str:
@@ -528,7 +577,7 @@ class AgenticRetrievalResult:
 
 @dataclass(frozen=True, slots=True)
 class RetrievalCorpus:
-    """One immutable vector index over skills and workspace text chunks."""
+    """One immutable vector index over all configured retrieval document kinds."""
 
     status: RetrievalCorpusStatus
     config: AgenticRetrievalConfig
@@ -561,6 +610,7 @@ class RetrievalCorpusBuilder:
     skill_library: SkillLibrary
     embed: Callable[[Sequence[str]], Iterable[Iterable[Real]]]
     config: AgenticRetrievalConfig = AgenticRetrievalConfig()
+    memory_store: MemoryStore | None = None
 
     def __post_init__(self) -> None:
         root = Path(self.workspace_root).resolve()
@@ -572,14 +622,19 @@ class RetrievalCorpusBuilder:
             raise TypeError("embed must be callable")
         if not isinstance(self.config, AgenticRetrievalConfig):
             raise TypeError("config must be an AgenticRetrievalConfig")
+        if self.memory_store is not None and not isinstance(
+            self.memory_store, MemoryStore
+        ):
+            raise TypeError("memory_store must be a MemoryStore or None")
         object.__setattr__(self, "workspace_root", root)
 
     def build(self) -> RetrievalCorpus:
-        """Read, chunk, and embed both evidence kinds into one fixed snapshot."""
+        """Read, chunk, and embed all configured kinds into one fixed snapshot."""
 
         pending: list[_UnembeddedDocument] = []
         exclusions: list[dict[str, str]] = []
         self._append_skills(pending, exclusions)
+        self._append_memories(pending, exclusions)
         self._append_workspace(pending, exclusions)
         fingerprint = _corpus_fingerprint(pending)
         kind_counts = Counter(document.kind.value for document in pending)
@@ -636,6 +691,8 @@ class RetrievalCorpusBuilder:
                         ).hexdigest(),
                         chunk_start=document.chunk_start,
                         chunk_end=document.chunk_end,
+                        epistemic_status=document.epistemic_status,
+                        provenance=document.provenance,
                     )
                     for document, vector in zip(pending, vectors, strict=True)
                 )
@@ -697,6 +754,62 @@ class RetrievalCorpusBuilder:
                 )
             )
 
+    def _append_memories(
+        self,
+        pending: list[_UnembeddedDocument],
+        exclusions: list[dict[str, str]],
+    ) -> None:
+        if self.memory_store is None:
+            return
+        try:
+            entries = self.memory_store.current_entries()
+        except Exception as error:
+            exclusions.append(
+                {
+                    "kind": RetrievalDocumentKind.MEMORY.value,
+                    "origin": "memory-store",
+                    "reason": "memory_store_read_failed",
+                    "detail": f"{type(error).__name__}: {error}",
+                }
+            )
+            return
+        for failure in self.memory_store.last_scan_failures:
+            exclusions.append(
+                {
+                    "kind": RetrievalDocumentKind.MEMORY.value,
+                    "origin": failure.origin,
+                    "reason": "memory_entry_read_failed",
+                    "detail": failure.detail,
+                }
+            )
+        for entry in entries:
+            content = entry.current_content
+            assert content is not None
+            provenance = entry.current_provenance.to_dict()
+            returned_text = (
+                "UNVALIDATED MEMORY: this is a historical agent claim, not "
+                "validated evidence. Use it only as a hint and verify it against "
+                "current workspace observations; current observations win.\n"
+                f"Claim: {content}\n"
+                f"Provenance: task_id={entry.current_provenance.task_id}, "
+                f"run_id={entry.current_provenance.run_id}, "
+                f"revision={entry.revision}"
+            )
+            pending.append(
+                _UnembeddedDocument(
+                    document_id=f"memory:{entry.memory_id}",
+                    kind=RetrievalDocumentKind.MEMORY,
+                    origin=entry.memory_id,
+                    indexed_span="memory_current_claim",
+                    index_text=content,
+                    returned_text=returned_text,
+                    epistemic_status=(
+                        "unvalidated_claim_verify_against_current_observation"
+                    ),
+                    provenance={**provenance, "revision": entry.revision},
+                )
+            )
+
     def _append_workspace(
         self,
         pending: list[_UnembeddedDocument],
@@ -705,6 +818,7 @@ class RetrievalCorpusBuilder:
         indexed_files = 0
         indexed_characters = 0
         library_entries = self.skill_library.entries
+        memory_root = self.memory_store.root if self.memory_store is not None else None
         for directory, names, filenames in os.walk(
             self.workspace_root, topdown=True, followlinks=False
         ):
@@ -724,6 +838,12 @@ class RetrievalCorpusBuilder:
                 elif _is_within(path.resolve(), library_entries):
                     exclusions.append(
                         _workspace_exclusion(relative, "skill_library_entries")
+                    )
+                elif memory_root is not None and _is_within(
+                    path.resolve(), memory_root
+                ):
+                    exclusions.append(
+                        _workspace_exclusion(relative, "memory_store_entries")
                     )
                 else:
                     retained_directories.append(name)
@@ -810,6 +930,7 @@ class AgenticRetrievalTool:
             raise TypeError("corpus must be a RetrievalCorpus")
         self.corpus = corpus
         self._returned_characters = 0
+        self._returned_memory_characters = 0
         self._audit_records: list[AgenticRetrievalResult] = []
 
     @classmethod
@@ -820,6 +941,7 @@ class AgenticRetrievalTool:
         embed: Callable[[Sequence[str]], Iterable[Iterable[Real]]],
         *,
         config: AgenticRetrievalConfig | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> AgenticRetrievalTool:
         """Build a corpus and return the agent-callable task-scoped tool."""
 
@@ -828,6 +950,7 @@ class AgenticRetrievalTool:
             skill_library,
             embed,
             config or AgenticRetrievalConfig(),
+            memory_store,
         ).build()
         return cls(corpus)
 
@@ -838,6 +961,10 @@ class AgenticRetrievalTool:
     @property
     def returned_characters(self) -> int:
         return self._returned_characters
+
+    @property
+    def returned_memory_characters(self) -> int:
+        return self._returned_memory_characters
 
     def retrieve(self, query: object) -> AgenticRetrievalResult:
         """Rank one fresh query and represent every failure as an audited result."""
@@ -887,6 +1014,8 @@ class AgenticRetrievalTool:
         else:
             result = self._retrieve_usable(query, before)
         self._returned_characters = result.task_characters_after
+        if result.task_memory_characters_after is not None:
+            self._returned_memory_characters = result.task_memory_characters_after
         self._audit_records.append(result)
         return result
 
@@ -930,6 +1059,9 @@ class AgenticRetrievalTool:
         documents = self.corpus.documents
         if not documents:
             return self._empty(query, before)
+        memory_enabled = any(
+            document.kind is RetrievalDocumentKind.MEMORY for document in documents
+        )
         try:
             raw_vectors = self.corpus.embed((query,))
         except Exception as error:
@@ -984,8 +1116,9 @@ class AgenticRetrievalTool:
                 for item in scored
                 if item[2] or item[3].document_id in semantic_document_ids
             ),
-            key=lambda item: (-item[0], -item[1], item[3].document_id),
+            key=_retrieval_selection_sort_key,
         )
+        ranked_eligible = tuple(enumerate(eligible, start=1))
         selected: list[RetrievedContext] = []
         reasons: dict[str, str] = {
             document.document_id: "no_lexical_evidence_or_semantic_separation"
@@ -993,11 +1126,29 @@ class AgenticRetrievalTool:
             if not overlap and document.document_id not in semantic_document_ids
         }
         per_call_characters = 0
+        per_call_memory_results = 0
+        memory_result_limit = min(
+            DEFAULT_MAX_MEMORY_RESULTS_PER_CALL,
+            max(0, self.corpus.config.max_results_per_call - 1),
+        )
+        memory_character_limit = min(
+            DEFAULT_MAX_MEMORY_CHARACTERS_PER_TASK,
+            self.corpus.config.max_characters_per_task // 3,
+        )
+        memory_before = self._returned_memory_characters
+        memory_remaining = memory_character_limit - memory_before
+        per_call_memory_characters = 0
         task_remaining = self.corpus.config.max_characters_per_task - before
-        for rank, (similarity, lexical_coverage, _overlap, document) in enumerate(
-            eligible, start=1
-        ):
+        for rank, item in ranked_eligible:
+            document = item[3]
             size = len(document.returned_text)
+            is_memory = document.kind is RetrievalDocumentKind.MEMORY
+            if is_memory and per_call_memory_results >= memory_result_limit:
+                reasons[document.document_id] = "per_call_memory_result_cap"
+                continue
+            if is_memory and per_call_memory_characters + size > memory_remaining:
+                reasons[document.document_id] = "per_task_memory_character_budget"
+                continue
             if len(selected) >= self.corpus.config.max_results_per_call:
                 reasons[document.document_id] = "per_call_result_cap"
                 continue
@@ -1008,28 +1159,76 @@ class AgenticRetrievalTool:
                 reasons[document.document_id] = "per_task_character_budget"
                 continue
             selected.append(
-                RetrievedContext(
-                    document_id=document.document_id,
-                    kind=document.kind,
-                    origin=document.origin,
-                    indexed_span=document.indexed_span,
-                    similarity=similarity,
-                    lexical_coverage=lexical_coverage,
-                    lexical_evidence=bool(_overlap),
-                    semantic_evidence=(document.document_id in semantic_document_ids),
+                _retrieved_context(
+                    item,
                     rank=rank,
-                    content=document.returned_text,
-                    chunk_start=document.chunk_start,
-                    chunk_end=document.chunk_end,
+                    semantic_document_ids=semantic_document_ids,
                 )
             )
             per_call_characters += size
+            if is_memory:
+                per_call_memory_results += 1
+                per_call_memory_characters += size
+
+        # A bounded memory hint must never be the reason current workspace
+        # evidence disappears. If greedy ranking selected memory but no eligible
+        # workspace result, remove the memory and use the best workspace excerpt
+        # that fits the capacity it frees. If no workspace excerpt can fit even
+        # then, return no memory rather than presenting an unvalidated claim alone.
+        selected_memory = [
+            match for match in selected if match.kind is RetrievalDocumentKind.MEMORY
+        ]
+        has_workspace = any(
+            match.kind is RetrievalDocumentKind.WORKSPACE for match in selected
+        )
+        workspace_candidates = tuple(
+            (rank, item)
+            for rank, item in ranked_eligible
+            if item[3].kind is RetrievalDocumentKind.WORKSPACE
+        )
+        if selected_memory and not has_workspace and workspace_candidates:
+            selected = [
+                match
+                for match in selected
+                if match.kind is not RetrievalDocumentKind.MEMORY
+            ]
+            removed_memory_characters = sum(
+                len(match.content) for match in selected_memory
+            )
+            per_call_characters -= removed_memory_characters
+            per_call_memory_characters = 0
+            per_call_memory_results = 0
+            for match in selected_memory:
+                reasons[match.document_id] = "workspace_observation_priority"
+            for rank, item in workspace_candidates:
+                document = item[3]
+                size = len(document.returned_text)
+                if len(selected) >= self.corpus.config.max_results_per_call:
+                    continue
+                if (
+                    per_call_characters + size
+                    > self.corpus.config.max_characters_per_call
+                ):
+                    continue
+                if per_call_characters + size > task_remaining:
+                    continue
+                selected.append(
+                    _retrieved_context(
+                        item,
+                        rank=rank,
+                        semantic_document_ids=semantic_document_ids,
+                    )
+                )
+                per_call_characters += size
+                reasons.pop(document.document_id, None)
+                break
+            selected.sort(key=lambda match: match.rank)
 
         selected_ids = {match.document_id for match in selected}
         similarity_ranks = {
             document.document_id: rank
             for rank, (_similarity, _coverage, _overlap, document) in enumerate(
-                sorted(scored, key=lambda item: (-item[0], item[3].document_id)),
+                sorted(scored, key=_retrieval_similarity_sort_key),
                 start=1,
             )
         }
@@ -1054,11 +1253,12 @@ class AgenticRetrievalTool:
                 ),
             }
             for similarity, lexical_coverage, overlap, document in sorted(
-                scored, key=lambda item: (-item[0], item[3].document_id)
+                scored, key=_retrieval_similarity_sort_key
             )
         )
         reason_counts = Counter(reasons.values())
         after = before + per_call_characters
+        memory_after = memory_before + per_call_memory_characters
         task_budget_blocked = reason_counts["per_task_character_budget"] > 0
         task_budget_exhausted = after >= self.corpus.config.max_characters_per_task
         task_budget_hit = task_budget_blocked or task_budget_exhausted
@@ -1083,6 +1283,17 @@ class AgenticRetrievalTool:
             per_call_result_cap_hit=reason_counts["per_call_result_cap"] > 0,
             per_call_character_cap_hit=(reason_counts["per_call_character_cap"] > 0),
             per_task_character_budget_hit=task_budget_hit,
+            task_memory_characters_before=memory_before if memory_enabled else None,
+            task_memory_characters_after=memory_after if memory_enabled else None,
+            memory_result_limit=memory_result_limit if memory_enabled else None,
+            memory_character_limit=memory_character_limit if memory_enabled else None,
+            per_call_memory_result_cap_hit=(
+                reason_counts["per_call_memory_result_cap"] > 0
+            ),
+            per_task_memory_character_budget_hit=(
+                reason_counts["per_task_memory_character_budget"] > 0
+                or memory_after >= memory_character_limit
+            ),
             refusal=(
                 {
                     "reason": "task_character_budget_insufficient",
@@ -1117,6 +1328,57 @@ def _terms(text: str) -> frozenset[str]:
             match.group(0).casefold() for match in _TOKEN.finditer(normalized)
         )
         if len(token) > 1 and token not in _STOP_WORDS
+    )
+
+
+def _retrieved_context(
+    item: tuple[float, float, frozenset[str], _CorpusDocument],
+    *,
+    rank: int,
+    semantic_document_ids: frozenset[str],
+) -> RetrievedContext:
+    similarity, lexical_coverage, overlap, document = item
+    return RetrievedContext(
+        document_id=document.document_id,
+        kind=document.kind,
+        origin=document.origin,
+        indexed_span=document.indexed_span,
+        similarity=similarity,
+        lexical_coverage=lexical_coverage,
+        lexical_evidence=bool(overlap),
+        semantic_evidence=(document.document_id in semantic_document_ids),
+        rank=rank,
+        content=document.returned_text,
+        chunk_start=document.chunk_start,
+        chunk_end=document.chunk_end,
+        epistemic_status=document.epistemic_status,
+        provenance=document.provenance,
+    )
+
+
+def _retrieval_selection_sort_key(
+    item: tuple[float, float, frozenset[str], _CorpusDocument],
+) -> tuple[float, bool, float, str]:
+    similarity, lexical_coverage, _overlap, document = item
+    # A current workspace excerpt or validated skill wins an equal-similarity
+    # comparison with memory before lexical tie-breaking. This is a mechanism,
+    # not merely prompt advice, for memory's lower epistemic authority.
+    return (
+        -similarity,
+        document.kind is RetrievalDocumentKind.MEMORY,
+        -lexical_coverage,
+        document.document_id,
+    )
+
+
+def _retrieval_similarity_sort_key(
+    item: tuple[float, float, frozenset[str], _CorpusDocument],
+) -> tuple[float, bool, str]:
+    similarity, _coverage, _overlap, document = item
+    return (
+        -similarity,
+        document.kind is RetrievalDocumentKind.MEMORY,
+        document.document_id,
     )
 
 
@@ -1208,6 +1470,10 @@ def _observation_match(match: RetrievedContext, *, content: str) -> dict[str, An
             "start_character": match.chunk_start,
             "end_character": match.chunk_end,
         }
+    if match.epistemic_status is not None:
+        result["epistemic_status"] = match.epistemic_status
+    if match.provenance is not None:
+        result["provenance"] = dict(match.provenance)
     return result
 
 
