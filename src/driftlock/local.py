@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import os
@@ -113,6 +114,24 @@ class LocalEnvironment:
         try:
             await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
             return_code = process.returncode if process.returncode is not None else 1
+        except asyncio.CancelledError:
+            # Delegation and other outer deadlines may cancel this coroutine
+            # before its own command timeout. Kill the whole process group so a
+            # timed-out child cannot keep mutating the shared workspace.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            _close_process_pipes(process)
+            stdout_task.cancel()
+            stderr_task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task), timeout=_PROCESS_CLEANUP_TIMEOUT_SEC
+                )
+            except TimeoutError:
+                wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
+            raise
         except TimeoutError:
             timed_out = True
             known_return_code = process.returncode

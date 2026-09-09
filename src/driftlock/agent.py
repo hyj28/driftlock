@@ -15,6 +15,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from driftlock.agentic_retrieval import AgenticRetrievalTool
+from driftlock.delegation import (
+    DEFAULT_MAX_DELEGATION_CONTEXT_CHARACTERS,
+    DEFAULT_MAX_DELEGATION_OBJECTIVE_CHARACTERS,
+    DelegationExecutionResult,
+    DelegationRequest,
+    DelegationStatus,
+    DelegationTool,
+)
 from driftlock.lhtb import WorkspaceDelta, WorkspaceDeltaObserver
 from driftlock.memory import (
     DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS,
@@ -297,6 +305,7 @@ class _ToolObservation:
     summary: str = ""
     command_return_code: int | None = None
     audit: Mapping[str, Any] | None = None
+    tokens: int = 0
 
 
 def conversation_history_characters(
@@ -446,12 +455,22 @@ class AgentConversationCodec:
     # Disabled agents continue emitting version two byte-for-byte.
     schema_version = 2
     memory_schema_version = 3
+    delegation_schema_version = 4
     state_key = "driftlock_tool_agent"
 
     def initial_state(
-        self, *, memory_checkpoint: Mapping[str, Any] | None = None
+        self,
+        *,
+        memory_checkpoint: Mapping[str, Any] | None = None,
+        delegation_checkpoint: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.encode((), steps=0, plan=None, memory_checkpoint=memory_checkpoint)
+        return self.encode(
+            (),
+            steps=0,
+            plan=None,
+            memory_checkpoint=memory_checkpoint,
+            delegation_checkpoint=delegation_checkpoint,
+        )
 
     def encode(
         self,
@@ -460,20 +479,24 @@ class AgentConversationCodec:
         steps: int,
         plan: AgentPlan | None = None,
         memory_checkpoint: Mapping[str, Any] | None = None,
+        delegation_checkpoint: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if plan is not None and not isinstance(plan, AgentPlan):
             raise AgentStateError("tool-agent plan must be an AgentPlan or None")
         payload = {
-            "schema_version": (
-                self.memory_schema_version
-                if memory_checkpoint is not None
-                else self.schema_version
-            ),
+            "schema_version": self.schema_version,
             "messages": list(messages),
             "steps": steps,
             "plan": plan.to_dict() if plan is not None else None,
         }
-        if memory_checkpoint is not None:
+        if delegation_checkpoint is not None:
+            payload["schema_version"] = self.delegation_schema_version
+            payload["memory_checkpoint"] = (
+                dict(memory_checkpoint) if memory_checkpoint is not None else None
+            )
+            payload["delegation_checkpoint"] = dict(delegation_checkpoint)
+        elif memory_checkpoint is not None:
+            payload["schema_version"] = self.memory_schema_version
             payload["memory_checkpoint"] = dict(memory_checkpoint)
         return {self.state_key: _json_copy(payload)}
 
@@ -488,7 +511,9 @@ class AgentConversationCodec:
     ) -> tuple[list[dict[str, Any]], int, AgentPlan | None]:
         """Decode all checkpointed agent state, including the durable plan."""
 
-        messages, steps, plan, _memory_checkpoint = self.decode_with_memory(value)
+        messages, steps, plan, _memory_checkpoint, _delegation_checkpoint = (
+            self.decode_with_extensions(value)
+        )
         return messages, steps, plan
 
     def decode_with_memory(
@@ -500,6 +525,22 @@ class AgentConversationCodec:
         dict[str, Any] | None,
     ]:
         """Decode conversation state plus an optional memory-store checkpoint."""
+
+        messages, steps, plan, memory_checkpoint, _delegation_checkpoint = (
+            self.decode_with_extensions(value)
+        )
+        return messages, steps, plan, memory_checkpoint
+
+    def decode_with_extensions(
+        self, value: Mapping[str, Any]
+    ) -> tuple[
+        list[dict[str, Any]],
+        int,
+        AgentPlan | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+    ]:
+        """Decode all opt-in checkpoint extensions without changing legacy state."""
 
         payload = value.get(self.state_key)
         if not isinstance(payload, Mapping):
@@ -516,6 +557,7 @@ class AgentConversationCodec:
                 )
             raw_plan = None
             raw_memory_checkpoint = None
+            raw_delegation_checkpoint = None
         elif version == self.schema_version:
             if set(payload) != {"schema_version", "messages", "steps", "plan"}:
                 raise AgentStateError(
@@ -525,6 +567,7 @@ class AgentConversationCodec:
                 raise AgentStateError("tool-agent state is missing the plan field")
             raw_plan = payload.get("plan")
             raw_memory_checkpoint = None
+            raw_delegation_checkpoint = None
         elif version == self.memory_schema_version:
             if set(payload) != {
                 "schema_version",
@@ -540,6 +583,32 @@ class AgentConversationCodec:
             raw_memory_checkpoint = payload.get("memory_checkpoint")
             if not isinstance(raw_memory_checkpoint, Mapping):
                 raise AgentStateError("tool-agent memory checkpoint must be an object")
+            raw_delegation_checkpoint = None
+        elif version == self.delegation_schema_version:
+            if set(payload) != {
+                "schema_version",
+                "messages",
+                "steps",
+                "plan",
+                "memory_checkpoint",
+                "delegation_checkpoint",
+            }:
+                raise AgentStateError(
+                    "version-four tool-agent state fields are malformed"
+                )
+            raw_plan = payload.get("plan")
+            raw_memory_checkpoint = payload.get("memory_checkpoint")
+            if raw_memory_checkpoint is not None and not isinstance(
+                raw_memory_checkpoint, Mapping
+            ):
+                raise AgentStateError(
+                    "tool-agent memory checkpoint must be an object or null"
+                )
+            raw_delegation_checkpoint = payload.get("delegation_checkpoint")
+            if not isinstance(raw_delegation_checkpoint, Mapping):
+                raise AgentStateError(
+                    "tool-agent delegation checkpoint must be an object"
+                )
         else:
             raise AgentStateError("unsupported tool-agent state schema version")
         messages = payload.get("messages")
@@ -589,7 +658,23 @@ class AgentConversationCodec:
             raise AgentStateError(
                 "tool-agent memory checkpoint must be JSON-compatible"
             ) from error
-        return copied, steps, plan, copied_memory_checkpoint
+        try:
+            copied_delegation_checkpoint = (
+                _json_copy(raw_delegation_checkpoint)
+                if raw_delegation_checkpoint is not None
+                else None
+            )
+        except (RecursionError, TypeError, ValueError) as error:
+            raise AgentStateError(
+                "tool-agent delegation checkpoint must be JSON-compatible"
+            ) from error
+        return (
+            copied,
+            steps,
+            plan,
+            copied_memory_checkpoint,
+            copied_delegation_checkpoint,
+        )
 
 
 class ToolCallingAgent:
@@ -600,8 +685,9 @@ class ToolCallingAgent:
     ``max_tool_calls_per_step`` are recorded but none of their calls execute.
     With ``planning=True``, :class:`StepContext`'s caller plan remains read-only
     guidance while ``manage_plan`` maintains separate checkpointed progress state.
-    A configured memory store adds ``manage_memory`` without changing the legacy
-    provider request when memory is absent.
+    Configured memory and delegation policies add ``manage_memory`` and
+    ``delegate_task`` respectively without changing the legacy provider request
+    when both are absent.
     """
 
     def __init__(
@@ -623,6 +709,7 @@ class ToolCallingAgent:
         memory_store: MemoryStore | None = None,
         memory_task_id: str | None = None,
         memory_run_id: str | None = None,
+        delegation_tool: DelegationTool | None = None,
         planning: bool = False,
     ) -> None:
         if max_output_tokens <= 0:
@@ -653,6 +740,14 @@ class ToolCallingAgent:
             raise ValueError("shell_timeout_sec must be positive")
         if not isinstance(planning, bool):
             raise TypeError("planning must be a boolean")
+        if delegation_tool is not None and not isinstance(
+            delegation_tool, DelegationTool
+        ):
+            raise TypeError("delegation_tool must be a DelegationTool or None")
+        if delegation_tool is not None and max_tool_output_chars < 768:
+            raise ValueError(
+                "delegation requires max_tool_output_chars to be at least 768"
+            )
         if memory_store is not None and not isinstance(memory_store, MemoryStore):
             raise TypeError("memory_store must be a MemoryStore or None")
         if memory_store is None:
@@ -683,6 +778,7 @@ class ToolCallingAgent:
         self.memory_store = memory_store
         self.memory_task_id = memory_task_id
         self.memory_run_id = memory_run_id
+        self.delegation_tool = delegation_tool
         self.planning = planning
 
     def initial_state(self) -> dict[str, Any]:
@@ -691,17 +787,42 @@ class ToolCallingAgent:
                 self.memory_store.checkpoint_state()
                 if self.memory_store is not None
                 else None
-            )
+            ),
+            delegation_checkpoint=(
+                self.delegation_tool.checkpoint_state()
+                if self.delegation_tool is not None
+                else None
+            ),
         )
 
     def restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
-        """Restore memory alongside runner-managed workspace/checkpoint state."""
-
+        """Restore opt-in state alongside runner-managed workspace state."""
+        (
+            _messages,
+            _steps,
+            _plan,
+            memory_checkpoint,
+            delegation_checkpoint,
+        ) = self.codec.decode_with_extensions(state)
+        if self.delegation_tool is not None:
+            if delegation_checkpoint is None:
+                raise AgentStateError(
+                    "delegation-enabled agent checkpoint is missing delegation state"
+                )
+            self.delegation_tool.validate_checkpoint_state(delegation_checkpoint)
+        elif delegation_checkpoint is not None:
+            raise AgentStateError(
+                "checkpoint state contains delegation but delegation is not enabled"
+            )
         if self.memory_store is None:
+            if memory_checkpoint is not None:
+                raise AgentStateError(
+                    "checkpoint state contains memory but memory is not enabled"
+                )
+            if self.delegation_tool is not None:
+                assert delegation_checkpoint is not None
+                self.delegation_tool.restore_checkpoint_state(delegation_checkpoint)
             return
-        _messages, _steps, _plan, memory_checkpoint = self.codec.decode_with_memory(
-            state
-        )
         if memory_checkpoint is None:
             raise AgentStateError(
                 "memory-enabled agent checkpoint is missing memory state"
@@ -713,6 +834,9 @@ class ToolCallingAgent:
             task_id=self.memory_task_id,
             run_id=self.memory_run_id,
         )
+        if self.delegation_tool is not None:
+            assert delegation_checkpoint is not None
+            self.delegation_tool.restore_checkpoint_state(delegation_checkpoint)
 
     def _encode_state(
         self,
@@ -730,21 +854,38 @@ class ToolCallingAgent:
                 if self.memory_store is not None
                 else None
             ),
+            delegation_checkpoint=(
+                self.delegation_tool.checkpoint_state()
+                if self.delegation_tool is not None
+                else None
+            ),
         )
 
     async def __call__(self, context: StepContext) -> StepOutcome:
-        history, completed_steps, plan, memory_checkpoint = (
-            self.codec.decode_with_memory(context.state)
-        )
+        (
+            history,
+            completed_steps,
+            plan,
+            memory_checkpoint,
+            delegation_checkpoint,
+        ) = self.codec.decode_with_extensions(context.state)
+        if self.delegation_tool is None and delegation_checkpoint is not None:
+            raise AgentStateError(
+                "checkpoint state contains delegation but delegation is not enabled"
+            )
+        if self.delegation_tool is not None and delegation_checkpoint is None:
+            raise AgentStateError(
+                "delegation-enabled agent checkpoint is missing delegation state"
+            )
         if self.memory_store is None and memory_checkpoint is not None:
             raise AgentStateError(
                 "checkpoint state contains memory but memory is not enabled"
             )
-        if self.memory_store is not None:
-            if memory_checkpoint is None:
-                raise AgentStateError(
-                    "memory-enabled agent checkpoint is missing memory state"
-                )
+        if self.memory_store is not None and memory_checkpoint is None:
+            raise AgentStateError(
+                "memory-enabled agent checkpoint is missing memory state"
+            )
+        if self.memory_store is not None or self.delegation_tool is not None:
             self.restore_checkpoint_state(context.state)
         if not self.planning and plan is not None:
             raise AgentStateError(
@@ -832,6 +973,7 @@ class ToolCallingAgent:
             completion,
             planning=self.planning,
             memory=self.memory_store is not None,
+            delegation=self.delegation_tool is not None,
         )
 
         if completion.truncated:
@@ -852,12 +994,23 @@ class ToolCallingAgent:
             history.append({"role": "user", "content": f"ERROR: {error}"})
         else:
             for call in completion.tool_calls:
+                delegation_tokens_remaining = (
+                    None
+                    if context.tokens_remaining is None
+                    else max(
+                        0,
+                        context.tokens_remaining
+                        - completion.tokens
+                        - sum(item.tokens for item in observations),
+                    )
+                )
                 observation, plan = await self._execute_tool(
                     call,
                     workspace,
                     plan=plan,
                     context=context,
                     completed_steps=completed_steps,
+                    delegation_tokens_remaining=delegation_tokens_remaining,
                 )
                 observations.append(observation)
                 history.append(_observation_message(observation))
@@ -899,7 +1052,8 @@ class ToolCallingAgent:
             ),
             context_compactions=compaction_audits,
             error="; ".join(errors) or None,
-            tokens=completion.tokens,
+            tokens=completion.tokens
+            + sum(observation.tokens for observation in observations),
             completed=completed,
             summary=summary,
         )
@@ -959,6 +1113,12 @@ class ToolCallingAgent:
                 "observations, and let current observations win. Correct or revoke "
                 "a memory when current evidence disproves it."
             )
+        if self.delegation_tool is not None:
+            system_prompt = (
+                f"{system_prompt}\nUse delegate_task only for a focused independent "
+                "subtask. The child starts with fresh conversation state, runs "
+                "sequentially, and cannot delegate again."
+            )
         messages: list[Mapping[str, Any]] = [
             {
                 "role": "system",
@@ -994,6 +1154,7 @@ class ToolCallingAgent:
             self.retrieval_tool is None
             and not self.planning
             and self.memory_store is None
+            and self.delegation_tool is None
         ):
             return _TOOL_DEFINITIONS
         definitions = _TOOL_DEFINITIONS
@@ -1003,6 +1164,8 @@ class ToolCallingAgent:
             definitions = (*definitions, _PLAN_TOOL_DEFINITION)
         if self.memory_store is not None:
             definitions = (*definitions, _MEMORY_TOOL_DEFINITION)
+        if self.delegation_tool is not None:
+            definitions = (*definitions, _DELEGATION_TOOL_DEFINITION)
         return definitions
 
     async def _snapshot_workspace(self) -> tuple[Any | None, str | None]:
@@ -1030,6 +1193,7 @@ class ToolCallingAgent:
         plan: AgentPlan | None,
         context: StepContext,
         completed_steps: int,
+        delegation_tokens_remaining: int | None,
     ) -> tuple[_ToolObservation, AgentPlan | None]:
         if call.name == "retrieve_context":
             try:
@@ -1039,6 +1203,8 @@ class ToolCallingAgent:
         if call.name == "manage_plan" and not self.planning:
             return _tool_error(call, f"unknown tool {call.name!r}"), plan
         if call.name == "manage_memory" and self.memory_store is None:
+            return _tool_error(call, f"unknown tool {call.name!r}"), plan
+        if call.name == "delegate_task" and self.delegation_tool is None:
             return _tool_error(call, f"unknown tool {call.name!r}"), plan
         try:
             arguments = _decode_arguments(call.arguments)
@@ -1052,6 +1218,16 @@ class ToolCallingAgent:
                 )
             if call.name == "manage_memory":
                 return self._manage_memory(call, arguments, context=context), plan
+            if call.name == "delegate_task":
+                return (
+                    await self._delegate_task(
+                        call,
+                        arguments,
+                        context=context,
+                        parent_tokens_remaining=delegation_tokens_remaining,
+                    ),
+                    plan,
+                )
             if call.name == "run_shell":
                 return await self._run_shell(call, arguments, workspace), plan
             if call.name == "read_file":
@@ -1105,6 +1281,10 @@ class ToolCallingAgent:
                     f"malformed arguments for {call.name}: {error}",
                     context=context,
                 )
+            elif call.name == "delegate_task":
+                observation = self._record_delegation_rejection(
+                    call, f"malformed arguments for {call.name}: {error}"
+                )
             return observation, plan
         except Exception as error:
             observation = _tool_error(call, f"{call.name} failed: {error}")
@@ -1122,7 +1302,64 @@ class ToolCallingAgent:
                     f"{call.name} failed: {error}",
                     context=context,
                 )
+            elif call.name == "delegate_task":
+                observation = self._record_delegation_rejection(
+                    call, f"{call.name} failed: {error}"
+                )
             return observation, plan
+
+    async def _delegate_task(
+        self,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        *,
+        context: StepContext,
+        parent_tokens_remaining: int | None,
+    ) -> _ToolObservation:
+        if self.delegation_tool is None:
+            raise ValueError("delegate_task is not configured for this task")
+        _require_keys(arguments, required={"objective"}, optional={"context"})
+        outcome = await self.delegation_tool.delegate(
+            arguments["objective"],
+            arguments.get("context", ""),
+            parent_goal=context.goal,
+            sequence=context.sequence,
+            logical_step=context.logical_step,
+            attempt=context.attempt,
+            parent_tokens_remaining=parent_tokens_remaining,
+            max_observation_characters=self.max_tool_output_chars,
+        )
+        error = (
+            None
+            if outcome.status is DelegationStatus.COMPLETED
+            else outcome.error or f"delegation ended with status {outcome.status.value}"
+        )
+        return _ToolObservation(
+            call,
+            outcome.to_observation(max_characters=self.max_tool_output_chars),
+            error=error,
+            audit=_delegation_tool_audit(call, outcome.to_report()),
+            tokens=outcome.tokens_contributed,
+        )
+
+    def _record_delegation_rejection(
+        self, call: ToolCall, error: str
+    ) -> _ToolObservation:
+        if self.delegation_tool is None:
+            return _tool_error(call, error)
+        objective = (
+            call.arguments.get("objective")
+            if isinstance(call.arguments, Mapping)
+            else call.arguments
+        )
+        outcome = self.delegation_tool.record_rejected_attempt(objective, error)
+        recorded_error = outcome.error or "delegation request was rejected"
+        return _ToolObservation(
+            call,
+            outcome.to_observation(max_characters=self.max_tool_output_chars),
+            error=recorded_error,
+            audit=_delegation_tool_audit(call, outcome.to_report()),
+        )
 
     async def _run_shell(
         self,
@@ -1523,6 +1760,116 @@ class ToolCallingAgent:
         return resolved
 
 
+class ToolCallingSubagentExecutor:
+    """Run a delegated objective in a fresh, non-recursive tool-agent session."""
+
+    def __init__(
+        self,
+        environment: RemoteEnvironment,
+        observer: WorkspaceDeltaObserver,
+        complete: AgentCompletionCallable,
+        *,
+        max_output_tokens: int = 4096,
+        min_output_tokens: int = 64,
+        prefill_estimator: AgentPrefillEstimator = conservative_prefill_estimate,
+        max_tool_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+        max_tool_calls_per_step: int = DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+        max_history_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
+        shell_timeout_sec: int = 60,
+        user: str | int | None = None,
+    ) -> None:
+        # Constructing once validates the shared child configuration. Actual
+        # executions create a new agent below so no conversation or mutable
+        # capability state can leak across delegated calls.
+        self.environment = environment
+        self.observer = observer
+        self.complete = complete
+        self.options = {
+            "max_output_tokens": max_output_tokens,
+            "min_output_tokens": min_output_tokens,
+            "prefill_estimator": prefill_estimator,
+            "max_tool_output_chars": max_tool_output_chars,
+            "max_tool_calls_per_step": max_tool_calls_per_step,
+            "max_history_characters": max_history_characters,
+            "shell_timeout_sec": shell_timeout_sec,
+            "user": user,
+        }
+        ToolCallingAgent(environment, observer, complete, **self.options)
+
+    async def __call__(self, request: DelegationRequest) -> DelegationExecutionResult:
+        if not isinstance(request, DelegationRequest):
+            raise TypeError("request must be a DelegationRequest")
+        child = ToolCallingAgent(
+            self.environment,
+            self.observer,
+            self.complete,
+            **self.options,
+        )
+        state = child.initial_state()
+        tokens = 0
+        last_summary = ""
+        goal = (
+            f"Parent goal:\n{request.parent_goal}\n\n"
+            f"Delegated objective:\n{request.objective}"
+        )
+        plan = request.context or "No additional delegation context was supplied."
+        for step in range(1, request.max_steps + 1):
+            try:
+                outcome = await child(
+                    StepContext(
+                        goal=goal,
+                        plan=plan,
+                        state=state,
+                        sequence=step,
+                        logical_step=step,
+                        attempt=1,
+                        rollback_feedback=None,
+                        tokens_remaining=request.max_tokens - tokens,
+                    )
+                )
+            except StepTokenBudgetExhausted:
+                return DelegationExecutionResult(
+                    DelegationStatus.TOKEN_LIMIT,
+                    last_summary,
+                    tokens,
+                    step - 1,
+                    "delegated child exhausted its token budget before a provider call",
+                )
+            state = outcome.state
+            tokens += outcome.tokens
+            last_summary = outcome.summary
+            if tokens > request.max_tokens:
+                return DelegationExecutionResult(
+                    DelegationStatus.TOKEN_LIMIT,
+                    last_summary,
+                    tokens,
+                    step,
+                    "delegated child exceeded its token budget",
+                )
+            if outcome.action == "Provider call failed":
+                return DelegationExecutionResult(
+                    DelegationStatus.FAILED,
+                    last_summary,
+                    tokens,
+                    step,
+                    outcome.error or "delegated child provider call failed",
+                )
+            if outcome.completed:
+                return DelegationExecutionResult(
+                    DelegationStatus.COMPLETED,
+                    outcome.summary,
+                    tokens,
+                    step,
+                )
+        return DelegationExecutionResult(
+            DelegationStatus.STEP_LIMIT,
+            last_summary,
+            tokens,
+            request.max_steps,
+            "delegated child reached its step limit",
+        )
+
+
 _SYSTEM_PROMPT = """You are driftlock, a terminal tool-calling agent. Take one useful
 step toward the goal on each response. You may emit several independent tool calls
 in a response. Use complete only when the goal is actually satisfied. A prose-only
@@ -1658,6 +2005,32 @@ _MEMORY_TOOL_DEFINITION = ToolDefinition(
             },
         },
         ["operation"],
+    ),
+)
+
+# Delegation is opt-in and deliberately takes only text. The parent selects the
+# execution bounds from local configuration instead of trusting model arguments.
+_DELEGATION_TOOL_DEFINITION = ToolDefinition(
+    "delegate_task",
+    (
+        "Run one focused independent subtask in a fresh sequential child-agent "
+        "session. The child shares the workspace and ordinary terminal tools, "
+        "but has no delegate_task capability. Execution, token, timeout, input, "
+        "and returned-result limits are enforced locally."
+    ),
+    _object_schema(
+        {
+            "objective": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": DEFAULT_MAX_DELEGATION_OBJECTIVE_CHARACTERS,
+            },
+            "context": {
+                "type": "string",
+                "maxLength": DEFAULT_MAX_DELEGATION_CONTEXT_CHARACTERS,
+            },
+        },
+        ["objective"],
     ),
 )
 
@@ -2159,7 +2532,11 @@ def _tool_error(call: ToolCall, message: str) -> _ToolObservation:
 
 
 def _describe_action(
-    completion: AgentCompletion, *, planning: bool, memory: bool
+    completion: AgentCompletion,
+    *,
+    planning: bool,
+    memory: bool,
+    delegation: bool,
 ) -> str:
     if completion.truncated:
         return "Handle a truncated provider response"
@@ -2190,6 +2567,8 @@ def _describe_action(
         }:
             return f"Manage memory: {operation}"
         return "Manage memory with malformed operation"
+    if call.name == "delegate_task" and delegation:
+        return _shorten(f"Delegate task: {arguments.get('objective', '')}", 160)
     if call.name == "complete":
         return "Signal task completion"
     return _shorten(f"Attempt unknown tool: {call.name}", 160)
@@ -2313,6 +2692,45 @@ def _memory_tool_audit(call: ToolCall, result: Mapping[str, Any]) -> dict[str, A
         },
         "result": dict(result),
     }
+
+
+def _delegation_tool_audit(call: ToolCall, result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "tool_call": {
+            "id": call.call_id,
+            "name": call.name,
+            # Delegated instructions may contain large or sensitive workspace
+            # context. The durable outcome already carries the objective digest.
+            "arguments": _delegation_audit_arguments(call.arguments),
+        },
+        "result": dict(result),
+    }
+
+
+def _delegation_audit_arguments(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        rendered = repr(value)
+        return {
+            "argument_type": type(value).__name__,
+            "sha256": hashlib.sha256(
+                rendered.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            "character_count": len(rendered),
+        }
+    result: dict[str, Any] = {}
+    for name in ("objective", "context"):
+        item = value.get(name)
+        if not isinstance(item, str):
+            result[name] = {"type": type(item).__name__}
+            continue
+        result[name] = {
+            "sha256": hashlib.sha256(
+                item.encode("utf-8", errors="surrogatepass")
+            ).hexdigest(),
+            "character_count": len(item),
+        }
+    return result
 
 
 def _memory_audit_arguments(value: object) -> dict[str, Any]:

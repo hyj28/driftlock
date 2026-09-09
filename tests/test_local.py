@@ -37,6 +37,26 @@ async def test_local_environment_times_out_endless_output(tmp_path: Path) -> Non
     assert "command timed out after 1 seconds" in result.stderr
 
 
+async def test_outer_cancellation_kills_command_before_late_workspace_write(
+    tmp_path: Path,
+) -> None:
+    environment = LocalEnvironment(tmp_path)
+    script = """\
+import pathlib
+import time
+
+time.sleep(0.3)
+pathlib.Path("late.txt").write_text("escaped timeout", encoding="utf-8")
+"""
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await environment.exec(f"python3 -c {shlex.quote(script)}")
+    await asyncio.sleep(0.4)
+
+    assert not (tmp_path / "late.txt").exists()
+
+
 async def test_local_environment_preserves_exit_of_pipe_holding_child(
     tmp_path: Path,
 ) -> None:
