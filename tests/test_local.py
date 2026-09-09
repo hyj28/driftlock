@@ -42,17 +42,30 @@ async def test_outer_cancellation_kills_command_before_late_workspace_write(
 ) -> None:
     environment = LocalEnvironment(tmp_path)
     script = """\
+import os
 import pathlib
 import time
 
-time.sleep(0.3)
-pathlib.Path("late.txt").write_text("escaped timeout", encoding="utf-8")
+child = os.fork()
+if child == 0:
+    os.setsid()
+    pathlib.Path("detached.pid").write_text(str(os.getpid()), encoding="utf-8")
+    time.sleep(0.3)
+    pathlib.Path("late.txt").write_text("escaped timeout", encoding="utf-8")
+else:
+    time.sleep(30)
 """
+    pid_path = tmp_path / "detached.pid"
 
-    with pytest.raises(TimeoutError):
-        async with asyncio.timeout(0.05):
-            await environment.exec(f"python3 -c {shlex.quote(script)}")
-    await asyncio.sleep(0.4)
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await environment.exec(f"python3 -c {shlex.quote(script)}")
+        await asyncio.sleep(0.4)
+    finally:
+        if pid_path.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
 
     assert not (tmp_path / "late.txt").exists()
 

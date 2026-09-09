@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -22,6 +23,7 @@ DEFAULT_MAX_DELEGATION_TOKENS_PER_CALL = 32_000
 DEFAULT_MAX_DELEGATION_TOKENS_PER_TASK = 64_000
 DEFAULT_DELEGATION_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_DELEGATION_ERROR_CHARACTERS = 1_000
+MAX_DELEGATION_ACCOUNTED_TOKENS = 1_000_000_000_000
 
 # A checkpoint contains at most one compact record per admitted call. Keeping a
 # separate bound on its serialized representation also rejects hostile nested
@@ -71,6 +73,10 @@ class DelegationConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.max_tokens_per_call > self.max_tokens_per_task:
             raise ValueError("max_tokens_per_call cannot exceed max_tokens_per_task")
+        if self.max_tokens_per_task > MAX_DELEGATION_ACCOUNTED_TOKENS:
+            raise ValueError(
+                "max_tokens_per_task exceeds the supported accounting limit"
+            )
         timeout = self.timeout_seconds
         if (
             not isinstance(timeout, (int, float))
@@ -140,6 +146,8 @@ class DelegationExecutionResult:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"delegation {name} must be a non-negative integer")
+        if self.tokens > MAX_DELEGATION_ACCOUNTED_TOKENS:
+            raise ValueError("delegation tokens exceed the supported accounting limit")
         if self.error is not None and not isinstance(self.error, str):
             raise TypeError("delegation error must be text or None")
         if self.status is DelegationStatus.COMPLETED and self.error is not None:
@@ -259,6 +267,7 @@ class DelegationTool:
         self._calls_used = 0
         self._tokens_used = 0
         self._records: list[dict[str, Any]] = []
+        self._cancelled_tasks: set[asyncio.Task[DelegationExecutionResult]] = set()
 
     @property
     def calls_used(self) -> int:
@@ -383,10 +392,18 @@ class DelegationTool:
             max_steps=self.config.max_steps_per_call,
             max_tokens=min(self.config.max_tokens_per_call, remaining),
         )
+        execution_task = asyncio.create_task(self.executor(request))
         try:
-            async with asyncio.timeout(self.config.timeout_seconds):
-                execution = await self.executor(request)
-        except TimeoutError:
+            done, _pending = await asyncio.wait(
+                {execution_task}, timeout=self.config.timeout_seconds
+            )
+        except BaseException:
+            execution_task.cancel()
+            self._retain_cancelled_task(execution_task)
+            raise
+        if not done:
+            execution_task.cancel()
+            self._retain_cancelled_task(execution_task)
             outcome = self._outcome(
                 DelegationStatus.TIMED_OUT,
                 normalized_objective,
@@ -399,75 +416,96 @@ class DelegationTool:
                 executor_invoked=True,
                 token_accounting_known=False,
             )
-        except Exception as exception:
-            outcome = self._outcome(
-                DelegationStatus.FAILED,
-                normalized_objective,
-                before_calls,
-                before_tokens,
-                error=(
-                    "delegation executor raised "
-                    f"{type(exception).__name__}: {exception}"
-                ),
-                executor_invoked=True,
-                token_accounting_known=False,
-            )
         else:
-            if not isinstance(execution, DelegationExecutionResult):
+            try:
+                execution = execution_task.result()
+            except asyncio.CancelledError:
                 outcome = self._outcome(
                     DelegationStatus.FAILED,
                     normalized_objective,
                     before_calls,
                     before_tokens,
-                    error="delegation executor returned an invalid result",
+                    error="delegation executor cancelled itself",
+                    executor_invoked=True,
+                    token_accounting_known=False,
+                )
+            except Exception as exception:
+                outcome = self._outcome(
+                    DelegationStatus.FAILED,
+                    normalized_objective,
+                    before_calls,
+                    before_tokens,
+                    error=(
+                        "delegation executor raised "
+                        f"{type(exception).__name__}: {_safe_str(exception)}"
+                    ),
                     executor_invoked=True,
                     token_accounting_known=False,
                 )
             else:
-                contract_error = _execution_contract_error(execution, request)
-                if contract_error is not None:
+                if not isinstance(execution, DelegationExecutionResult):
                     outcome = self._outcome(
                         DelegationStatus.FAILED,
                         normalized_objective,
                         before_calls,
                         before_tokens,
-                        error=contract_error,
+                        error="delegation executor returned an invalid result",
                         executor_invoked=True,
                         token_accounting_known=False,
                     )
                 else:
+                    contract_error = _execution_contract_error(execution, request)
                     self._tokens_used += execution.tokens
-                    output_sha256 = _sha256(execution.output)
-                    if len(execution.output) > self.config.max_result_characters:
+                    if contract_error is not None:
                         outcome = self._outcome(
-                            DelegationStatus.RESULT_TOO_LARGE,
+                            DelegationStatus.FAILED,
                             normalized_objective,
                             before_calls,
                             before_tokens,
                             tokens=execution.tokens,
-                            steps=execution.steps,
-                            output_character_count=len(execution.output),
-                            output_sha256=output_sha256,
-                            error=(
-                                "delegation output exceeds the "
-                                f"{self.config.max_result_characters}-character limit"
-                            ),
+                            error=contract_error,
                             executor_invoked=True,
                         )
                     else:
-                        outcome = self._outcome(
-                            execution.status,
-                            normalized_objective,
-                            before_calls,
-                            before_tokens,
-                            tokens=execution.tokens,
-                            steps=execution.steps,
-                            output=execution.output,
-                            output_character_count=len(execution.output),
-                            output_sha256=output_sha256,
-                            error=execution.error,
-                            executor_invoked=True,
-                        )
+                        effective_status = execution.status
+                        effective_error = execution.error
+                        if execution.tokens > request.max_tokens:
+                            effective_status = DelegationStatus.TOKEN_LIMIT
+                            effective_error = (
+                                "delegated child exceeded its assigned token budget"
+                            )
+                        output_sha256 = _sha256(execution.output)
+                        if len(execution.output) > self.config.max_result_characters:
+                            outcome = self._outcome(
+                                DelegationStatus.RESULT_TOO_LARGE,
+                                normalized_objective,
+                                before_calls,
+                                before_tokens,
+                                tokens=execution.tokens,
+                                steps=execution.steps,
+                                output_character_count=len(execution.output),
+                                output_sha256=output_sha256,
+                                error=(
+                                    "delegation output exceeds the "
+                                    f"{self.config.max_result_characters}-character "
+                                    "limit"
+                                ),
+                                executor_invoked=True,
+                            )
+                        else:
+                            outcome = self._outcome(
+                                effective_status,
+                                normalized_objective,
+                                before_calls,
+                                before_tokens,
+                                tokens=execution.tokens,
+                                steps=execution.steps,
+                                output=execution.output,
+                                output_character_count=len(execution.output),
+                                output_sha256=output_sha256,
+                                error=effective_error,
+                                executor_invoked=True,
+                            )
         if (
             outcome.output is not None
             and len(outcome.to_observation()) > max_observation_characters
@@ -511,6 +549,18 @@ class DelegationTool:
     def _record(self, outcome: DelegationOutcome) -> DelegationOutcome:
         self._records.append(_record_from_outcome(outcome))
         return outcome
+
+    def _retain_cancelled_task(
+        self, task: asyncio.Task[DelegationExecutionResult]
+    ) -> None:
+        self._cancelled_tasks.add(task)
+
+        def discard(completed: asyncio.Task[DelegationExecutionResult]) -> None:
+            self._cancelled_tasks.discard(completed)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                completed.exception()
+
+        task.add_done_callback(discard)
 
     def _outcome(
         self,
@@ -602,8 +652,6 @@ def _validate_invocation_metadata(
 def _execution_contract_error(
     execution: DelegationExecutionResult, request: DelegationRequest
 ) -> str | None:
-    if execution.tokens > request.max_tokens:
-        return "delegation executor reported tokens above its assigned limit"
     if execution.steps > request.max_steps:
         return "delegation executor reported steps above its assigned limit"
     return None
@@ -638,9 +686,18 @@ def _safe_repr(value: object) -> str:
         return f"<{type(value).__name__} with unavailable representation>"
 
 
+def _safe_str(value: object) -> str:
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__} with unavailable text>"
+
+
 def _record_from_outcome(outcome: DelegationOutcome) -> dict[str, Any]:
     report = outcome.to_report()
-    report.pop("output", None)
+    output = report["output"]
+    assert isinstance(output, dict)
+    output.pop("content", None)
     return report
 
 
@@ -668,7 +725,7 @@ def _decode_state(
     if (
         not isinstance(tokens, int)
         or isinstance(tokens, bool)
-        or not 0 <= tokens <= config.max_tokens_per_task
+        or not 0 <= tokens <= MAX_DELEGATION_ACCOUNTED_TOKENS
     ):
         raise ValueError("delegation checkpoint token count is invalid")
     if not isinstance(records, list) or len(records) != calls:
@@ -712,6 +769,7 @@ def _validate_checkpoint_record(
         "tokens",
         "steps",
         "executor_invoked",
+        "output",
     }
     if set(record) not in (required, required | {"error"}):
         raise ValueError("delegation checkpoint record fields are malformed")
@@ -757,7 +815,7 @@ def _validate_checkpoint_record(
         or not _is_nonnegative_int(contributed)
         or not _is_nonnegative_int(after)
         or after != before + contributed
-        or after > config.max_tokens_per_task
+        or after > MAX_DELEGATION_ACCOUNTED_TOKENS
         or not isinstance(token_report.get("accounting_known"), bool)
     ):
         raise ValueError("delegation checkpoint token report is invalid")
@@ -766,6 +824,22 @@ def _validate_checkpoint_record(
         raise ValueError("delegation checkpoint step count is invalid")
     if not isinstance(record.get("executor_invoked"), bool):
         raise ValueError("delegation checkpoint executor flag is invalid")
+    output = record.get("output")
+    if not isinstance(output, Mapping) or set(output) != {
+        "character_count",
+        "sha256",
+        "included",
+    }:
+        raise ValueError("delegation checkpoint output evidence is malformed")
+    output_characters = output.get("character_count")
+    output_sha256 = output.get("sha256")
+    output_included = output.get("included")
+    if (
+        not _is_nonnegative_int(output_characters)
+        or not isinstance(output_included, bool)
+        or (output_sha256 is not None and not _is_sha256(output_sha256))
+    ):
+        raise ValueError("delegation checkpoint output evidence is invalid")
     error = record.get("error")
     if error is not None and (
         not isinstance(error, str)
@@ -779,6 +853,37 @@ def _validate_checkpoint_record(
         raise ValueError("incomplete delegation checkpoint record lacks an error")
     if not token_report["accounting_known"] and contributed != 0:
         raise ValueError("unknown delegation token accounting cannot contribute tokens")
+    if status is DelegationStatus.REJECTED:
+        if (
+            record["executor_invoked"]
+            or contributed
+            or steps
+            or output_sha256 is not None
+        ):
+            raise ValueError("rejected delegation checkpoint record is inconsistent")
+    elif not record["executor_invoked"]:
+        raise ValueError("executed delegation checkpoint record lacks invocation")
+    if status is DelegationStatus.COMPLETED and (
+        not token_report["accounting_known"]
+        or not output_included
+        or output_sha256 is None
+    ):
+        raise ValueError("completed delegation checkpoint record is inconsistent")
+    if status is DelegationStatus.TIMED_OUT and (
+        token_report["accounting_known"]
+        or contributed
+        or steps
+        or output_sha256 is not None
+    ):
+        raise ValueError("timed-out delegation checkpoint record is inconsistent")
+    if status is DelegationStatus.RESULT_TOO_LARGE and (
+        output_included or output_sha256 is None
+    ):
+        raise ValueError("oversized delegation checkpoint record is inconsistent")
+    if status is not DelegationStatus.REJECTED and (
+        objective["character_count"] > config.max_objective_characters
+    ):
+        raise ValueError("executed delegation objective exceeds the configured limit")
 
 
 def _is_nonnegative_int(value: object) -> bool:

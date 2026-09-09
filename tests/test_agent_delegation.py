@@ -27,6 +27,7 @@ from driftlock.delegation import (
 )
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
+from driftlock.memory import MemoryStore
 from driftlock.models import RunStatus, StepContext
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
@@ -202,20 +203,20 @@ async def test_delegation_enforces_cumulative_child_token_quota() -> None:
 
 
 @pytest.mark.parametrize(
-    ("result", "status", "known"),
+    ("result", "status", "known", "contributed"),
     [
         (
             RuntimeError("provider secret " + "x" * 2_000),
             DelegationStatus.FAILED,
             False,
+            0,
         ),
-        (object(), DelegationStatus.FAILED, False),
-        (_result(tokens=32_001), DelegationStatus.FAILED, False),
-        (_result(steps=9), DelegationStatus.FAILED, False),
+        (object(), DelegationStatus.FAILED, False, 0),
+        (_result(steps=9), DelegationStatus.FAILED, True, 7),
     ],
 )
 async def test_delegation_contains_executor_failures(
-    result: object, status: DelegationStatus, known: bool
+    result: object, status: DelegationStatus, known: bool, contributed: int
 ) -> None:
     executor = RecordingExecutor(result)  # type: ignore[arg-type]
     tool = DelegationTool(executor)
@@ -224,8 +225,66 @@ async def test_delegation_contains_executor_failures(
 
     assert outcome.status is status
     assert outcome.token_accounting_known is known
-    assert outcome.tokens_contributed == 0
+    assert outcome.tokens_contributed == contributed
     assert len(outcome.error or "") <= 1_000
+
+
+async def test_known_token_overshoot_is_counted_and_checkpointed() -> None:
+    executor = RecordingExecutor(_result(tokens=10))
+    tool = DelegationTool(
+        executor,
+        config=DelegationConfig(
+            max_tokens_per_call=5,
+            max_tokens_per_task=5,
+        ),
+    )
+
+    outcome = await _delegate(tool)
+
+    assert outcome.status is DelegationStatus.TOKEN_LIMIT
+    assert outcome.token_accounting_known
+    assert outcome.tokens_contributed == 10
+    assert tool.tokens_used == 10
+    restored = DelegationTool(RecordingExecutor(_result()), config=tool.config)
+    restored.restore_checkpoint_state(tool.checkpoint_state())
+    assert restored.tokens_used == 10
+
+
+async def test_timeout_cannot_be_suppressed_by_executor_cancellation() -> None:
+    returned = asyncio.Event()
+
+    async def suppress_cancel(_: DelegationRequest) -> DelegationExecutionResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)
+            returned.set()
+            return _result()
+
+    tool = DelegationTool(
+        suppress_cancel,
+        config=DelegationConfig(timeout_seconds=0.001),
+    )
+
+    outcome = await asyncio.wait_for(_delegate(tool), timeout=0.03)
+
+    assert outcome.status is DelegationStatus.TIMED_OUT
+    assert not returned.is_set()
+    await asyncio.wait_for(returned.wait(), timeout=0.2)
+
+
+async def test_executor_exception_with_broken_string_is_contained() -> None:
+    class BrokenError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("string rendering failed")
+
+    executor = RecordingExecutor(BrokenError())
+    tool = DelegationTool(executor)
+
+    outcome = await _delegate(tool)
+
+    assert outcome.status is DelegationStatus.FAILED
+    assert "unavailable text" in (outcome.error or "")
 
 
 async def test_delegation_timeout_is_contained_and_audited() -> None:
@@ -284,6 +343,11 @@ def test_delegation_checkpoint_round_trip_and_malformed_matrix() -> None:
     rejected = tool.record_rejected_attempt("objective", "bad request")
     assert rejected.status is DelegationStatus.REJECTED
     checkpoint = tool.checkpoint_state()
+    assert checkpoint["records"][0]["output"] == {
+        "character_count": 0,
+        "sha256": None,
+        "included": False,
+    }
     restored = DelegationTool(RecordingExecutor(_result()))
     restored.restore_checkpoint_state(checkpoint)
     assert restored.checkpoint_state() == checkpoint
@@ -306,6 +370,24 @@ def test_delegation_checkpoint_round_trip_and_malformed_matrix() -> None:
     for value in malformed:
         with pytest.raises(ValueError):
             restored.restore_checkpoint_state(value)
+
+
+async def test_checkpoint_retains_output_evidence_and_rejects_impossible_flags() -> (
+    None
+):
+    tool = DelegationTool(RecordingExecutor(_result("evidence")))
+    await _delegate(tool)
+    checkpoint = tool.checkpoint_state()
+    output = checkpoint["records"][0]["output"]
+    assert output["character_count"] == 8
+    assert len(output["sha256"]) == 64
+    assert output["included"] is True
+    assert "content" not in output
+
+    impossible = json.loads(json.dumps(checkpoint))
+    impossible["records"][0]["executor_invoked"] = False
+    with pytest.raises(ValueError, match="lacks invocation"):
+        tool.restore_checkpoint_state(impossible)
 
 
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 0, -1])
@@ -381,6 +463,118 @@ async def test_agent_exposes_delegation_only_when_configured_and_counts_tokens(
     assert "delegate_task" not in plain_provider.requests[0].messages[0]["content"]
 
 
+async def test_parent_counts_known_child_token_overshoot_exactly(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall("delegate_task", {"objective": "inspect"}, "delegate-1"),
+            ),
+            tokens=1,
+        )
+    )
+    delegation = DelegationTool(
+        RecordingExecutor(_result(tokens=10)),
+        config=DelegationConfig(
+            max_tokens_per_call=5,
+            max_tokens_per_task=5,
+        ),
+    )
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        delegation_tool=delegation,
+    )
+
+    outcome = await agent(_context(agent.initial_state(), tokens=100_000))
+
+    assert outcome.tokens == 11
+    assert outcome.error == "delegated child exceeded its assigned token budget"
+    assert outcome.tool_audits[0]["result"]["status"] == "token_limit"
+    assert outcome.tool_audits[0]["result"]["tokens"]["contributed"] == 10
+
+
+async def test_runner_stops_on_and_reports_known_child_token_overshoot(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall("delegate_task", {"objective": "inspect"}, "delegate-1"),
+            ),
+            tokens=1,
+        )
+    )
+    delegation = DelegationTool(
+        RecordingExecutor(_result(tokens=10)),
+        config=DelegationConfig(max_tokens_per_call=5, max_tokens_per_task=5),
+    )
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        delegation_tool=delegation,
+        min_output_tokens=1,
+        prefill_estimator=lambda _: 0,
+    )
+    runner = DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=2, max_tokens=6),
+    )
+
+    result = await runner.run(
+        goal="repair parser", step=agent, initial_state=agent.initial_state()
+    )
+
+    assert result.status is RunStatus.TOKEN_LIMIT
+    assert result.agent_tokens_used == 11
+    assert result.tokens_used == 11
+
+
+async def test_multiple_delegations_share_parent_step_token_budget(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall("delegate_task", {"objective": "one"}, "delegate-1"),
+                ToolCall("delegate_task", {"objective": "two"}, "delegate-2"),
+            ),
+            tokens=5,
+        )
+    )
+    executor = RecordingExecutor(_result(tokens=7), _result(tokens=3))
+    delegation = DelegationTool(
+        executor,
+        config=DelegationConfig(
+            max_tokens_per_call=100,
+            max_tokens_per_task=100,
+        ),
+    )
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        delegation_tool=delegation,
+        min_output_tokens=1,
+        prefill_estimator=lambda _: 0,
+    )
+
+    outcome = await agent(_context(agent.initial_state(), tokens=20))
+
+    assert [request.max_tokens for request in executor.requests] == [15, 8]
+    assert outcome.tokens == 15
+
+
 async def test_malformed_delegate_call_is_structured_and_never_invokes_executor(
     tmp_path: Path,
 ) -> None:
@@ -431,6 +625,44 @@ def test_codec_combines_memory_and_delegation_without_changing_legacy_schema() -
     del malformed[codec.state_key]["delegation_checkpoint"]
     with pytest.raises(AgentStateError, match="fields are malformed"):
         codec.decode_with_extensions(malformed)
+
+
+async def test_real_memory_and_delegation_restore_together(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall(
+                    "manage_memory",
+                    {"operation": "record", "content": "temporary child fact"},
+                    "memory-1",
+                ),
+                ToolCall("delegate_task", {"objective": "inspect"}, "delegate-1"),
+            )
+        )
+    )
+    memory = MemoryStore(tmp_path / "memory")
+    delegation = DelegationTool(RecordingExecutor(_result()))
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        memory_store=memory,
+        memory_task_id="task-parser",
+        memory_run_id="run-1",
+        delegation_tool=delegation,
+    )
+    initial = agent.initial_state()
+
+    outcome = await agent(_context(initial))
+
+    assert outcome.state["driftlock_tool_agent"]["schema_version"] == 4
+    assert len(memory.current_entries()) == 1
+    assert delegation.calls_used == 1
+    agent.restore_checkpoint_state(initial)
+    assert memory.current_entries() == ()
+    assert delegation.calls_used == 0
 
 
 async def test_builtin_subagent_is_fresh_non_recursive_and_can_edit_workspace(

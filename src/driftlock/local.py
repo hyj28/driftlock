@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import difflib
 import hashlib
 import os
 import shutil
 import signal
+import struct
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,8 +119,13 @@ class LocalEnvironment:
             return_code = process.returncode if process.returncode is not None else 1
         except asyncio.CancelledError:
             # Delegation and other outer deadlines may cancel this coroutine
-            # before its own command timeout. Kill the whole process group so a
-            # timed-out child cannot keep mutating the shared workspace.
+            # before its own command timeout. Stop the group before enumerating
+            # descendants, closing the race where a process forks and detaches
+            # between the snapshot and the kill.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGSTOP)
+            descendants = await asyncio.to_thread(_descendant_process_ids, process.pid)
+            _kill_processes(descendants)
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             _close_process_pipes(process)
@@ -136,6 +144,10 @@ class LocalEnvironment:
             timed_out = True
             known_return_code = process.returncode
             process_group_terminated = False
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGSTOP)
+            descendants = await asyncio.to_thread(_descendant_process_ids, process.pid)
+            _kill_processes(descendants)
             try:
                 os.killpg(process.pid, signal.SIGKILL)
                 process_group_terminated = True
@@ -253,6 +265,87 @@ def _decode_capped(value: bytes, limit: int) -> str:
     marker = f"\n[process output truncated after {limit} bytes]".encode()
     retained = max(0, limit - len(marker))
     return (value[:retained] + marker).decode("utf-8", errors="replace")
+
+
+def _descendant_process_ids(root_pid: int) -> tuple[int, ...]:
+    """Snapshot descendants deepest-first, including children in new sessions."""
+
+    children: dict[int, list[int]] = {}
+    for pid, parent in _process_parent_pairs():
+        children.setdefault(parent, []).append(pid)
+    discovered: list[tuple[int, int]] = []
+    pending = [(root_pid, 0)]
+    seen = {root_pid}
+    while pending:
+        parent, depth = pending.pop()
+        for pid in children.get(parent, ()):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            discovered.append((depth + 1, pid))
+            pending.append((pid, depth + 1))
+    discovered.sort(reverse=True)
+    return tuple(pid for _depth, pid in discovered)
+
+
+def _process_parent_pairs() -> tuple[tuple[int, int], ...]:
+    if sys.platform == "darwin":
+        return _darwin_process_parent_pairs()
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return ()
+    pairs: list[tuple[int, int]] = []
+    for stat_path in proc.glob("[0-9]*/stat"):
+        try:
+            pid = int(stat_path.parent.name)
+            fields = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            parent = int(fields[1])
+        except (IndexError, OSError, ValueError):
+            continue
+        pairs.append((pid, parent))
+    return tuple(pairs)
+
+
+def _darwin_process_parent_pairs() -> tuple[tuple[int, int], ...]:
+    """Use libproc because sandboxed macOS processes may not execute ``ps``."""
+
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libproc.proc_listallpids.restype = ctypes.c_int
+        capacity = max(1, libproc.proc_listallpids(None, 0) * 2)
+        pid_buffer = (ctypes.c_int * capacity)()
+        count = libproc.proc_listallpids(pid_buffer, ctypes.sizeof(pid_buffer))
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        return ()
+    pairs: list[tuple[int, int]] = []
+    for pid in pid_buffer[: max(0, count)]:
+        info = ctypes.create_string_buffer(256)
+        try:
+            copied = libproc.proc_pidinfo(pid, 3, 0, info, len(info))
+        except (OSError, ValueError):
+            continue
+        if copied < 20:
+            continue
+        recorded_pid = struct.unpack_from("=I", info.raw, 12)[0]
+        parent = struct.unpack_from("=I", info.raw, 16)[0]
+        if recorded_pid == pid:
+            pairs.append((pid, parent))
+    return tuple(pairs)
+
+
+def _kill_processes(process_ids: tuple[int, ...]) -> None:
+    for pid in process_ids:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
 
 
 async def _read_capped(stream: asyncio.StreamReader, limit: int) -> bytes:
