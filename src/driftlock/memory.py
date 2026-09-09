@@ -147,6 +147,12 @@ class MemoryStoreConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise MemoryStoreError(f"{name} must be a positive integer")
+        required = _required_revocation_reserve(self)
+        if self.max_remediation_bytes < required:
+            raise MemoryStoreError(
+                "max_remediation_bytes must reserve at least "
+                f"{required} bytes for one worst-case terminal revocation"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,6 +652,84 @@ class MemoryStore:
             if entry.status is MemoryEntryStatus.ACTIVE
         )
 
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Return a bounded exact snapshot suitable for agent checkpoint state."""
+
+        with self._mutation_lock():
+            entries = self.all_entries()
+            return {
+                "schema_version": MEMORY_SCHEMA_VERSION,
+                "entries": [entry.to_dict() for entry in entries],
+            }
+
+    def restore_checkpoint_state(
+        self,
+        value: object,
+        *,
+        task_id: str,
+        run_id: str,
+    ) -> None:
+        """Restore this run's effects while preserving unrelated concurrent writes.
+
+        The runner retains the rejected tool calls in its step audit.  The durable
+        memory view itself returns to the checkpoint snapshot, just as the workspace
+        does.  A conflicting write to the same entry by another run is refused
+        rather than silently overwritten.
+        """
+
+        snapshot = _decode_checkpoint_state(value)
+        snapshot_by_id = {entry.memory_id: entry for entry in snapshot}
+        with self._mutation_lock():
+            current = self.all_entries()
+            current_by_id = {entry.memory_id: entry for entry in current}
+            replacements: list[MemoryEntry] = []
+            removals: list[str] = []
+            for memory_id, prior in snapshot_by_id.items():
+                present = current_by_id.get(memory_id)
+                if present is None:
+                    raise MemoryStoreError(
+                        f"cannot restore memory checkpoint: {memory_id!r} disappeared"
+                    )
+                if present == prior:
+                    continue
+                prefix = present.events[: len(prior.events)]
+                suffix = present.events[len(prior.events) :]
+                if prefix != prior.events or not suffix:
+                    raise MemoryStoreError(
+                        "cannot restore memory checkpoint after a conflicting "
+                        f"rewrite of {memory_id!r}"
+                    )
+                if any(
+                    event.provenance.task_id != task_id
+                    or event.provenance.run_id != run_id
+                    for event in suffix
+                ):
+                    raise MemoryStoreError(
+                        "cannot restore memory checkpoint across another run's "
+                        f"write to {memory_id!r}"
+                    )
+                replacements.append(prior)
+            for memory_id, present in current_by_id.items():
+                if memory_id in snapshot_by_id:
+                    continue
+                if all(
+                    event.provenance.task_id == task_id
+                    and event.provenance.run_id == run_id
+                    for event in present.events
+                ):
+                    removals.append(memory_id)
+
+            for entry in replacements:
+                self._write_entry(entry, _serialize_entry(entry))
+            for memory_id in removals:
+                try:
+                    (self.entries / f"{memory_id}.json").unlink()
+                except OSError as error:
+                    raise MemoryStoreError(
+                        f"could not restore memory checkpoint for {memory_id!r}: "
+                        f"{error}"
+                    ) from error
+
     def record(
         self, content: object, provenance: MemoryProvenance
     ) -> MemoryMutationResult:
@@ -938,17 +1022,21 @@ class MemoryStore:
         document = _serialize_entry(entry)
         after_bytes = store_bytes_before - previous_size + len(document)
         entry_count_after = entry_count_before + (1 if previous_size == 0 else 0)
-        store_limit = (
-            self.config.max_store_bytes
-            if operation is MemoryOperation.RECORD
-            else self._hard_store_byte_limit
-        )
-        if after_bytes > store_limit:
-            limit_name = (
-                "max_store_bytes"
-                if operation is MemoryOperation.RECORD
-                else "the absolute store byte limit"
+        if operation is MemoryOperation.RECORD:
+            store_limit = self.config.max_store_bytes
+        elif operation is MemoryOperation.CORRECT:
+            store_limit = self._hard_store_byte_limit - _required_revocation_reserve(
+                self.config
             )
+        else:
+            store_limit = self._hard_store_byte_limit
+        if after_bytes > store_limit:
+            if operation is MemoryOperation.RECORD:
+                limit_name = "max_store_bytes"
+            elif operation is MemoryOperation.CORRECT:
+                limit_name = "the correction limit with revocation headroom"
+            else:
+                limit_name = "the absolute store byte limit"
             return self._reject(
                 operation,
                 None if operation is MemoryOperation.RECORD else entry.memory_id,
@@ -1221,6 +1309,33 @@ class MemoryStore:
 def _validate_memory_id(memory_id: object) -> None:
     if not isinstance(memory_id, str) or _MEMORY_ID.fullmatch(memory_id) is None:
         raise MemoryStoreFormatError("memory id has invalid format")
+
+
+def _decode_checkpoint_state(value: object) -> tuple[MemoryEntry, ...]:
+    if not isinstance(value, Mapping) or set(value) != {"schema_version", "entries"}:
+        raise MemoryStoreFormatError("memory checkpoint state fields are malformed")
+    if value.get("schema_version") != MEMORY_SCHEMA_VERSION:
+        raise MemoryStoreFormatError("unsupported memory checkpoint schema version")
+    raw_entries = value.get("entries")
+    if not isinstance(raw_entries, list):
+        raise MemoryStoreFormatError("memory checkpoint entries must be a list")
+    entries = tuple(MemoryEntry.from_dict(entry) for entry in raw_entries)
+    identifiers = tuple(entry.memory_id for entry in entries)
+    if identifiers != tuple(sorted(identifiers)) or len(identifiers) != len(
+        set(identifiers)
+    ):
+        raise MemoryStoreFormatError(
+            "memory checkpoint entries must have unique sorted identifiers"
+        )
+    return entries
+
+
+def _required_revocation_reserve(config: MemoryStoreConfig) -> int:
+    # JSON escaping can expand one character to six ASCII bytes (``\\u0001``).
+    # The fixed allowance covers field names, counters, punctuation, and indentation.
+    return 2_048 + 6 * (
+        config.max_reason_characters + 2 * config.max_provenance_id_characters
+    )
 
 
 def _serialize_entry(entry: MemoryEntry) -> bytes:

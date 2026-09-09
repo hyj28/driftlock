@@ -19,6 +19,8 @@ from driftlock.agentic_retrieval import (
     RetrievalCorpusBuilder,
     RetrievalDocumentKind,
 )
+from driftlock.checkpoints import DirectoryCheckpointStore
+from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
 from driftlock.memory import (
     MemoryEntryStatus,
@@ -28,9 +30,11 @@ from driftlock.memory import (
     MemoryRecoveryKind,
     MemoryStore,
     MemoryStoreConfig,
+    MemoryStoreError,
     MemoryStoreFormatError,
 )
-from driftlock.models import StepContext
+from driftlock.models import RunStatus, StepContext
+from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.skill_admission import SkillAdmissionCandidate, SkillLibrary
 from driftlock.skill_distillation import Skill
 
@@ -323,27 +327,36 @@ def test_identical_correction_is_rejected_without_appending_an_event(
     assert store.read("memory-000001").revision == 1
 
 
-def test_absolute_remediation_reserve_cap_is_recorded_without_losing_entry(
+def test_configuration_rejects_a_reserve_too_small_for_one_revocation() -> None:
+    with pytest.raises(
+        MemoryStoreError,
+        match="must reserve at least 6584 bytes",
+    ):
+        MemoryStoreConfig(max_remediation_bytes=1)
+
+
+def test_correction_cannot_consume_terminal_revocation_headroom(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "memory"
-    provenance = _provenance("t", "r")
-    initial = MemoryStore(root, config=MemoryStoreConfig(max_store_bytes=1_000))
-    initial.record("Original fact.", provenance)
     store = MemoryStore(
-        root,
+        tmp_path / "memory",
         config=MemoryStoreConfig(
-            max_store_bytes=376,
-            max_remediation_bytes=1,
+            max_store_bytes=4_200,
+            max_remediation_bytes=7_000,
         ),
     )
+    provenance = _provenance("t", "r")
+    recorded = store.record("A" * 2_000, provenance)
+    corrected = store.correct("memory-000001", "B" * 2_000, "R" * 500, provenance)
+    revoked = store.revoke("memory-000001", "x", provenance)
 
-    result = store.revoke("memory-000001", "Observed now.", provenance)
-
-    assert result.status is MemoryMutationStatus.REJECTED
-    assert result.memory_id == "memory-000001"
-    assert result.limits["store_size"]["hit"] is True
-    assert store.read("memory-000001").current_content == "Original fact."
+    assert recorded.status is MemoryMutationStatus.APPLIED
+    assert corrected.status is MemoryMutationStatus.REJECTED
+    assert corrected.error == (
+        "memory store would exceed the correction limit with revocation headroom (4616)"
+    )
+    assert revoked.status is MemoryMutationStatus.APPLIED
+    assert store.read("memory-000001").status is MemoryEntryStatus.REVOKED
 
 
 @pytest.mark.parametrize(
@@ -848,6 +861,160 @@ def test_memory_cannot_consume_whole_shared_task_character_budget(
     assert tool.returned_characters < 18_000
     assert results[2].exclusion_reason_counts == {"per_task_memory_character_budget": 1}
     assert results[2].per_task_memory_character_budget_hit is True
+
+
+def test_memory_never_survives_as_the_only_match_when_workspace_is_eligible(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    prefill = "prefill " + ("p" * 2_592)
+    fresh = "freshneedle current " + ("w" * 2_980)
+    memory_content = "freshneedle historical " + ("m" * 1_977)
+    assert len(prefill) == 2_600
+    assert len(fresh) == 3_000
+    assert len(memory_content) == 2_000
+    (workspace / "a-prefill.txt").write_text(prefill, encoding="utf-8")
+    (workspace / "z-fresh.txt").write_text(fresh, encoding="utf-8")
+    store = MemoryStore(tmp_path / "memory")
+    store.record(memory_content, _provenance())
+    prefill_query = "prefill"
+    fresh_query = "freshneedle"
+    tool = AgenticRetrievalTool.from_workspace(
+        workspace,
+        SkillLibrary(tmp_path / "library"),
+        LiteralEmbedder(
+            {
+                prefill: _vector(1.0),
+                fresh: _vector(0.9),
+                memory_content: _vector(1.0),
+                prefill_query: _RELATED_QUERY_VECTOR,
+                fresh_query: _RELATED_QUERY_VECTOR,
+            }
+        ),
+        memory_store=store,
+    )
+
+    for _ in range(6):
+        tool.retrieve(prefill_query)
+    result = tool.retrieve(fresh_query)
+
+    assert result.task_characters_before == 15_600
+    assert result.matches == ()
+    assert result.refusal == {
+        "reason": "task_character_budget_insufficient",
+        "stage": "selection",
+        "detail": (
+            "matching documents remained, but none fit the remaining task "
+            "retrieval character budget"
+        ),
+    }
+    considered = {item["document_id"]: item for item in result.considered}
+    assert considered["memory:memory-000001"]["reason"] == (
+        "workspace_observation_priority"
+    )
+    assert considered["workspace:z-fresh.txt#chunk-1"]["reason"] == (
+        "per_task_character_budget"
+    )
+
+
+@pytest.mark.parametrize("operation", ["record", "correct", "revoke"])
+def test_memory_checkpoint_restore_covers_every_mutation(
+    tmp_path: Path, operation: str
+) -> None:
+    store = MemoryStore(tmp_path / operation)
+    baseline = _provenance("other-task", "other-run")
+    if operation != "record":
+        store.record("Original fact.", baseline)
+    checkpoint = store.checkpoint_state()
+    current = _provenance("task-parser", "run-07")
+    if operation == "record":
+        result = store.record("Rejected branch claim.", current)
+    elif operation == "correct":
+        result = store.correct(
+            "memory-000001", "Rejected correction.", "Bad branch.", current
+        )
+    else:
+        result = store.revoke("memory-000001", "Bad branch.", current)
+    assert result.status is MemoryMutationStatus.APPLIED
+
+    store.restore_checkpoint_state(checkpoint, task_id="task-parser", run_id="run-07")
+
+    if operation == "record":
+        assert store.current_entries() == ()
+    else:
+        restored = store.read("memory-000001")
+        assert restored.current_content == "Original fact."
+        assert restored.revision == 1
+
+
+async def test_runner_rollback_restores_memory_before_retry(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall(
+                    "manage_memory",
+                    {"operation": "record", "content": "Rejected claim one."},
+                    "memory-1",
+                ),
+            )
+        ),
+        AgentCompletion(
+            tool_calls=(
+                ToolCall(
+                    "manage_memory",
+                    {"operation": "record", "content": "Rejected claim two."},
+                    "memory-2",
+                ),
+            )
+        ),
+        AgentCompletion(
+            tool_calls=(
+                ToolCall("complete", {"summary": "Finished retry."}, "complete-1"),
+            )
+        ),
+    )
+    store = MemoryStore(tmp_path / "memory")
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        memory_store=store,
+        memory_task_id="task-parser",
+        memory_run_id="run-07",
+    )
+    runner = DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=2,
+                loop_window=2,
+                loop_repetitions=2,
+                error_window=10,
+                reward_stall_steps=10,
+                corroborating_signals=frozenset(),
+            )
+        ),
+        config=RunnerConfig(max_steps=3, max_rollbacks=1),
+    )
+
+    result = await runner.run(
+        goal="repair parser", step=agent, initial_state=agent.initial_state()
+    )
+
+    assert result.status is RunStatus.COMPLETED
+    assert len(result.rollbacks) == 1
+    assert [(step.logical_step, step.outcome.action) for step in result.steps] == [
+        (1, "Manage memory: record"),
+        (2, "Manage memory: record"),
+        (1, "Signal task completion"),
+    ]
+    assert store.current_entries() == ()
+    terminal = json.dumps(result.state, sort_keys=True)
+    assert "memory-000001" not in terminal
+    assert "memory-000002" not in terminal
 
 
 def test_corrected_memory_is_retrieved_without_superseded_content(

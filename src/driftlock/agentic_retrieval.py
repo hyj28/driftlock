@@ -1118,6 +1118,7 @@ class AgenticRetrievalTool:
             ),
             key=_retrieval_selection_sort_key,
         )
+        ranked_eligible = tuple(enumerate(eligible, start=1))
         selected: list[RetrievedContext] = []
         reasons: dict[str, str] = {
             document.document_id: "no_lexical_evidence_or_semantic_separation"
@@ -1138,9 +1139,8 @@ class AgenticRetrievalTool:
         memory_remaining = memory_character_limit - memory_before
         per_call_memory_characters = 0
         task_remaining = self.corpus.config.max_characters_per_task - before
-        for rank, (similarity, lexical_coverage, _overlap, document) in enumerate(
-            eligible, start=1
-        ):
+        for rank, item in ranked_eligible:
+            document = item[3]
             size = len(document.returned_text)
             is_memory = document.kind is RetrievalDocumentKind.MEMORY
             if is_memory and per_call_memory_results >= memory_result_limit:
@@ -1159,27 +1159,70 @@ class AgenticRetrievalTool:
                 reasons[document.document_id] = "per_task_character_budget"
                 continue
             selected.append(
-                RetrievedContext(
-                    document_id=document.document_id,
-                    kind=document.kind,
-                    origin=document.origin,
-                    indexed_span=document.indexed_span,
-                    similarity=similarity,
-                    lexical_coverage=lexical_coverage,
-                    lexical_evidence=bool(_overlap),
-                    semantic_evidence=(document.document_id in semantic_document_ids),
+                _retrieved_context(
+                    item,
                     rank=rank,
-                    content=document.returned_text,
-                    chunk_start=document.chunk_start,
-                    chunk_end=document.chunk_end,
-                    epistemic_status=document.epistemic_status,
-                    provenance=document.provenance,
+                    semantic_document_ids=semantic_document_ids,
                 )
             )
             per_call_characters += size
             if is_memory:
                 per_call_memory_results += 1
                 per_call_memory_characters += size
+
+        # A bounded memory hint must never be the reason current workspace
+        # evidence disappears. If greedy ranking selected memory but no eligible
+        # workspace result, remove the memory and use the best workspace excerpt
+        # that fits the capacity it frees. If no workspace excerpt can fit even
+        # then, return no memory rather than presenting an unvalidated claim alone.
+        selected_memory = [
+            match for match in selected if match.kind is RetrievalDocumentKind.MEMORY
+        ]
+        has_workspace = any(
+            match.kind is RetrievalDocumentKind.WORKSPACE for match in selected
+        )
+        workspace_candidates = tuple(
+            (rank, item)
+            for rank, item in ranked_eligible
+            if item[3].kind is RetrievalDocumentKind.WORKSPACE
+        )
+        if selected_memory and not has_workspace and workspace_candidates:
+            selected = [
+                match
+                for match in selected
+                if match.kind is not RetrievalDocumentKind.MEMORY
+            ]
+            removed_memory_characters = sum(
+                len(match.content) for match in selected_memory
+            )
+            per_call_characters -= removed_memory_characters
+            per_call_memory_characters = 0
+            per_call_memory_results = 0
+            for match in selected_memory:
+                reasons[match.document_id] = "workspace_observation_priority"
+            for rank, item in workspace_candidates:
+                document = item[3]
+                size = len(document.returned_text)
+                if len(selected) >= self.corpus.config.max_results_per_call:
+                    continue
+                if (
+                    per_call_characters + size
+                    > self.corpus.config.max_characters_per_call
+                ):
+                    continue
+                if per_call_characters + size > task_remaining:
+                    continue
+                selected.append(
+                    _retrieved_context(
+                        item,
+                        rank=rank,
+                        semantic_document_ids=semantic_document_ids,
+                    )
+                )
+                per_call_characters += size
+                reasons.pop(document.document_id, None)
+                break
+            selected.sort(key=lambda match: match.rank)
 
         selected_ids = {match.document_id for match in selected}
         similarity_ranks = {
@@ -1285,6 +1328,31 @@ def _terms(text: str) -> frozenset[str]:
             match.group(0).casefold() for match in _TOKEN.finditer(normalized)
         )
         if len(token) > 1 and token not in _STOP_WORDS
+    )
+
+
+def _retrieved_context(
+    item: tuple[float, float, frozenset[str], _CorpusDocument],
+    *,
+    rank: int,
+    semantic_document_ids: frozenset[str],
+) -> RetrievedContext:
+    similarity, lexical_coverage, overlap, document = item
+    return RetrievedContext(
+        document_id=document.document_id,
+        kind=document.kind,
+        origin=document.origin,
+        indexed_span=document.indexed_span,
+        similarity=similarity,
+        lexical_coverage=lexical_coverage,
+        lexical_evidence=bool(overlap),
+        semantic_evidence=(document.document_id in semantic_document_ids),
+        rank=rank,
+        content=document.returned_text,
+        chunk_start=document.chunk_start,
+        chunk_end=document.chunk_end,
+        epistemic_status=document.epistemic_status,
+        provenance=document.provenance,
     )
 
 

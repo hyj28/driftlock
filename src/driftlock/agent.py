@@ -441,20 +441,17 @@ def compact_conversation_history(
 class AgentConversationCodec:
     """Versioned JSON codec for semantic tool-agent conversation state."""
 
-    # Version two adds the separately validated plan field. Version-one states
-    # migrate explicitly to a null plan, so old experiments are never misread.
+    # Version two adds the separately validated plan field. Version three is used
+    # only by memory-enabled agents and checkpoints the bounded durable store view.
+    # Disabled agents continue emitting version two byte-for-byte.
     schema_version = 2
+    memory_schema_version = 3
     state_key = "driftlock_tool_agent"
 
-    def initial_state(self) -> dict[str, Any]:
-        return {
-            self.state_key: {
-                "schema_version": self.schema_version,
-                "messages": [],
-                "steps": 0,
-                "plan": None,
-            }
-        }
+    def initial_state(
+        self, *, memory_checkpoint: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.encode((), steps=0, plan=None, memory_checkpoint=memory_checkpoint)
 
     def encode(
         self,
@@ -462,15 +459,22 @@ class AgentConversationCodec:
         *,
         steps: int,
         plan: AgentPlan | None = None,
+        memory_checkpoint: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if plan is not None and not isinstance(plan, AgentPlan):
             raise AgentStateError("tool-agent plan must be an AgentPlan or None")
         payload = {
-            "schema_version": self.schema_version,
+            "schema_version": (
+                self.memory_schema_version
+                if memory_checkpoint is not None
+                else self.schema_version
+            ),
             "messages": list(messages),
             "steps": steps,
             "plan": plan.to_dict() if plan is not None else None,
         }
+        if memory_checkpoint is not None:
+            payload["memory_checkpoint"] = dict(memory_checkpoint)
         return {self.state_key: _json_copy(payload)}
 
     def decode(self, value: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
@@ -483,6 +487,19 @@ class AgentConversationCodec:
         self, value: Mapping[str, Any]
     ) -> tuple[list[dict[str, Any]], int, AgentPlan | None]:
         """Decode all checkpointed agent state, including the durable plan."""
+
+        messages, steps, plan, _memory_checkpoint = self.decode_with_memory(value)
+        return messages, steps, plan
+
+    def decode_with_memory(
+        self, value: Mapping[str, Any]
+    ) -> tuple[
+        list[dict[str, Any]],
+        int,
+        AgentPlan | None,
+        dict[str, Any] | None,
+    ]:
+        """Decode conversation state plus an optional memory-store checkpoint."""
 
         payload = value.get(self.state_key)
         if not isinstance(payload, Mapping):
@@ -498,6 +515,7 @@ class AgentConversationCodec:
                     "version-one tool-agent state fields are malformed"
                 )
             raw_plan = None
+            raw_memory_checkpoint = None
         elif version == self.schema_version:
             if set(payload) != {"schema_version", "messages", "steps", "plan"}:
                 raise AgentStateError(
@@ -506,6 +524,22 @@ class AgentConversationCodec:
             if "plan" not in payload:
                 raise AgentStateError("tool-agent state is missing the plan field")
             raw_plan = payload.get("plan")
+            raw_memory_checkpoint = None
+        elif version == self.memory_schema_version:
+            if set(payload) != {
+                "schema_version",
+                "messages",
+                "steps",
+                "plan",
+                "memory_checkpoint",
+            }:
+                raise AgentStateError(
+                    "version-three tool-agent state fields are malformed"
+                )
+            raw_plan = payload.get("plan")
+            raw_memory_checkpoint = payload.get("memory_checkpoint")
+            if not isinstance(raw_memory_checkpoint, Mapping):
+                raise AgentStateError("tool-agent memory checkpoint must be an object")
         else:
             raise AgentStateError("unsupported tool-agent state schema version")
         messages = payload.get("messages")
@@ -545,7 +579,17 @@ class AgentConversationCodec:
                 raise AgentStateError(
                     f"tool-agent plan is malformed: {error}"
                 ) from error
-        return copied, steps, plan
+        try:
+            copied_memory_checkpoint = (
+                _json_copy(raw_memory_checkpoint)
+                if raw_memory_checkpoint is not None
+                else None
+            )
+        except (RecursionError, TypeError, ValueError) as error:
+            raise AgentStateError(
+                "tool-agent memory checkpoint must be JSON-compatible"
+            ) from error
+        return copied, steps, plan, copied_memory_checkpoint
 
 
 class ToolCallingAgent:
@@ -642,10 +686,66 @@ class ToolCallingAgent:
         self.planning = planning
 
     def initial_state(self) -> dict[str, Any]:
-        return self.codec.initial_state()
+        return self.codec.initial_state(
+            memory_checkpoint=(
+                self.memory_store.checkpoint_state()
+                if self.memory_store is not None
+                else None
+            )
+        )
+
+    def restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        """Restore memory alongside runner-managed workspace/checkpoint state."""
+
+        if self.memory_store is None:
+            return
+        _messages, _steps, _plan, memory_checkpoint = self.codec.decode_with_memory(
+            state
+        )
+        if memory_checkpoint is None:
+            raise AgentStateError(
+                "memory-enabled agent checkpoint is missing memory state"
+            )
+        assert self.memory_task_id is not None
+        assert self.memory_run_id is not None
+        self.memory_store.restore_checkpoint_state(
+            memory_checkpoint,
+            task_id=self.memory_task_id,
+            run_id=self.memory_run_id,
+        )
+
+    def _encode_state(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        steps: int,
+        plan: AgentPlan | None,
+    ) -> dict[str, Any]:
+        return self.codec.encode(
+            messages,
+            steps=steps,
+            plan=plan,
+            memory_checkpoint=(
+                self.memory_store.checkpoint_state()
+                if self.memory_store is not None
+                else None
+            ),
+        )
 
     async def __call__(self, context: StepContext) -> StepOutcome:
-        history, completed_steps, plan = self.codec.decode_with_plan(context.state)
+        history, completed_steps, plan, memory_checkpoint = (
+            self.codec.decode_with_memory(context.state)
+        )
+        if self.memory_store is None and memory_checkpoint is not None:
+            raise AgentStateError(
+                "checkpoint state contains memory but memory is not enabled"
+            )
+        if self.memory_store is not None:
+            if memory_checkpoint is None:
+                raise AgentStateError(
+                    "memory-enabled agent checkpoint is missing memory state"
+                )
+            self.restore_checkpoint_state(context.state)
         if not self.planning and plan is not None:
             raise AgentStateError(
                 "checkpoint state contains a plan but planning is not enabled"
@@ -663,7 +763,7 @@ class ToolCallingAgent:
             message = f"Malformed conversation state: {error}"
             return StepOutcome(
                 action="Reject malformed conversation state",
-                state=self.codec.encode(history, steps=completed_steps + 1, plan=plan),
+                state=self._encode_state(history, steps=completed_steps + 1, plan=plan),
                 error=message,
                 summary=message,
             )
@@ -703,7 +803,7 @@ class ToolCallingAgent:
             observation_error = before_error or observer_error
             return StepOutcome(
                 action="Provider call failed",
-                state=self.codec.encode(updated, steps=completed_steps + 1, plan=plan),
+                state=self._encode_state(updated, steps=completed_steps + 1, plan=plan),
                 changed_paths=delta.changed_paths,
                 diff=delta.diff,
                 workspace_delta_observed=observation_error is None,
@@ -782,7 +882,7 @@ class ToolCallingAgent:
         )
         return StepOutcome(
             action=action,
-            state=self.codec.encode(history, steps=completed_steps + 1, plan=plan),
+            state=self._encode_state(history, steps=completed_steps + 1, plan=plan),
             changed_paths=delta.changed_paths,
             diff=delta.diff,
             workspace_delta_observed=observation_error is None,
