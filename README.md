@@ -6,7 +6,7 @@
 >
 > The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
 > retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (986 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> (994 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
@@ -80,6 +80,19 @@ them is *undo*.
 Delegation runs sequentially, so child filesystem changes are observed as part of the
 parent step. Rollback restores those changes together with the checkpointed delegation
 quota; already billed child tokens remain counted.
+
+Checkpoint and restore calls require an idle delegation tool; wait for completion
+or cancellation first. Interrupted calls retain provider-reported tokens as a
+known minimum (`accounting_known=false` means the total may be higher). Further
+delegation is paused on that ledger because the remaining budget is uncertain.
+Custom executors must cooperate with cancellation; a deadline bounds the parent's
+wait, and cannot force arbitrary executor code to stop.
+
+`LocalEnvironment` runs trusted local commands and provides best-effort process
+cleanup, not a security sandbox. A detached program that replaces its inherited
+environment can outlive a command or delegation deadline. For strict process
+lifetime and filesystem isolation, supply a host-managed isolated environment;
+do not rely on local timeout cleanup to contain untrusted shell programs.
 
 ## The approach
 

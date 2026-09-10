@@ -33,7 +33,13 @@ class LocalExecResult:
 
 
 class LocalEnvironment:
-    """Execute the remote-environment protocol within a configured local root."""
+    """Execute trusted local commands; this backend is not a process sandbox.
+
+    Cleanup tracks descendants and an inherited command marker on a best-effort
+    basis. Detached programs that replace their environment can outlive a call.
+    Use a host-managed isolated environment when strict process lifetime or
+    filesystem isolation is required.
+    """
 
     def __init__(
         self,

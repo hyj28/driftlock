@@ -235,6 +235,154 @@ async def test_concurrent_delegate_calls_serialize_shared_quota_and_checkpoint()
     assert restored.checkpoint_state() == checkpoint
 
 
+async def test_active_delegation_guards_checkpoint_access_and_survives_cancel() -> None:
+    started = asyncio.Event()
+
+    async def blocked(_: DelegationRequest) -> DelegationExecutionResult:
+        started.set()
+        await asyncio.Event().wait()
+        return _result()
+
+    tool = DelegationTool(blocked)
+    initial = tool.checkpoint_state()
+    task = asyncio.create_task(_delegate(tool))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    try:
+        with pytest.raises(RuntimeError, match="in progress"):
+            tool.checkpoint_state()
+        with pytest.raises(RuntimeError, match="in progress"):
+            tool.restore_checkpoint_state(initial)
+        with pytest.raises(RuntimeError, match="in progress"):
+            tool.record_rejected_attempt("other", "malformed")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    checkpoint = tool.checkpoint_state()
+    assert checkpoint["calls_used"] == 1
+    assert len(checkpoint["records"]) == 1
+    assert checkpoint["records"][0]["status"] == "failed"
+    assert checkpoint["records"][0]["tokens"]["accounting_known"] is False
+    restored = DelegationTool(blocked)
+    restored.restore_checkpoint_state(checkpoint)
+    assert restored.checkpoint_state() == checkpoint
+    assert (await _delegate(restored)).status is DelegationStatus.REJECTED
+
+
+async def test_cancelled_waiter_does_not_consume_quota() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(_: DelegationRequest) -> DelegationExecutionResult:
+        started.set()
+        await release.wait()
+        return _result(tokens=1)
+
+    tool = DelegationTool(blocked)
+    active = asyncio.create_task(_delegate(tool))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    waiter = asyncio.create_task(_delegate(tool))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    assert (await active).status is DelegationStatus.COMPLETED
+    assert tool.calls_used == 1
+    tool.validate_checkpoint_state(tool.checkpoint_state())
+
+
+@pytest.mark.parametrize("cancel_outer", [False, True])
+async def test_interrupted_child_retains_prior_provider_usage_and_pauses_budget(
+    tmp_path: Path,
+    cancel_outer: bool,
+) -> None:
+    second_call = asyncio.Event()
+    calls = 0
+
+    async def provider(_: AgentCompletionRequest) -> AgentCompletion:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return AgentCompletion(text="first step", tokens=7)
+        second_call.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    executor = ToolCallingSubagentExecutor(
+        LocalEnvironment(tmp_path),
+        LocalWorkspaceDeltaObserver(tmp_path),
+        provider,
+        min_output_tokens=1,
+        prefill_estimator=lambda _: 0,
+    )
+    config = DelegationConfig(
+        max_tokens_per_call=10,
+        max_tokens_per_task=10,
+        timeout_seconds=30 if cancel_outer else 0.05,
+    )
+    tool = DelegationTool(executor, config=config)
+    task = asyncio.create_task(_delegate(tool))
+    await asyncio.wait_for(second_call.wait(), timeout=1)
+    if cancel_outer:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        outcome = await asyncio.wait_for(task, timeout=1)
+        assert outcome.status is DelegationStatus.TIMED_OUT
+        assert outcome.tokens_contributed == 7
+    assert tool.tokens_used == 7
+    assert tool.records[0]["tokens"]["accounting_known"] is False
+    restored = DelegationTool(executor, config=config)
+    restored.restore_checkpoint_state(tool.checkpoint_state())
+    assert (await _delegate(restored)).status is DelegationStatus.REJECTED
+    assert restored.tokens_used == 7
+    assert calls == 2
+
+
+async def test_parent_counts_provider_usage_when_child_tool_times_out(
+    tmp_path: Path,
+) -> None:
+    class BlockingEnvironment:
+        async def exec(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    child_provider = ScriptedProvider(
+        AgentCompletion(
+            tokens=7,
+            tool_calls=(ToolCall("run_shell", {"command": "work"}, "work"),),
+        )
+    )
+    delegation = DelegationTool(
+        ToolCallingSubagentExecutor(
+            BlockingEnvironment(),
+            LocalWorkspaceDeltaObserver(tmp_path),
+            child_provider,
+            min_output_tokens=1,
+            prefill_estimator=lambda _: 0,
+        ),
+        config=DelegationConfig(timeout_seconds=0.05),
+    )
+    parent = ToolCallingAgent(
+        LocalEnvironment(tmp_path),
+        LocalWorkspaceDeltaObserver(tmp_path),
+        ScriptedProvider(
+            AgentCompletion(
+                tokens=2,
+                tool_calls=(ToolCall("delegate_task", {"objective": "work"}, "child"),),
+            )
+        ),
+        delegation_tool=delegation,
+    )
+    outcome = await parent(_context(parent.initial_state()))
+    assert outcome.tokens == 9
+    assert outcome.tool_audits[0]["result"]["status"] == "timed_out"
+    assert delegation.tokens_used == 7
+    delegation.validate_checkpoint_state(delegation.checkpoint_state())
+
+
 @pytest.mark.parametrize(
     ("result", "status", "known", "contributed"),
     [
@@ -514,6 +662,18 @@ async def test_checkpoint_rejects_impossible_status_evidence_combinations() -> N
         rejected.restore_checkpoint_state(retained_rejection)
 
 
+@pytest.mark.parametrize("tokens", [32_001, 65_000])
+async def test_checkpoint_rejects_completed_over_configured_quota(tokens: int) -> None:
+    tool = DelegationTool(RecordingExecutor(_result(tokens=1)))
+    await _delegate(tool)
+    checkpoint = tool.checkpoint_state()
+    checkpoint["tokens_used"] = tokens
+    checkpoint["records"][0]["tokens"].update(contributed=tokens, after=tokens)
+    with pytest.raises(ValueError, match="token budget"):
+        tool.restore_checkpoint_state(checkpoint)
+    assert tool.tokens_used == 1
+
+
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 0, -1])
 def test_delegation_config_rejects_non_finite_or_non_positive_timeout(
     timeout: float,
@@ -760,6 +920,38 @@ async def test_malformed_delegate_arguments_with_broken_repr_are_contained(
     )
     assert delegation.calls_used == 1
     assert executor.requests == []
+
+
+async def test_nested_nonrenderable_objective_is_rejected_before_executor(
+    tmp_path: Path,
+) -> None:
+    class BrokenText:
+        def __str__(self) -> str:
+            raise RuntimeError("cannot stringify")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("cannot represent")
+
+    executor = RecordingExecutor(_result())
+    tool = DelegationTool(executor)
+    agent = ToolCallingAgent(
+        LocalEnvironment(tmp_path),
+        LocalWorkspaceDeltaObserver(tmp_path),
+        ScriptedProvider(
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall("delegate_task", {"objective": BrokenText()}, "malformed"),
+                )
+            )
+        ),
+        delegation_tool=tool,
+    )
+    outcome = await agent(_context(agent.initial_state()))
+    assert outcome.action == "Delegate task with malformed objective"
+    assert outcome.tool_audits[0]["result"]["status"] == "rejected"
+    assert executor.requests == []
+    assert tool.calls_used == 1
+    tool.validate_checkpoint_state(tool.checkpoint_state())
 
 
 def test_codec_combines_memory_and_delegation_without_changing_legacy_schema() -> None:

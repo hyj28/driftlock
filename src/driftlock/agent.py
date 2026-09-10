@@ -23,6 +23,7 @@ from driftlock.delegation import (
     DelegationRequest,
     DelegationStatus,
     DelegationTool,
+    _report_delegation_tokens,
 )
 from driftlock.lhtb import WorkspaceDelta, WorkspaceDeltaObserver
 from driftlock.memory import (
@@ -1807,10 +1808,22 @@ class ToolCallingSubagentExecutor:
     async def __call__(self, request: DelegationRequest) -> DelegationExecutionResult:
         if not isinstance(request, DelegationRequest):
             raise TypeError("request must be a DelegationRequest")
+
+        async def metered_complete(
+            completion_request: AgentCompletionRequest,
+        ) -> AgentCompletion:
+            try:
+                completion = await self.complete(completion_request)
+            except AgentProviderError as error:
+                _report_delegation_tokens(error.tokens)
+                raise
+            _report_delegation_tokens(completion.tokens)
+            return completion
+
         child = ToolCallingAgent(
             self.environment,
             self.observer,
-            self.complete,
+            metered_complete,
             **self.options,
         )
         state = child.initial_state()
@@ -2576,7 +2589,10 @@ def _describe_action(
             return f"Manage memory: {operation}"
         return "Manage memory with malformed operation"
     if call.name == "delegate_task" and delegation:
-        return _shorten(f"Delegate task: {arguments.get('objective', '')}", 160)
+        objective = arguments.get("objective", "")
+        if not isinstance(objective, str):
+            return "Delegate task with malformed objective"
+        return _shorten(f"Delegate task: {objective}", 160)
     if call.name == "complete":
         return "Signal task completion"
     return _shorten(f"Attempt unknown tool: {call.name}", 160)

@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Protocol
@@ -30,6 +31,25 @@ _MAX_DELEGATION_LEDGER_TOKENS = 2 * MAX_DELEGATION_ACCOUNTED_TOKENS
 # separate bound on its serialized representation also rejects hostile nested
 # JSON supplied through a tampered checkpoint before copying it.
 _MAX_DELEGATION_RECORD_CHARACTERS = 4_000
+
+
+@dataclass(slots=True)
+class _DelegationUsage:
+    tokens: int = 0
+    closed: bool = False
+
+
+_active_usage: ContextVar[_DelegationUsage | None] = ContextVar(
+    "delegation_usage", default=None
+)
+
+
+def _report_delegation_tokens(tokens: int) -> None:
+    """Retain provider-reported usage before tools or subsequent awaits run."""
+
+    usage = _active_usage.get()
+    if usage is not None and not usage.closed:
+        usage.tokens += tokens
 
 
 class DelegationStatus(StrEnum):
@@ -284,6 +304,7 @@ class DelegationTool:
         return tuple(_copy_records(self._records))
 
     def checkpoint_state(self) -> dict[str, Any]:
+        self._require_idle()
         return {
             "schema_version": DELEGATION_SCHEMA_VERSION,
             "calls_used": self._calls_used,
@@ -292,6 +313,7 @@ class DelegationTool:
         }
 
     def restore_checkpoint_state(self, value: object) -> None:
+        self._require_idle()
         calls, tokens, records = _decode_state(value, self.config)
         self._calls_used = calls
         self._tokens_used = tokens
@@ -301,6 +323,12 @@ class DelegationTool:
         """Validate a checkpoint without mutating the live delegation ledger."""
 
         _decode_state(value, self.config)
+
+    def _require_idle(self) -> None:
+        if self._delegate_lock.locked():
+            raise RuntimeError(
+                "delegation is in progress; await it before checkpoint access"
+            )
 
     async def delegate(
         self,
@@ -382,6 +410,11 @@ class DelegationTool:
             allow_empty=True,
         )
         error = validation_error or error or context_error or parent_goal_error
+        if any(not record["tokens"]["accounting_known"] for record in self._records):
+            error = (
+                error
+                or "delegation is paused because earlier token accounting is incomplete"
+            )
         digest_source = (
             normalized_objective
             if isinstance(objective, str)
@@ -421,7 +454,16 @@ class DelegationTool:
             max_steps=self.config.max_steps_per_call,
             max_tokens=min(self.config.max_tokens_per_call, remaining),
         )
-        execution_task = asyncio.create_task(self.executor(request))
+        usage = _DelegationUsage()
+
+        async def execute() -> DelegationExecutionResult:
+            context_token = _active_usage.set(usage)
+            try:
+                return await self.executor(request)
+            finally:
+                _active_usage.reset(context_token)
+
+        execution_task = asyncio.create_task(execute())
         try:
             done, _pending = await asyncio.wait(
                 {execution_task}, timeout=self.config.timeout_seconds
@@ -429,11 +471,22 @@ class DelegationTool:
         except BaseException:
             execution_task.cancel()
             self._retain_cancelled_task(execution_task)
+            self._record(
+                self._interrupted_outcome(
+                    usage,
+                    DelegationStatus.FAILED,
+                    normalized_objective,
+                    before_calls,
+                    before_tokens,
+                    "delegation was interrupted by its caller",
+                )
+            )
             raise
         if not done:
             execution_task.cancel()
             self._retain_cancelled_task(execution_task)
-            outcome = self._outcome(
+            outcome = self._interrupted_outcome(
+                usage,
                 DelegationStatus.TIMED_OUT,
                 normalized_objective,
                 before_calls,
@@ -442,24 +495,22 @@ class DelegationTool:
                     "delegation timed out after "
                     f"{self.config.timeout_seconds:g} seconds"
                 ),
-                executor_invoked=True,
-                token_accounting_known=False,
             )
         else:
             try:
                 execution = execution_task.result()
             except asyncio.CancelledError:
-                outcome = self._outcome(
+                outcome = self._interrupted_outcome(
+                    usage,
                     DelegationStatus.FAILED,
                     normalized_objective,
                     before_calls,
                     before_tokens,
                     error="delegation executor cancelled itself",
-                    executor_invoked=True,
-                    token_accounting_known=False,
                 )
             except Exception as exception:
-                outcome = self._outcome(
+                outcome = self._interrupted_outcome(
+                    usage,
                     DelegationStatus.FAILED,
                     normalized_objective,
                     before_calls,
@@ -468,19 +519,16 @@ class DelegationTool:
                         "delegation executor raised "
                         f"{type(exception).__name__}: {_safe_str(exception)}"
                     ),
-                    executor_invoked=True,
-                    token_accounting_known=False,
                 )
             else:
                 if not isinstance(execution, DelegationExecutionResult):
-                    outcome = self._outcome(
+                    outcome = self._interrupted_outcome(
+                        usage,
                         DelegationStatus.FAILED,
                         normalized_objective,
                         before_calls,
                         before_tokens,
                         error="delegation executor returned an invalid result",
-                        executor_invoked=True,
-                        token_accounting_known=False,
                     )
                 else:
                     contract_error = _execution_contract_error(execution, request)
@@ -535,6 +583,7 @@ class DelegationTool:
                                 error=effective_error,
                                 executor_invoked=True,
                             )
+        usage.closed = True
         if (
             outcome.output is not None
             and len(outcome.to_observation()) > max_observation_characters
@@ -555,6 +604,7 @@ class DelegationTool:
     ) -> DelegationOutcome:
         """Audit malformed tool arguments without invoking the child executor."""
 
+        self._require_idle()
         before_calls = self._calls_used
         before_tokens = self._tokens_used
         if self._calls_used >= self.config.max_delegations_per_task:
@@ -578,6 +628,28 @@ class DelegationTool:
     def _record(self, outcome: DelegationOutcome) -> DelegationOutcome:
         self._records.append(_record_from_outcome(outcome))
         return outcome
+
+    def _interrupted_outcome(
+        self,
+        usage: _DelegationUsage,
+        status: DelegationStatus,
+        objective: str,
+        calls_before: int,
+        tokens_before: int,
+        error: str,
+    ) -> DelegationOutcome:
+        usage.closed = True
+        self._tokens_used += usage.tokens
+        return self._outcome(
+            status,
+            objective,
+            calls_before,
+            tokens_before,
+            tokens=usage.tokens,
+            error=error,
+            executor_invoked=True,
+            token_accounting_known=False,
+        )
 
     def _retain_cancelled_task(
         self, task: asyncio.Task[DelegationExecutionResult]
@@ -762,13 +834,19 @@ def _decode_state(
     if any(not isinstance(record, Mapping) for record in records):
         raise ValueError("delegation checkpoint record is malformed")
     expected_tokens = 0
+    accounting_incomplete = False
     for index, record in enumerate(records, 1):
         _validate_checkpoint_record(record, index=index, config=config)
+        if accounting_incomplete and record["executor_invoked"]:
+            raise ValueError(
+                "delegation checkpoint executes after incomplete accounting"
+            )
         token_report = record["tokens"]
         assert isinstance(token_report, Mapping)
         if token_report["before"] != expected_tokens:
             raise ValueError("delegation checkpoint token history is inconsistent")
         expected_tokens = token_report["after"]
+        accounting_incomplete |= not token_report["accounting_known"]
     if expected_tokens != tokens:
         raise ValueError("delegation checkpoint token total is inconsistent")
     try:
@@ -843,6 +921,7 @@ def _validate_checkpoint_record(
         not _is_nonnegative_int(before)
         or not _is_nonnegative_int(contributed)
         or not _is_nonnegative_int(after)
+        or contributed > MAX_DELEGATION_ACCOUNTED_TOKENS
         or after != before + contributed
         or after > _MAX_DELEGATION_LEDGER_TOKENS
         or not isinstance(token_report.get("accounting_known"), bool)
@@ -880,8 +959,6 @@ def _validate_checkpoint_record(
         raise ValueError("completed delegation checkpoint record has an error")
     if status is not DelegationStatus.COMPLETED and not isinstance(error, str):
         raise ValueError("incomplete delegation checkpoint record lacks an error")
-    if not token_report["accounting_known"] and contributed != 0:
-        raise ValueError("unknown delegation token accounting cannot contribute tokens")
     output_absent = (
         not output_included and output_sha256 is None and output_characters == 0
     )
@@ -901,12 +978,19 @@ def _validate_checkpoint_record(
             raise ValueError("rejected delegation checkpoint record is inconsistent")
     elif not record["executor_invoked"]:
         raise ValueError("executed delegation checkpoint record lacks invocation")
+    if record["executor_invoked"] and before >= config.max_tokens_per_task:
+        raise ValueError("delegation checkpoint executes after exhausted token budget")
+    if status in {DelegationStatus.COMPLETED, DelegationStatus.STEP_LIMIT} and (
+        contributed
+        > min(config.max_tokens_per_call, config.max_tokens_per_task - before)
+    ):
+        raise ValueError("delegation checkpoint status contradicts its token budget")
     if status is DelegationStatus.COMPLETED and (
         not token_report["accounting_known"] or not output_retained
     ):
         raise ValueError("completed delegation checkpoint record is inconsistent")
     if status is DelegationStatus.TIMED_OUT and (
-        token_report["accounting_known"] or contributed or steps or not output_absent
+        token_report["accounting_known"] or steps or not output_absent
     ):
         raise ValueError("timed-out delegation checkpoint record is inconsistent")
     if status is DelegationStatus.RESULT_TOO_LARGE and (
@@ -919,7 +1003,7 @@ def _validate_checkpoint_record(
         raise ValueError("limited delegation checkpoint record is inconsistent")
     if status is DelegationStatus.FAILED:
         known = token_report["accounting_known"]
-        if (not known and (contributed or steps or not output_absent)) or (
+        if (not known and (steps or not output_absent)) or (
             known and not (output_absent or output_retained)
         ):
             raise ValueError("failed delegation checkpoint record is inconsistent")
