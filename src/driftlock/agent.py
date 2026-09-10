@@ -2620,7 +2620,14 @@ def _json_safe(value: object) -> Any:
     try:
         return _json_copy(value)
     except (TypeError, ValueError):
+        return _safe_repr(value)
+
+
+def _safe_repr(value: object) -> str:
+    try:
         return repr(value)
+    except Exception:
+        return f"<{type(value).__name__} with unavailable representation>"
 
 
 def _render_agent_plan(plan: AgentPlan | None) -> str:
@@ -2718,7 +2725,7 @@ def _delegation_tool_audit(call: ToolCall, result: Mapping[str, Any]) -> dict[st
 
 def _delegation_audit_arguments(value: object) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        rendered = repr(value)
+        rendered = _safe_repr(value)
         return {
             "argument_type": type(value).__name__,
             "sha256": hashlib.sha256(
@@ -2743,7 +2750,7 @@ def _delegation_audit_arguments(value: object) -> dict[str, Any]:
 
 def _memory_audit_arguments(value: object) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        rendered = repr(value)
+        rendered = _safe_repr(value)
         return {
             "argument_type": type(value).__name__,
             "sha256": hashlib.sha256(
@@ -2758,7 +2765,7 @@ def _memory_audit_arguments(value: object) -> dict[str, Any]:
     }:
         result["operation"] = operation
     elif operation is not None:
-        rendered = operation if isinstance(operation, str) else repr(operation)
+        rendered = operation if isinstance(operation, str) else _safe_repr(operation)
         result["operation"] = {
             "sha256": hashlib.sha256(
                 rendered.encode("utf-8", errors="surrogatepass")
@@ -2775,7 +2782,7 @@ def _memory_audit_arguments(value: object) -> dict[str, Any]:
     ):
         result["memory_id"] = memory_id
     elif memory_id is not None:
-        rendered = memory_id if isinstance(memory_id, str) else repr(memory_id)
+        rendered = memory_id if isinstance(memory_id, str) else _safe_repr(memory_id)
         result["memory_id"] = {
             "sha256": hashlib.sha256(
                 rendered.encode("utf-8", errors="surrogatepass")
@@ -2787,7 +2794,7 @@ def _memory_audit_arguments(value: object) -> dict[str, Any]:
         candidate = value.get(name)
         if candidate is None:
             continue
-        rendered = candidate if isinstance(candidate, str) else repr(candidate)
+        rendered = candidate if isinstance(candidate, str) else _safe_repr(candidate)
         result[name] = {
             "sha256": hashlib.sha256(
                 rendered.encode("utf-8", errors="surrogatepass")

@@ -203,6 +203,38 @@ async def test_delegation_enforces_cumulative_child_token_quota() -> None:
     assert tool.tokens_used == 10
 
 
+async def test_concurrent_delegate_calls_serialize_shared_quota_and_checkpoint() -> (
+    None
+):
+    calls = 0
+
+    async def yielding_executor(_: DelegationRequest) -> DelegationExecutionResult:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return _result(tokens=1)
+
+    tool = DelegationTool(
+        yielding_executor,
+        config=DelegationConfig(
+            max_delegations_per_task=2,
+            max_tokens_per_call=1,
+            max_tokens_per_task=1,
+        ),
+    )
+
+    first, second = await asyncio.gather(_delegate(tool), _delegate(tool))
+
+    assert first.status is DelegationStatus.COMPLETED
+    assert second.status is DelegationStatus.REJECTED
+    assert calls == 1
+    assert tool.tokens_used == 1
+    checkpoint = tool.checkpoint_state()
+    restored = DelegationTool(RecordingExecutor(_result()), config=tool.config)
+    restored.restore_checkpoint_state(checkpoint)
+    assert restored.checkpoint_state() == checkpoint
+
+
 @pytest.mark.parametrize(
     ("result", "status", "known", "contributed"),
     [
@@ -690,6 +722,42 @@ async def test_malformed_delegate_call_is_structured_and_never_invokes_executor(
 
     report = outcome.tool_audits[0]["result"]
     assert report["status"] == "rejected"
+    assert delegation.calls_used == 1
+    assert executor.requests == []
+
+
+async def test_malformed_delegate_arguments_with_broken_repr_are_contained(
+    tmp_path: Path,
+) -> None:
+    class BrokenRepresentation:
+        def __repr__(self) -> str:
+            raise RuntimeError("representation failed")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        AgentCompletion(
+            tool_calls=(
+                ToolCall("delegate_task", BrokenRepresentation(), "bad-delegate"),
+            )
+        )
+    )
+    executor = RecordingExecutor(_result())
+    delegation = DelegationTool(executor)
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        delegation_tool=delegation,
+    )
+
+    outcome = await agent(_context(agent.initial_state()))
+
+    assert outcome.completed is False
+    assert outcome.tool_audits[0]["result"]["status"] == "rejected"
+    assert outcome.tool_audits[0]["tool_call"]["arguments"]["argument_type"] == (
+        "BrokenRepresentation"
+    )
     assert delegation.calls_used == 1
     assert executor.requests == []
 

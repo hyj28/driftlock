@@ -269,6 +269,7 @@ class DelegationTool:
         self._tokens_used = 0
         self._records: list[dict[str, Any]] = []
         self._cancelled_tasks: set[asyncio.Task[DelegationExecutionResult]] = set()
+        self._delegate_lock = asyncio.Lock()
 
     @property
     def calls_used(self) -> int:
@@ -302,6 +303,33 @@ class DelegationTool:
         _decode_state(value, self.config)
 
     async def delegate(
+        self,
+        objective: object,
+        context: object,
+        *,
+        parent_goal: str,
+        sequence: int,
+        logical_step: int,
+        attempt: int,
+        parent_tokens_remaining: int | None,
+        max_observation_characters: int,
+    ) -> DelegationOutcome:
+        # One ledger represents one sequential task. Serialize public callers so
+        # admission, execution accounting, and the appended audit record remain
+        # one atomic transition even if a host accidentally submits concurrently.
+        async with self._delegate_lock:
+            return await self._delegate_serialized(
+                objective,
+                context,
+                parent_goal=parent_goal,
+                sequence=sequence,
+                logical_step=logical_step,
+                attempt=attempt,
+                parent_tokens_remaining=parent_tokens_remaining,
+                max_observation_characters=max_observation_characters,
+            )
+
+    async def _delegate_serialized(
         self,
         objective: object,
         context: object,
