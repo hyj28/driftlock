@@ -6,7 +6,7 @@
 >
 > The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
 > retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (747 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> (994 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
@@ -33,12 +33,12 @@ own runs; the rest is what any capable agent needs.
 | Skill distillation, retrieval, injection | done |
 | Paired validation + admission with a measured noise floor | done |
 | Resumable runs, bounded retries, degraded-observation reporting | done |
-| **Agentic RAG** — retrieval as a tool the agent invokes from live context, over code *and* skills | **next** |
-| Context compaction | planned |
-| Planning / task decomposition | planned |
-| Persistent memory across tasks | planned |
-| Subagents and delegation | planned |
-| MCP client support | planned |
+| **Agentic RAG** — retrieval as a tool the agent invokes from live context, over code *and* skills | done |
+| Context compaction | done |
+| Planning / task decomposition | done |
+| Persistent memory across tasks | done |
+| Subagents and bounded sequential delegation | done |
+| **MCP client support** | **next** |
 | Parallel tool calls | planned |
 | Prompt-cache management | planned |
 | Output self-verification | planned |
@@ -74,11 +74,25 @@ them is *undo*.
 | write | Rollback-grounded skill distillation into a persistent library |
 | select | Embedding retrieval over skill activation conditions, plus a router |
 | compress | Context editing at checkpoint boundaries |
-| isolate | Read-only subagents that read, grep, and test but never write, returning condensed summaries |
+| isolate | Fresh bounded subagents with their own conversation, shared workspace tools, and no recursive delegation |
 | **undo** | **Checkpoint + progress-aware rollback** |
 
-Because subagents have no filesystem side effects, rollback semantics are unaffected
-by them: there is nothing in flight to undo.
+Delegation runs sequentially, so child filesystem changes are observed as part of the
+parent step. Rollback restores those changes together with the checkpointed delegation
+quota; already billed child tokens remain counted.
+
+Checkpoint and restore calls require an idle delegation tool; wait for completion
+or cancellation first. Interrupted calls retain provider-reported tokens as a
+known minimum (`accounting_known=false` means the total may be higher). Further
+delegation is paused on that ledger because the remaining budget is uncertain.
+Custom executors must cooperate with cancellation; a deadline bounds the parent's
+wait, and cannot force arbitrary executor code to stop.
+
+`LocalEnvironment` runs trusted local commands and provides best-effort process
+cleanup, not a security sandbox. A detached program that replaces its inherited
+environment can outlive a command or delegation deadline. For strict process
+lifetime and filesystem isolation, supply a host-managed isolated environment;
+do not rely on local timeout cleanup to contain untrusted shell programs.
 
 ## The approach
 
