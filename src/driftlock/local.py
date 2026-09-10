@@ -8,6 +8,7 @@ import ctypes
 import difflib
 import hashlib
 import os
+import secrets
 import shutil
 import signal
 import struct
@@ -19,6 +20,7 @@ from pathlib import Path
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
 
 _PROCESS_CLEANUP_TIMEOUT_SEC = 1.0
+_PROCESS_OWNER_ENV = "DRIFTLOCK_PROCESS_OWNER"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +98,8 @@ class LocalEnvironment:
     async def _exec_process(
         self, command: str, timeout: int, environment: dict[str, str]
     ) -> LocalExecResult:
-        baseline_processes = frozenset(pid for pid, _ in _process_parent_pairs())
+        owner_token = secrets.token_hex(32)
+        environment = {**environment, _PROCESS_OWNER_ENV: owner_token}
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=self.root,
@@ -118,19 +121,20 @@ class LocalEnvironment:
         try:
             await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
             return_code = process.returncode if process.returncode is not None else 1
+            await asyncio.to_thread(
+                _terminate_owned_processes, process.pid, owner_token
+            )
         except asyncio.CancelledError:
             # Delegation and other outer deadlines may cancel this coroutine
             # before its own command timeout. Stop the group before enumerating
             # descendants, closing the race where a process forks and detaches
             # between the snapshot and the kill.
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGSTOP)
-            descendants = await asyncio.to_thread(_descendant_process_ids, process.pid)
-            workspace_processes = await asyncio.to_thread(
-                _new_workspace_process_ids, self.root, baseline_processes
+            await asyncio.to_thread(
+                _terminate_owned_processes, process.pid, owner_token
             )
-            _kill_processes(tuple(dict.fromkeys((*descendants, *workspace_processes))))
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGKILL)
             _close_process_pipes(process)
             stdout_task.cancel()
@@ -148,17 +152,15 @@ class LocalEnvironment:
             timed_out = True
             known_return_code = process.returncode
             process_group_terminated = False
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGSTOP)
-            descendants = await asyncio.to_thread(_descendant_process_ids, process.pid)
-            workspace_processes = await asyncio.to_thread(
-                _new_workspace_process_ids, self.root, baseline_processes
+            await asyncio.to_thread(
+                _terminate_owned_processes, process.pid, owner_token
             )
-            _kill_processes(tuple(dict.fromkeys((*descendants, *workspace_processes))))
             try:
                 os.killpg(process.pid, signal.SIGKILL)
                 process_group_terminated = True
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             _close_process_pipes(process)
             stdout_task.cancel()
@@ -355,51 +357,74 @@ def _kill_processes(process_ids: tuple[int, ...]) -> None:
             os.kill(pid, signal.SIGKILL)
 
 
-def _new_workspace_process_ids(
-    workspace: Path, baseline: frozenset[int]
-) -> tuple[int, ...]:
-    current = {pid for pid, _parent in _process_parent_pairs()}
-    candidates = current - baseline - {os.getpid()}
+def _terminate_owned_processes(root_pid: int, owner_token: str) -> None:
+    owned = tuple(
+        dict.fromkeys(
+            (*_descendant_process_ids(root_pid), *_tagged_process_ids(owner_token))
+        )
+    )
+    for pid in owned:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGSTOP)
+    # Stopping the first snapshot closes the normal fork race. Re-scan once so
+    # children created immediately before their parent stopped are also owned.
+    owned = tuple(
+        dict.fromkeys(
+            (
+                *owned,
+                *_descendant_process_ids(root_pid),
+                *_tagged_process_ids(owner_token),
+            )
+        )
+    )
+    _kill_processes(tuple(reversed(owned)))
+
+
+def _tagged_process_ids(owner_token: str) -> tuple[int, ...]:
+    marker = f"{_PROCESS_OWNER_ENV}={owner_token}".encode() + b"\0"
     if sys.platform == "darwin":
-        return _darwin_workspace_process_ids(candidates, workspace)
+        return _darwin_tagged_process_ids(marker)
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return ()
     result: list[int] = []
-    for pid in candidates:
+    for environment_path in proc.glob("[0-9]*/environ"):
         try:
-            cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
-        except (OSError, RuntimeError):
+            pid = int(environment_path.parent.name)
+            environment = environment_path.read_bytes()
+        except (OSError, ValueError):
             continue
-        if cwd == workspace or cwd.is_relative_to(workspace):
+        if pid != os.getpid() and marker in environment + b"\0":
             result.append(pid)
     return tuple(result)
 
 
-def _darwin_workspace_process_ids(
-    candidates: set[int], workspace: Path
-) -> tuple[int, ...]:
+def _darwin_tagged_process_ids(marker: bytes) -> tuple[int, ...]:
     try:
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
-        libproc.proc_pidinfo.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint,
             ctypes.c_void_p,
-            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
         ]
-        libproc.proc_pidinfo.restype = ctypes.c_int
+        libc.sysctl.restype = ctypes.c_int
     except (AttributeError, OSError):
         return ()
-    root = os.fsencode(workspace.resolve())
     result: list[int] = []
-    for pid in candidates:
-        info = ctypes.create_string_buffer(4096)
-        try:
-            copied = libproc.proc_pidinfo(pid, 9, 0, info, len(info))
-        except (OSError, ValueError):
+    for pid, _parent in _process_parent_pairs():
+        if pid == os.getpid():
             continue
-        if copied <= 0:
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
             continue
-        paths = info.raw[:copied].split(b"\0")
-        if any(path == root or path.startswith(root + b"/") for path in paths):
+        info = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, info, ctypes.byref(size), None, 0) != 0:
+            continue
+        if marker in info.raw[: size.value] + b"\0":
             result.append(pid)
     return tuple(result)
 

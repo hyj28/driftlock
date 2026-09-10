@@ -457,6 +457,31 @@ async def test_checkpoint_retains_output_evidence_and_rejects_impossible_flags()
         tool.restore_checkpoint_state(impossible)
 
 
+async def test_checkpoint_rejects_impossible_status_evidence_combinations() -> None:
+    limited = DelegationTool(
+        RecordingExecutor(_result(tokens=10)),
+        config=DelegationConfig(max_tokens_per_call=5, max_tokens_per_task=5),
+    )
+    await _delegate(limited)
+    unknown_limit = limited.checkpoint_state()
+    token_report = unknown_limit["records"][0]["tokens"]
+    token_report["accounting_known"] = False
+    token_report["contributed"] = 0
+    token_report["after"] = token_report["before"]
+    unknown_limit["tokens_used"] = 0
+    with pytest.raises(ValueError, match="limited delegation"):
+        limited.restore_checkpoint_state(unknown_limit)
+
+    rejected = DelegationTool(RecordingExecutor(_result()))
+    rejected.record_rejected_attempt("objective", "bad request")
+    retained_rejection = rejected.checkpoint_state()
+    retained_rejection["records"][0]["output"].update(
+        {"included": True, "character_count": 999}
+    )
+    with pytest.raises(ValueError, match="rejected delegation"):
+        rejected.restore_checkpoint_state(retained_rejection)
+
+
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 0, -1])
 def test_delegation_config_rejects_non_finite_or_non_positive_timeout(
     timeout: float,

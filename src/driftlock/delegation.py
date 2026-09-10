@@ -854,33 +854,47 @@ def _validate_checkpoint_record(
         raise ValueError("incomplete delegation checkpoint record lacks an error")
     if not token_report["accounting_known"] and contributed != 0:
         raise ValueError("unknown delegation token accounting cannot contribute tokens")
+    output_absent = (
+        not output_included and output_sha256 is None and output_characters == 0
+    )
+    output_retained = (
+        output_included
+        and output_sha256 is not None
+        and output_characters <= config.max_result_characters
+    )
     if status is DelegationStatus.REJECTED:
         if (
             record["executor_invoked"]
+            or not token_report["accounting_known"]
             or contributed
             or steps
-            or output_sha256 is not None
+            or not output_absent
         ):
             raise ValueError("rejected delegation checkpoint record is inconsistent")
     elif not record["executor_invoked"]:
         raise ValueError("executed delegation checkpoint record lacks invocation")
     if status is DelegationStatus.COMPLETED and (
-        not token_report["accounting_known"]
-        or not output_included
-        or output_sha256 is None
+        not token_report["accounting_known"] or not output_retained
     ):
         raise ValueError("completed delegation checkpoint record is inconsistent")
     if status is DelegationStatus.TIMED_OUT and (
-        token_report["accounting_known"]
-        or contributed
-        or steps
-        or output_sha256 is not None
+        token_report["accounting_known"] or contributed or steps or not output_absent
     ):
         raise ValueError("timed-out delegation checkpoint record is inconsistent")
     if status is DelegationStatus.RESULT_TOO_LARGE and (
-        output_included or output_sha256 is None
+        not token_report["accounting_known"] or output_included or output_sha256 is None
     ):
         raise ValueError("oversized delegation checkpoint record is inconsistent")
+    if status in {DelegationStatus.STEP_LIMIT, DelegationStatus.TOKEN_LIMIT} and (
+        not token_report["accounting_known"] or not output_retained
+    ):
+        raise ValueError("limited delegation checkpoint record is inconsistent")
+    if status is DelegationStatus.FAILED:
+        known = token_report["accounting_known"]
+        if (not known and (contributed or steps or not output_absent)) or (
+            known and not (output_absent or output_retained)
+        ):
+            raise ValueError("failed delegation checkpoint record is inconsistent")
     if status is not DelegationStatus.REJECTED and (
         objective["character_count"] > config.max_objective_characters
     ):
