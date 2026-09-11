@@ -6,7 +6,7 @@
 >
 > The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
 > retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (747 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> (1054 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
@@ -33,14 +33,15 @@ own runs; the rest is what any capable agent needs.
 | Skill distillation, retrieval, injection | done |
 | Paired validation + admission with a measured noise floor | done |
 | Resumable runs, bounded retries, degraded-observation reporting | done |
-| **Agentic RAG** — retrieval as a tool the agent invokes from live context, over code *and* skills | **next** |
-| Context compaction | planned |
-| Planning / task decomposition | planned |
-| Persistent memory across tasks | planned |
-| Subagents and delegation | planned |
-| MCP client support | planned |
-| Parallel tool calls | planned |
-| Prompt-cache management | planned |
+| **Agentic RAG** — retrieval as a tool the agent invokes from live context, over code *and* skills | done |
+| Context compaction | done |
+| Planning / task decomposition | done |
+| Persistent memory across tasks | done |
+| Subagents and bounded sequential delegation | done |
+| MCP client support — stdio tool discovery and invocation | done |
+| Bounded opt-in parallel workspace reads | done |
+| MCP Streamable HTTP and authorization | planned |
+| **Prompt-cache management** | **next** |
 | Output self-verification | planned |
 
 The optional `driftlock.st_embedder` module pins the real MiniLM model; installing `sentence-transformers` project-locally enables its integration test without changing retrieval's injected interface.
@@ -74,11 +75,25 @@ them is *undo*.
 | write | Rollback-grounded skill distillation into a persistent library |
 | select | Embedding retrieval over skill activation conditions, plus a router |
 | compress | Context editing at checkpoint boundaries |
-| isolate | Read-only subagents that read, grep, and test but never write, returning condensed summaries |
+| isolate | Fresh bounded subagents with their own conversation, shared workspace tools, and no recursive delegation |
 | **undo** | **Checkpoint + progress-aware rollback** |
 
-Because subagents have no filesystem side effects, rollback semantics are unaffected
-by them: there is nothing in flight to undo.
+Delegation runs sequentially, so child filesystem changes are observed as part of the
+parent step. Rollback restores those changes together with the checkpointed delegation
+quota; already billed child tokens remain counted.
+
+Checkpoint and restore calls require an idle delegation tool; wait for completion
+or cancellation first. Interrupted calls retain provider-reported tokens as a
+known minimum (`accounting_known=false` means the total may be higher). Further
+delegation is paused on that ledger because the remaining budget is uncertain.
+Custom executors must cooperate with cancellation; a deadline bounds the parent's
+wait, and cannot force arbitrary executor code to stop.
+
+`LocalEnvironment` runs trusted local commands and provides best-effort process
+cleanup, not a security sandbox. A detached program that replaces its inherited
+environment can outlive a command or delegation deadline. For strict process
+lifetime and filesystem isolation, supply a host-managed isolated environment;
+do not rely on local timeout cleanup to contain untrusted shell programs.
 
 ## The approach
 
@@ -260,6 +275,84 @@ Periodic snapshots are retained across detector windows. When drift is confirmed
 the runner selects the newest checkpoint from before the earliest triggered signal
 window, avoiding a superficially recent snapshot that already contains the loop,
 stall, or error spike.
+
+### Parallel workspace reads
+
+Set `parallel_tool_calls=True` on `ToolCallingAgent` to overlap contiguous
+`read_file` and `search_files` calls in one provider response:
+
+```python
+agent = ToolCallingAgent(
+    environment,
+    observer,
+    async_completion_function,
+    parallel_tool_calls=True,
+)
+```
+
+All other tools are serial barriers, including shell commands, writes, completion,
+planning, memory, retrieval, delegation, and MCP. Results, errors, history, and
+audits retain the provider's call order. The existing `max_tool_calls_per_step`
+limits both total calls and concurrency; the defaults remain 4 calls and 96,000
+history characters. Truncated responses and responses above the call limit execute
+no tools. Enabled read failure details are truncated to `max_tool_output_chars`.
+Cancellation cancels and joins launched reads before propagating, without starting
+later barriers.
+
+The default is `False`, preserving serial execution and existing provider requests.
+Opted-in environments must tolerate concurrent read `exec` requests;
+`LocalEnvironment` supports this. Delegated children do not inherit this option.
+
+### MCP tools over stdio
+
+The optional MCP client connects to explicitly configured local servers. It supports
+the [MCP stdio lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+and [tool discovery/calls](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+for protocol versions `2025-11-25` and `2025-06-18`. No additional dependencies are
+required. HTTP, resources, prompts, sampling, and authorization flows are not
+implemented in this version.
+
+```python
+import sys
+from driftlock import MCPClient, MCPServerConfig, ToolCallingAgent
+
+config = MCPServerConfig(
+    name="project",
+    command=(sys.executable, "/path/to/mcp_server.py"),
+    allowed_tools=frozenset({"lookup"}),
+)
+async with MCPClient(config) as client:
+    agent = ToolCallingAgent(
+        environment,
+        observer,
+        async_completion_function,
+        mcp_clients=(client,),
+    )
+    result = await runner.run(
+        goal="Look up the project settings",
+        step=agent,
+        initial_state=agent.initial_state(),
+    )
+```
+
+The host owns server lifecycle and authorizes native tool names through the required
+allowlist; an empty allowlist exposes no tools. Names advertised to the model are
+namespaced per server. Tools and schemas are snapshotted at connection time; create
+a new client/agent to adopt a changed catalog. Up to 8 servers and 64 total external
+tools can be attached to one agent. `MCPLimits` bounds requests, responses, discovery,
+results and shutdown. MCP results use the existing per-step call and conversation
+limits. Oversized results become explicit tool errors, not truncated successes.
+
+Client failures and server `isError` results are auditable tool errors. Failed or
+timed-out transport sessions are closed; potentially mutating calls are never retried
+automatically. The parent model's token usage remains separate from server work.
+External tool effects and connections are not checkpoint resources: restoring a
+workspace or conversation does not undo an external action. Choose read-only tools
+or tools with suitable idempotency when using rollback. Server text is untrusted
+data, and configured server programs run with the host's local permissions. Explicit
+environment overrides belong in `MCPServerConfig.env`; the client does not copy the
+host's whole environment. With `mcp_clients=()` the legacy request and checkpoint
+schema are unchanged. Delegated children do not inherit MCP capabilities implicitly.
 
 ### Remote and Harbor environments
 

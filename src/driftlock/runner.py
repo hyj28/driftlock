@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from inspect import isawaitable
 from typing import Any
 
 from driftlock.checkpoints import CheckpointStore
@@ -257,6 +258,7 @@ class DriftlockRunner:
                     else:
                         checkpoint = rollback_checkpoint
                         state = await self._restore_checkpoint(checkpoint)
+                        await _restore_step_checkpoint_state(step, state)
                         coarse_triggers.append(
                             self._trigger_record(
                                 record,
@@ -586,3 +588,16 @@ def _bounded_tool_observations(steps: tuple[StepRecord, ...]) -> tuple[str, ...]
             break
     selected.reverse()
     return tuple(selected)
+
+
+async def _restore_step_checkpoint_state(
+    step: StepFunction, state: Mapping[str, Any]
+) -> None:
+    """Let stateful step implementations restore resources outside the workspace."""
+
+    restore = getattr(step, "restore_checkpoint_state", None)
+    if restore is None:
+        return
+    result = restore(state)
+    if isawaitable(result):
+        await result

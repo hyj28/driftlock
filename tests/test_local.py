@@ -37,6 +37,106 @@ async def test_local_environment_times_out_endless_output(tmp_path: Path) -> Non
     assert "command timed out after 1 seconds" in result.stderr
 
 
+async def test_outer_cancellation_kills_command_before_late_workspace_write(
+    tmp_path: Path,
+) -> None:
+    environment = LocalEnvironment(tmp_path)
+    script = """\
+import os
+import pathlib
+import time
+
+child = os.fork()
+if child == 0:
+    os.setsid()
+    grandchild = os.fork()
+    if grandchild == 0:
+        pathlib.Path("detached.pid").write_text(str(os.getpid()), encoding="utf-8")
+        time.sleep(0.3)
+        pathlib.Path("late.txt").write_text("escaped timeout", encoding="utf-8")
+    else:
+        os._exit(0)
+else:
+    time.sleep(30)
+"""
+    pid_path = tmp_path / "detached.pid"
+
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await environment.exec(f"python3 -c {shlex.quote(script)}")
+        await asyncio.sleep(0.4)
+    finally:
+        if pid_path.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+
+    assert not (tmp_path / "late.txt").exists()
+
+
+async def test_successful_command_cleans_double_fork_after_chdir_and_closed_pipes(
+    tmp_path: Path,
+) -> None:
+    late_path = tmp_path / "late.txt"
+    pid_path = tmp_path / "detached.pid"
+    script = f"""\
+import os
+import pathlib
+import time
+
+child = os.fork()
+if child == 0:
+    os.setsid()
+    grandchild = os.fork()
+    if grandchild == 0:
+        pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding="utf-8")
+        os.chdir("/tmp")
+        descriptor = os.open("/dev/null", os.O_RDWR)
+        for target in (0, 1, 2):
+            os.dup2(descriptor, target)
+        time.sleep(0.3)
+        pathlib.Path({str(late_path)!r}).write_text("late mutation", encoding="utf-8")
+    else:
+        os._exit(0)
+else:
+    os._exit(0)
+"""
+    environment = LocalEnvironment(tmp_path)
+
+    try:
+        result = await environment.exec(f"python3 -c {shlex.quote(script)}")
+        await asyncio.sleep(0.4)
+    finally:
+        if pid_path.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+
+    assert result.return_code == 0
+    assert not late_path.exists()
+
+
+async def test_cancellation_preserves_unrelated_process_in_same_workspace(
+    tmp_path: Path,
+) -> None:
+    environment = LocalEnvironment(tmp_path)
+    managed = asyncio.create_task(environment.exec("sleep 30"))
+    await asyncio.sleep(0.05)
+    unrelated = await asyncio.create_subprocess_exec(
+        "sleep", "30", cwd=tmp_path, start_new_session=True
+    )
+
+    try:
+        managed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await managed
+        await asyncio.sleep(0.05)
+        assert unrelated.returncode is None
+    finally:
+        if unrelated.returncode is None:
+            unrelated.terminate()
+        await unrelated.wait()
+
+
 async def test_local_environment_preserves_exit_of_pipe_holding_child(
     tmp_path: Path,
 ) -> None:
