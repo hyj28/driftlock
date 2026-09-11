@@ -6,7 +6,7 @@
 >
 > The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
 > retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (994 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> (1025 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
@@ -38,8 +38,9 @@ own runs; the rest is what any capable agent needs.
 | Planning / task decomposition | done |
 | Persistent memory across tasks | done |
 | Subagents and bounded sequential delegation | done |
-| **MCP client support** | **next** |
-| Parallel tool calls | planned |
+| MCP client support — stdio tool discovery and invocation | done |
+| **Parallel tool calls** | **next** |
+| MCP Streamable HTTP and authorization | planned |
 | Prompt-cache management | planned |
 | Output self-verification | planned |
 
@@ -274,6 +275,57 @@ Periodic snapshots are retained across detector windows. When drift is confirmed
 the runner selects the newest checkpoint from before the earliest triggered signal
 window, avoiding a superficially recent snapshot that already contains the loop,
 stall, or error spike.
+
+### MCP tools over stdio
+
+The optional MCP client connects to explicitly configured local servers. It supports
+the [MCP stdio lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+and [tool discovery/calls](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+for protocol versions `2025-11-25` and `2025-06-18`. No additional dependencies are
+required. HTTP, resources, prompts, sampling, and authorization flows are not
+implemented in this version.
+
+```python
+import sys
+from driftlock import MCPClient, MCPServerConfig, ToolCallingAgent
+
+config = MCPServerConfig(
+    name="project",
+    command=(sys.executable, "/path/to/mcp_server.py"),
+    allowed_tools=frozenset({"lookup"}),
+)
+async with MCPClient(config) as client:
+    agent = ToolCallingAgent(
+        environment,
+        observer,
+        async_completion_function,
+        mcp_clients=(client,),
+    )
+    result = await runner.run(
+        goal="Look up the project settings",
+        step=agent,
+        initial_state=agent.initial_state(),
+    )
+```
+
+The host owns server lifecycle and authorizes native tool names through the required
+allowlist; an empty allowlist exposes no tools. Names advertised to the model are
+namespaced per server. Tools and schemas are snapshotted at connection time; create
+a new client/agent to adopt a changed catalog. Up to 8 servers and 64 total external
+tools can be attached to one agent. `MCPLimits` bounds requests, responses, discovery,
+results and shutdown. MCP results use the existing per-step call and conversation
+limits. Oversized results become explicit tool errors, not truncated successes.
+
+Client failures and server `isError` results are auditable tool errors. Failed or
+timed-out transport sessions are closed; potentially mutating calls are never retried
+automatically. The parent model's token usage remains separate from server work.
+External tool effects and connections are not checkpoint resources: restoring a
+workspace or conversation does not undo an external action. Choose read-only tools
+or tools with suitable idempotency when using rollback. Server text is untrusted
+data, and configured server programs run with the host's local permissions. Explicit
+environment overrides belong in `MCPServerConfig.env`; the client does not copy the
+host's whole environment. With `mcp_clients=()` the legacy request and checkpoint
+schema are unchanged. Delegated children do not inherit MCP capabilities implicitly.
 
 ### Remote and Harbor environments
 
