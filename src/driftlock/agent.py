@@ -691,6 +691,9 @@ class ToolCallingAgent:
     Configured memory and delegation policies add ``manage_memory`` and
     ``delegate_task`` respectively without changing the legacy provider request
     when both are absent.
+    ``parallel_tool_calls=True`` overlaps contiguous ``read_file`` and
+    ``search_files`` calls only. All other tools are serial barriers. Opted-in
+    environments must support concurrent read ``exec`` requests.
     """
 
     def __init__(
@@ -715,6 +718,7 @@ class ToolCallingAgent:
         delegation_tool: DelegationTool | None = None,
         mcp_clients: Sequence[MCPClient] = (),
         planning: bool = False,
+        parallel_tool_calls: bool = False,
     ) -> None:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -744,6 +748,8 @@ class ToolCallingAgent:
             raise ValueError("shell_timeout_sec must be positive")
         if not isinstance(planning, bool):
             raise TypeError("planning must be a boolean")
+        if not isinstance(parallel_tool_calls, bool):
+            raise TypeError("parallel_tool_calls must be a boolean")
         if delegation_tool is not None and not isinstance(
             delegation_tool, DelegationTool
         ):
@@ -774,6 +780,7 @@ class ToolCallingAgent:
         self._prefill_estimator = prefill_estimator
         self.max_tool_output_chars = max_tool_output_chars
         self.max_tool_calls_per_step = max_tool_calls_per_step
+        self.parallel_tool_calls = parallel_tool_calls
         self.max_history_characters = max_history_characters
         self.shell_timeout_sec = shell_timeout_sec
         self.codec = codec or AgentConversationCodec()
@@ -1031,7 +1038,20 @@ class ToolCallingAgent:
             )
             history.append({"role": "user", "content": f"ERROR: {error}"})
         else:
-            for call in completion.tool_calls:
+            next_call = 0
+            while next_call < len(completion.tool_calls):
+                batch_end = next_call + 1
+                if self.parallel_tool_calls and completion.tool_calls[
+                    next_call
+                ].name in {"read_file", "search_files"}:
+                    while batch_end < len(
+                        completion.tool_calls
+                    ) and completion.tool_calls[batch_end].name in {
+                        "read_file",
+                        "search_files",
+                    }:
+                        batch_end += 1
+                batch = completion.tool_calls[next_call:batch_end]
                 delegation_tokens_remaining = (
                     None
                     if context.tokens_remaining is None
@@ -1042,21 +1062,39 @@ class ToolCallingAgent:
                         - sum(item.tokens for item in observations),
                     )
                 )
-                observation, plan = await self._execute_tool(
-                    call,
+                results = await self._execute_tool_batch(
+                    batch,
                     workspace,
                     plan=plan,
                     context=context,
                     completed_steps=completed_steps,
                     delegation_tokens_remaining=delegation_tokens_remaining,
                 )
-                observations.append(observation)
-                history.append(_observation_message(observation))
-                if observation.error:
-                    errors.append(observation.error)
-                if observation.completed:
-                    completed = True
-                    summary = observation.summary
+                for observation, updated_plan in results:
+                    plan = updated_plan
+                    if self.parallel_tool_calls and observation.call.name in {
+                        "read_file",
+                        "search_files",
+                    }:
+                        observation = replace(
+                            observation,
+                            content=_truncate(
+                                observation.content, self.max_tool_output_chars
+                            ),
+                            error=(
+                                _truncate(observation.error, self.max_tool_output_chars)
+                                if observation.error is not None
+                                else None
+                            ),
+                        )
+                    observations.append(observation)
+                    history.append(_observation_message(observation))
+                    if observation.error:
+                        errors.append(observation.error)
+                    if observation.completed:
+                        completed = True
+                        summary = observation.summary
+                next_call = batch_end
             if not completion.tool_calls:
                 correction = (
                     "No tool call or completion signal was emitted. Continue with a "
@@ -1238,6 +1276,52 @@ class ToolCallingAgent:
             return self.observer.compare(before, after), None
         except Exception as error:
             return WorkspaceDelta(), f"Workspace delta observation failed: {error}"
+
+    async def _execute_tool_batch(
+        self,
+        calls: tuple[ToolCall, ...],
+        workspace: str,
+        *,
+        plan: AgentPlan | None,
+        context: StepContext,
+        completed_steps: int,
+        delegation_tokens_remaining: int | None,
+    ) -> list[tuple[_ToolObservation, AgentPlan | None]]:
+        """Execute one serial call or a bounded contiguous group of reads."""
+        if len(calls) == 1:
+            return [
+                await self._execute_tool(
+                    calls[0],
+                    workspace,
+                    plan=plan,
+                    context=context,
+                    completed_steps=completed_steps,
+                    delegation_tokens_remaining=delegation_tokens_remaining,
+                )
+            ]
+        tasks = [
+            asyncio.create_task(
+                self._execute_tool(
+                    call,
+                    workspace,
+                    plan=plan,
+                    context=context,
+                    completed_steps=completed_steps,
+                    delegation_tokens_remaining=delegation_tokens_remaining,
+                )
+            )
+            for call in calls
+        ]
+        try:
+            # gather preserves input order even when later reads finish first.
+            return await asyncio.gather(*tasks)
+        finally:
+            # Do not leave workspace reads running past cancellation or start a
+            # subsequent serial barrier until every launched read has settled.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _execute_tool(
         self,
