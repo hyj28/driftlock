@@ -93,6 +93,7 @@ from driftlock.local import (
     LocalExecResult,
     LocalWorkspaceDeltaObserver,
 )
+from driftlock.mcp import MCPClient, MCPError, MCPLimits, MCPServerConfig, MCPTool
 from driftlock.memory import (
     DEFAULT_MAX_MEMORY_AUDIT_ERROR_CHARACTERS,
     DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS,
@@ -328,6 +329,11 @@ __all__ = [
     "LocalEnvironment",
     "LocalExecResult",
     "LocalWorkspaceDeltaObserver",
+    "MCPClient",
+    "MCPError",
+    "MCPLimits",
+    "MCPServerConfig",
+    "MCPTool",
     "MemoryEntry",
     "MemoryEntryStatus",
     "MemoryEvent",
