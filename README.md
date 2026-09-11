@@ -6,7 +6,7 @@
 >
 > The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
 > retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (1025 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> (1054 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
@@ -39,9 +39,9 @@ own runs; the rest is what any capable agent needs.
 | Persistent memory across tasks | done |
 | Subagents and bounded sequential delegation | done |
 | MCP client support — stdio tool discovery and invocation | done |
-| **Parallel tool calls** | **next** |
+| Bounded opt-in parallel workspace reads | done |
 | MCP Streamable HTTP and authorization | planned |
-| Prompt-cache management | planned |
+| **Prompt-cache management** | **next** |
 | Output self-verification | planned |
 
 The optional `driftlock.st_embedder` module pins the real MiniLM model; installing `sentence-transformers` project-locally enables its integration test without changing retrieval's injected interface.
@@ -275,6 +275,33 @@ Periodic snapshots are retained across detector windows. When drift is confirmed
 the runner selects the newest checkpoint from before the earliest triggered signal
 window, avoiding a superficially recent snapshot that already contains the loop,
 stall, or error spike.
+
+### Parallel workspace reads
+
+Set `parallel_tool_calls=True` on `ToolCallingAgent` to overlap contiguous
+`read_file` and `search_files` calls in one provider response:
+
+```python
+agent = ToolCallingAgent(
+    environment,
+    observer,
+    async_completion_function,
+    parallel_tool_calls=True,
+)
+```
+
+All other tools are serial barriers, including shell commands, writes, completion,
+planning, memory, retrieval, delegation, and MCP. Results, errors, history, and
+audits retain the provider's call order. The existing `max_tool_calls_per_step`
+limits both total calls and concurrency; the defaults remain 4 calls and 96,000
+history characters. Truncated responses and responses above the call limit execute
+no tools. Enabled read failure details are truncated to `max_tool_output_chars`.
+Cancellation cancels and joins launched reads before propagating, without starting
+later barriers.
+
+The default is `False`, preserving serial execution and existing provider requests.
+Opted-in environments must tolerate concurrent read `exec` requests;
+`LocalEnvironment` supports this. Delegated children do not inherit this option.
 
 ### MCP tools over stdio
 
