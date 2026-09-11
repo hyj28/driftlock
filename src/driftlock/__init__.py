@@ -14,6 +14,7 @@ from driftlock.agent import (
     ConversationCompactionAudit,
     ConversationCompactionResult,
     ConversationCompactionStatus,
+    PromptCachingAgentCompletionRequest,
     ToolCall,
     ToolCallingAgent,
     ToolCallingSubagentExecutor,
@@ -154,6 +155,19 @@ from driftlock.planning import (
     PlanUpdateStatus,
     apply_plan_operation,
 )
+from driftlock.prompt_cache import (
+    DEFAULT_MAX_CACHE_SUMMARY_REPORTS,
+    PromptCacheBreakpoint,
+    PromptCacheConfig,
+    PromptCacheInvalidation,
+    PromptCacheObservability,
+    PromptCacheReport,
+    PromptCacheReportError,
+    PromptCacheStatus,
+    PromptCacheSummary,
+    prompt_cache_report,
+    summarize_prompt_cache,
+)
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteCheckpointError
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.skill_admission import (
@@ -226,6 +240,7 @@ __all__ = [
     "DEFAULT_DELEGATION_TIMEOUT_SECONDS",
     "DEFAULT_IGNORED_DIRECTORY_NAMES",
     "DEFAULT_JUDGE_MAX_OUTPUT_TOKENS",
+    "DEFAULT_MAX_CACHE_SUMMARY_REPORTS",
     "DEFAULT_MAX_CHARACTERS_PER_CALL",
     "DEFAULT_MAX_CHARACTERS_PER_TASK",
     "DEFAULT_MAX_DELEGATIONS_PER_TASK",
@@ -353,6 +368,15 @@ __all__ = [
     "PlanStatus",
     "PlanStep",
     "PlanUpdateStatus",
+    "PromptCacheBreakpoint",
+    "PromptCacheConfig",
+    "PromptCacheInvalidation",
+    "PromptCacheObservability",
+    "PromptCacheReport",
+    "PromptCacheReportError",
+    "PromptCacheStatus",
+    "PromptCacheSummary",
+    "PromptCachingAgentCompletionRequest",
     "RemoteArchiveCheckpointStore",
     "RemoteCheckpointError",
     "RetrievalCorpus",
@@ -414,8 +438,10 @@ __all__ = [
     "lhtb_harbor_patch_path",
     "merge_signal_counts",
     "parse_skill",
+    "prompt_cache_report",
     "render_admission_report",
     "retrieve_for_distillation_arms",
     "serialize_skill",
+    "summarize_prompt_cache",
     "validate_skill",
 ]

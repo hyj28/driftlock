@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from driftlock.agentic_retrieval import AgenticRetrievalTool
 from driftlock.delegation import (
@@ -47,6 +47,13 @@ from driftlock.planning import (
     PlanStatus,
     PlanUpdateStatus,
     apply_plan_operation,
+)
+from driftlock.prompt_cache import (
+    PromptCacheBreakpoint,
+    PromptCacheConfig,
+    PromptCacheInvalidation,
+    PromptCacheReportError,
+    prompt_cache_report,
 )
 from driftlock.remote import RemoteEnvironment
 
@@ -207,6 +214,14 @@ _COMPACTION_SUMMARY_PREFIX = (
     "Earlier activity summary:\n"
 )
 
+# This private marker identifies append-only plan snapshots in checkpoint state;
+# providers see only the ordinary user message so their schemas remain untouched.
+_PROMPT_CACHE_PLAN_SNAPSHOT_KEY = "driftlock_prompt_cache_plan_snapshot"
+
+# The marker is versioned independently because archived cache-enabled state may
+# outlive the exact metadata used to recognize locally generated plan messages.
+_PROMPT_CACHE_PLAN_SNAPSHOT_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
@@ -231,6 +246,8 @@ class AgentCompletion:
     tool_calls: tuple[ToolCall, ...] = ()
     tokens: int = 0
     truncated: bool = False
+    prompt_tokens: int | None = None
+    cached_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
@@ -245,6 +262,8 @@ class AgentCompletion:
             raise ValueError("tokens must be a non-negative integer")
         if not isinstance(self.truncated, bool):
             raise TypeError("truncated must be a boolean")
+        # Cache fields are validated only by an opted-in agent. This preserves the
+        # legacy path exactly, while letting that path ignore adapter-only metadata.
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +282,22 @@ class AgentCompletionRequest:
     messages: tuple[Mapping[str, Any], ...]
     tools: tuple[ToolDefinition, ...]
     max_output_tokens: int
+    # A ClassVar leaves the historical dataclass fields and ``asdict`` wire shape
+    # untouched. The enabled-only subtype below overrides it with request intent.
+    cache_breakpoint: ClassVar[PromptCacheBreakpoint | None] = None
+
+
+@dataclass(frozen=True, slots=True)
+class PromptCachingAgentCompletionRequest(AgentCompletionRequest):
+    """A completion request carrying an enabled cache-prefix breakpoint."""
+
+    cache_breakpoint: PromptCacheBreakpoint
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cache_breakpoint, PromptCacheBreakpoint):
+            raise TypeError("cache_breakpoint must be a PromptCacheBreakpoint")
+        if self.cache_breakpoint.message_count > len(self.messages):
+            raise ValueError("cache breakpoint exceeds the request message count")
 
 
 AgentCompletionCallable = Callable[[AgentCompletionRequest], Awaitable[AgentCompletion]]
@@ -719,6 +754,7 @@ class ToolCallingAgent:
         mcp_clients: Sequence[MCPClient] = (),
         planning: bool = False,
         parallel_tool_calls: bool = False,
+        prompt_cache: PromptCacheConfig | None = None,
     ) -> None:
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -750,6 +786,8 @@ class ToolCallingAgent:
             raise TypeError("planning must be a boolean")
         if not isinstance(parallel_tool_calls, bool):
             raise TypeError("parallel_tool_calls must be a boolean")
+        if prompt_cache is not None and not isinstance(prompt_cache, PromptCacheConfig):
+            raise TypeError("prompt_cache must be a PromptCacheConfig or None")
         if delegation_tool is not None and not isinstance(
             delegation_tool, DelegationTool
         ):
@@ -809,6 +847,7 @@ class ToolCallingAgent:
                 if len(self._mcp_tools) > 64:
                     raise ValueError("at most 64 MCP tools may be exposed per agent")
         self.planning = planning
+        self.prompt_cache = prompt_cache
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state(
@@ -920,6 +959,10 @@ class ToolCallingAgent:
             raise AgentStateError(
                 "checkpoint state contains a plan but planning is not enabled"
             )
+        current_plan_snapshot = None
+        if self.prompt_cache is not None and self.planning:
+            current_plan_snapshot = _prompt_cache_plan_snapshot(plan)
+            history.append(current_plan_snapshot)
         try:
             # Only provider-visible history is compacted and budgeted here. The
             # bounded plan stays beside it in checkpoint state and is injected
@@ -938,16 +981,34 @@ class ToolCallingAgent:
                 summary=message,
             )
         history = list(compaction.messages)
+        if current_plan_snapshot is not None and not _contains_plan_snapshot(
+            history, current_plan_snapshot
+        ):
+            # A summary-only compaction can be smaller than the bounded plan
+            # rendering. Keep the current plan available after that visible,
+            # recorded rewrite instead of silently replacing it with a summary.
+            history.append(current_plan_snapshot)
         compaction_audits = (
             (compaction.audit.to_dict(),) if compaction.audit is not None else ()
         )
-        request = AgentCompletionRequest(
-            messages=self._request_messages(context, history, plan),
-            # Preserve the exact legacy request when neither optional tool is
-            # configured; completed runs remain replayable without a surface change.
-            tools=self._tool_definitions(),
-            max_output_tokens=self.max_output_tokens,
-        )
+        messages = self._request_messages(context, history, plan)
+        # Construct the historical type itself while cache management is absent:
+        # even dataclass reflection must retain its exact archived wire shape.
+        if self.prompt_cache is None:
+            request: AgentCompletionRequest = AgentCompletionRequest(
+                messages=messages,
+                tools=self._tool_definitions(),
+                max_output_tokens=self.max_output_tokens,
+            )
+        else:
+            request = PromptCachingAgentCompletionRequest(
+                messages=messages,
+                tools=self._tool_definitions(),
+                max_output_tokens=self.max_output_tokens,
+                cache_breakpoint=PromptCacheBreakpoint(
+                    len(messages) - int(bool(context.rollback_feedback))
+                ),
+            )
         request = replace(
             request,
             max_output_tokens=self._output_cap(context.tokens_remaining, request),
@@ -957,6 +1018,31 @@ class ToolCallingAgent:
 
         try:
             completion = await self._complete(request)
+        except PromptCacheReportError as error:
+            message = f"Malformed provider cache report: {error}"
+            updated = [
+                *history,
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous provider response had malformed cache usage "
+                        f"and was not acted on. {error}"
+                    ),
+                },
+            ]
+            delta, observer_error = await self._observe_delta(before)
+            observation_error = before_error or observer_error
+            return StepOutcome(
+                action="Reject malformed provider cache report",
+                state=self._encode_state(updated, steps=completed_steps + 1, plan=plan),
+                changed_paths=delta.changed_paths,
+                diff=delta.diff,
+                workspace_delta_observed=observation_error is None,
+                workspace_observation_error=observation_error,
+                error=message,
+                summary=message,
+                context_compactions=compaction_audits,
+            )
         except AgentProviderError as error:
             message = f"Provider call failed: {error}"
             updated = [
@@ -982,6 +1068,18 @@ class ToolCallingAgent:
                 tokens=error.tokens,
                 summary="The provider failed before a usable response was returned.",
                 context_compactions=compaction_audits,
+                prompt_cache=(
+                    prompt_cache_report(
+                        prompt_tokens=None,
+                        cached_tokens=None,
+                        invalidation=_prompt_cache_invalidation(
+                            compacted=compaction.audit is not None,
+                            rolled_back=bool(context.rollback_feedback),
+                        ),
+                    )
+                    if self.prompt_cache is not None
+                    else None
+                ),
             )
 
         # A provider may accidentally swallow cancellation and return a value.
@@ -990,6 +1088,44 @@ class ToolCallingAgent:
         current_task = asyncio.current_task()
         if current_task is not None and current_task.cancelling():
             raise asyncio.CancelledError
+
+        cache_report = None
+        if self.prompt_cache is not None:
+            try:
+                cache_report = prompt_cache_report(
+                    prompt_tokens=completion.prompt_tokens,
+                    cached_tokens=completion.cached_tokens,
+                    invalidation=_prompt_cache_invalidation(
+                        compacted=compaction.audit is not None,
+                        rolled_back=bool(context.rollback_feedback),
+                    ),
+                )
+            except PromptCacheReportError as error:
+                message = f"Malformed provider cache report: {error}"
+                history.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous provider response had malformed cache "
+                            f"usage and was not acted on. {error}"
+                        ),
+                    }
+                )
+                delta, observer_error = await self._observe_delta(before)
+                observation_error = before_error or observer_error
+                return StepOutcome(
+                    action="Reject malformed provider cache report",
+                    state=self._encode_state(
+                        history, steps=completed_steps + 1, plan=plan
+                    ),
+                    changed_paths=delta.changed_paths,
+                    diff=delta.diff,
+                    workspace_delta_observed=observation_error is None,
+                    workspace_observation_error=observation_error,
+                    error=message,
+                    summary=message,
+                    context_compactions=compaction_audits,
+                )
 
         errors: list[str] = []
         observations: list[_ToolObservation] = []
@@ -1127,6 +1263,7 @@ class ToolCallingAgent:
                 if observation.audit is not None
             ),
             context_compactions=compaction_audits,
+            prompt_cache=cache_report,
             error="; ".join(errors) or None,
             tokens=completion.tokens
             + sum(observation.tokens for observation in observations),
@@ -1175,10 +1312,9 @@ class ToolCallingAgent:
             caller_plan = (
                 context.plan.strip() or "No caller-supplied plan was provided."
             )
-            rendered_plan = (
-                f"Caller-supplied plan (read-only guidance):\n{caller_plan}\n\n"
-                f"{_render_agent_plan(plan)}"
-            )
+            rendered_plan = f"Caller-supplied plan (read-only guidance):\n{caller_plan}"
+            if self.prompt_cache is None:
+                rendered_plan = f"{rendered_plan}\n\n{_render_agent_plan(plan)}"
         else:
             system_prompt = _SYSTEM_PROMPT
             rendered_plan = context.plan.strip() or "No separate plan was supplied."
@@ -2309,7 +2445,44 @@ def _require_keys(
 def _provider_message(message: Mapping[str, Any]) -> dict[str, Any]:
     copied = dict(_json_copy(message))
     copied.pop(_COMPACTION_AUDIT_KEY, None)
+    copied.pop(_PROMPT_CACHE_PLAN_SNAPSHOT_KEY, None)
     return copied
+
+
+def _prompt_cache_plan_snapshot(plan: AgentPlan | None) -> dict[str, Any]:
+    """Create one append-only, provider-visible snapshot of mutable plan state."""
+
+    return {
+        "role": "user",
+        "content": _render_agent_plan(plan),
+        _PROMPT_CACHE_PLAN_SNAPSHOT_KEY: {
+            "schema_version": _PROMPT_CACHE_PLAN_SNAPSHOT_SCHEMA_VERSION,
+        },
+    }
+
+
+def _contains_plan_snapshot(
+    messages: Sequence[Mapping[str, Any]], snapshot: Mapping[str, Any]
+) -> bool:
+    return any(
+        message.get(_PROMPT_CACHE_PLAN_SNAPSHOT_KEY)
+        == snapshot[_PROMPT_CACHE_PLAN_SNAPSHOT_KEY]
+        and message.get("role") == snapshot["role"]
+        and message.get("content") == snapshot["content"]
+        for message in messages
+    )
+
+
+def _prompt_cache_invalidation(
+    *, compacted: bool, rolled_back: bool
+) -> PromptCacheInvalidation | None:
+    if compacted and rolled_back:
+        return PromptCacheInvalidation.COMPACTION_AND_ROLLBACK
+    if compacted:
+        return PromptCacheInvalidation.COMPACTION
+    if rolled_back:
+        return PromptCacheInvalidation.ROLLBACK
+    return None
 
 
 def _copy_conversation_messages(
@@ -2834,7 +3007,7 @@ def _safe_repr(value: object) -> str:
 
 
 def _render_agent_plan(plan: AgentPlan | None) -> str:
-    """Render plan state outside compactable history and its character budget."""
+    """Render bounded mutable plan state for the next provider request."""
 
     if plan is None:
         return (

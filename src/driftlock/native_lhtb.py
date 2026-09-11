@@ -302,6 +302,8 @@ class SingleAttemptJSONProvider:
                 text=response.text,
                 tokens=response.usage.total_tokens,
                 truncated=True,
+                prompt_tokens=response.usage.input_tokens,
+                cached_tokens=response.usage.cache_tokens,
             )
         try:
             text, calls = _decode_provider_response(response.text)
@@ -314,6 +316,8 @@ class SingleAttemptJSONProvider:
             text=text,
             tool_calls=calls,
             tokens=response.usage.total_tokens,
+            prompt_tokens=response.usage.input_tokens,
+            cached_tokens=response.usage.cache_tokens,
         )
 
     def _require_one_call(self, calls_before: int) -> None:

@@ -343,6 +343,8 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         ]
         if context_compactions:
             record["context_compactions"] = context_compactions
+        if result.prompt_cache_summary is not None:
+            record["prompt_cache"] = result.prompt_cache_summary.to_dict()
         self._native_phases.append(record)
         output = Path(self.logs_dir) / "driftlock-native-result.json"
         output.write_text(
