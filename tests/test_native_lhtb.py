@@ -11,6 +11,11 @@ from typing import Any
 
 import pytest
 
+from driftlock.agent import (
+    AgentCompletionRequest,
+    PromptCachingAgentCompletionRequest,
+    ToolDefinition,
+)
 from driftlock.heuristics import HeuristicConfig
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
 from driftlock.lhtb_analysis import _validate_arm_identity
@@ -35,6 +40,7 @@ from driftlock.native_lhtb import (
     set_native_result_metadata,
     set_native_token_limit_metadata,
 )
+from driftlock.prompt_cache import PromptCacheBreakpoint
 from driftlock.remote import RemoteCheckpointError
 from driftlock.runner import RunnerConfig
 
@@ -192,16 +198,22 @@ class ScriptedPhysicalCall:
         self._physical_call_count = 0
         self.prompts: list[str] = []
         self.output_caps: list[int] = []
+        self.cacheable_prefix_characters: list[int | None] = []
 
     @property
     def physical_call_count(self) -> int:
         return self._physical_call_count
 
     async def __call__(
-        self, prompt: str, *, max_output_tokens: int
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        cacheable_prefix_characters: int | None,
     ) -> BilledProviderResponse:
         self.prompts.append(prompt)
         self.output_caps.append(max_output_tokens)
+        self.cacheable_prefix_characters.append(cacheable_prefix_characters)
         self._physical_call_count += self.increments.pop(0)
         response = self.responses.pop(0)
         if isinstance(response, BilledProviderFailure):
@@ -221,6 +233,61 @@ class DriftOnceJudge:
             "avoid the rejected no-op branch",
             tokens=7,
         )
+
+
+async def test_native_adapter_delivers_cache_breakpoint_to_physical_provider() -> None:
+    response = BilledProviderResponse(
+        '{"text":"ok","tool_calls":[]}', ProviderUsage(input_tokens=10)
+    )
+    call = ScriptedPhysicalCall([response, response, response])
+    provider = SingleAttemptJSONProvider(call)
+    tools = (
+        ToolDefinition(
+            name="read_file",
+            description="Read one file",
+            input_schema={"type": "object"},
+        ),
+    )
+    first = PromptCachingAgentCompletionRequest(
+        messages=(
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "goal"},
+        ),
+        tools=tools,
+        max_output_tokens=10,
+        cache_breakpoint=PromptCacheBreakpoint(2),
+    )
+    second = PromptCachingAgentCompletionRequest(
+        messages=(
+            *first.messages,
+            {"role": "assistant", "content": "next"},
+        ),
+        tools=tools,
+        max_output_tokens=10,
+        cache_breakpoint=PromptCacheBreakpoint(3),
+    )
+    control = AgentCompletionRequest(
+        messages=first.messages,
+        tools=tools,
+        max_output_tokens=10,
+    )
+
+    await provider(first)
+    await provider(control)
+    await provider(second)
+
+    first_breakpoint, control_breakpoint, second_breakpoint = (
+        call.cacheable_prefix_characters
+    )
+    assert first_breakpoint == 324
+    assert control_breakpoint is None
+    assert second_breakpoint == 362
+    assert call.prompts[0] == call.prompts[1]
+    assert call.prompts[0][:first_breakpoint] == call.prompts[2][:first_breakpoint]
+    assert call.prompts[0][:first_breakpoint].endswith(
+        '{"role":"user","content":"goal"}'
+    )
+    assert second_breakpoint > first_breakpoint
 
 
 def _response(

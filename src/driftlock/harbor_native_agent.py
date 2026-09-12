@@ -36,6 +36,7 @@ from driftlock.native_lhtb import (
     set_native_result_metadata,
     set_native_token_limit_metadata,
 )
+from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.runner import RunnerConfig
 
 
@@ -51,11 +52,15 @@ class _HarborLiteLLMSingleAttempt:
         model_info: dict[str, Any],
         timeout_sec: float,
         extra_body: dict[str, Any],
+        explicit_prompt_cache_control: bool,
     ) -> None:
         _validate_pinned_harbor()
         if timeout_sec <= 0:
             raise ValueError("provider timeout must be positive")
+        if not isinstance(explicit_prompt_cache_control, bool):
+            raise TypeError("explicit_prompt_cache_control must be a boolean")
         self.timeout_sec = timeout_sec
+        self.explicit_prompt_cache_control = explicit_prompt_cache_control
         self.llm = LiteLLM(
             model_name=model_name,
             api_base=api_base,
@@ -85,13 +90,37 @@ class _HarborLiteLLMSingleAttempt:
         return count
 
     async def __call__(
-        self, prompt: str, *, max_output_tokens: int
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        cacheable_prefix_characters: int | None,
     ) -> BilledProviderResponse:
         started = time.monotonic()
         try:
+            provider_prompt: str | list[dict[str, Any]] = prompt
+            if (
+                cacheable_prefix_characters is not None
+                and self.explicit_prompt_cache_control
+            ):
+                if not 0 <= cacheable_prefix_characters <= len(prompt):
+                    raise ValueError(
+                        "cacheable prefix character offset is out of range"
+                    )
+                provider_prompt = [
+                    {
+                        "type": "text",
+                        "text": prompt[:cacheable_prefix_characters],
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt[cacheable_prefix_characters:],
+                    },
+                ]
             response = await self._unwrapped_call(
                 self.llm,
-                prompt=prompt,
+                prompt=provider_prompt,
                 max_tokens=max_output_tokens,
                 num_retries=0,
                 max_retries=0,
@@ -133,6 +162,8 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_command_failure_rate: float = 1.0,
         driftlock_reward_stall_steps: int = 5,
         driftlock_reward_epsilon: float = 1e-6,
+        driftlock_prompt_cache: bool = False,
+        driftlock_explicit_prompt_cache_control: bool = False,
         driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
@@ -147,6 +178,14 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             raise ValueError("native driftlock requires parser_name='json'")
         if not record_terminal_session:
             raise ValueError("the frozen LHTB native arm records terminal activity")
+        if not isinstance(driftlock_prompt_cache, bool):
+            raise TypeError("driftlock_prompt_cache must be a boolean")
+        if not isinstance(driftlock_explicit_prompt_cache_control, bool):
+            raise TypeError("driftlock_explicit_prompt_cache_control must be a boolean")
+        if driftlock_explicit_prompt_cache_control and not driftlock_prompt_cache:
+            raise ValueError(
+                "explicit prompt cache control requires driftlock_prompt_cache"
+            )
         super().__init__(*args, **kwargs)
         if not isinstance(self.model_name, str) or not self.model_name:
             raise ValueError("native driftlock requires model_name")
@@ -181,6 +220,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             model_info=model_info,
             timeout_sec=timeout_sec,
             extra_body=call_kwargs["extra_body"],
+            explicit_prompt_cache_control=(driftlock_explicit_prompt_cache_control),
         )
         self._native_low_level = low_level
         self._native_provider = SingleAttemptJSONProvider(low_level)
@@ -229,6 +269,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         self._native_instruction = ""
         self._native_last_result: RunResult | None = None
         self._native_phases: list[dict[str, Any]] = []
+        self._native_prompt_cache = driftlock_prompt_cache
 
     @staticmethod
     def name() -> str:
@@ -343,6 +384,8 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         ]
         if context_compactions:
             record["context_compactions"] = context_compactions
+        if result.prompt_cache_summary is not None:
+            record["prompt_cache"] = result.prompt_cache_summary.to_dict()
         self._native_phases.append(record)
         output = Path(self.logs_dir) / "driftlock-native-result.json"
         output.write_text(
@@ -381,6 +424,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             plan=self._native_plan,
             retain_checkpoints=self._native_retain_checkpoints,
             agent_max_output_tokens=self._native_max_output_tokens,
+            prompt_cache=(PromptCacheConfig() if self._native_prompt_cache else None),
         )
         self._native_runtime = runtime
         self._native_environment = environment

@@ -779,6 +779,8 @@ class LHTBDriftlockAgent(Terminus2):
             ]
             if context_compactions:
                 record["context_compactions"] = context_compactions
+            if result.prompt_cache_summary is not None:
+                record["prompt_cache"] = result.prompt_cache_summary.to_dict()
         injector = getattr(self, "_driftlock_skill_injector", None)
         if injector is not None:
             record["skill_injection"] = injector.phase_report()

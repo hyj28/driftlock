@@ -9,6 +9,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from driftlock.prompt_cache import (
+    PromptCacheReport,
+    PromptCacheSummary,
+    summarize_prompt_cache_reports,
+)
+
 
 class Verdict(StrEnum):
     """The fine judge's assessment of the current trajectory."""
@@ -129,6 +135,7 @@ class StepOutcome:
     ``tool_audits`` retains diagnostics that are deliberately not fed back into
     the agent conversation.
     ``context_compactions`` records lossy conversation rewrites at this step.
+    ``prompt_cache`` distinguishes an observed hit or miss from absent telemetry.
     """
 
     action: str
@@ -142,6 +149,7 @@ class StepOutcome:
     tool_observations: tuple[str, ...] = ()
     tool_audits: tuple[Mapping[str, Any], ...] = ()
     context_compactions: tuple[Mapping[str, Any], ...] = ()
+    prompt_cache: PromptCacheReport | None = None
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -179,6 +187,10 @@ class StepOutcome:
             not isinstance(audit, Mapping) for audit in self.context_compactions
         ):
             raise TypeError("context_compactions must be a tuple of mappings")
+        if self.prompt_cache is not None and not isinstance(
+            self.prompt_cache, PromptCacheReport
+        ):
+            raise TypeError("prompt_cache must be a PromptCacheReport or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +415,17 @@ class RunResult:
     agent_tokens_used: int
     judge_tokens_used: int
     coarse_triggers: tuple[DriftTriggerRecord, ...] = ()
+
+    @property
+    def prompt_cache_summary(self) -> PromptCacheSummary | None:
+        """Aggregate configured cache reports without inventing blind misses."""
+
+        reports = tuple(
+            step.outcome.prompt_cache
+            for step in self.steps
+            if step.outcome.prompt_cache is not None
+        )
+        return summarize_prompt_cache_reports(reports) if reports else None
 
     @property
     def judge_attempts(self) -> int:

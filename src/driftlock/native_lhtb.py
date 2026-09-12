@@ -28,6 +28,7 @@ from driftlock.models import (
     StepTokenBudgetExhausted,
     aggregate_run_summary,
 )
+from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteEnvironment
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
@@ -201,7 +202,11 @@ class SingleAttemptCall(Protocol):
     def physical_call_count(self) -> int: ...
 
     async def __call__(
-        self, prompt: str, *, max_output_tokens: int
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        cacheable_prefix_characters: int | None,
     ) -> BilledProviderResponse: ...
 
 
@@ -260,7 +265,7 @@ class SingleAttemptJSONProvider:
 
     def prefill_estimate(self, request: AgentCompletionRequest) -> int:
         prompt = _provider_prompt(request)
-        wire_messages = [{"role": "user", "content": prompt}]
+        wire_messages = [{"role": "user", "content": prompt.text}]
         encoded = json.dumps(
             wire_messages,
             ensure_ascii=False,
@@ -270,10 +275,12 @@ class SingleAttemptJSONProvider:
 
     async def __call__(self, request: AgentCompletionRequest) -> AgentCompletion:
         calls_before = self.provider_call_count
+        prompt = _provider_prompt(request)
         try:
             response = await self._call(
-                _provider_prompt(request),
+                prompt.text,
                 max_output_tokens=request.max_output_tokens,
+                cacheable_prefix_characters=prompt.cacheable_prefix_characters,
             )
         except BilledProviderFailure as error:
             self._require_one_call(calls_before)
@@ -302,6 +309,8 @@ class SingleAttemptJSONProvider:
                 text=response.text,
                 tokens=response.usage.total_tokens,
                 truncated=True,
+                prompt_tokens=response.usage.input_tokens,
+                cached_tokens=response.usage.cache_tokens,
             )
         try:
             text, calls = _decode_provider_response(response.text)
@@ -314,6 +323,8 @@ class SingleAttemptJSONProvider:
             text=text,
             tool_calls=calls,
             tokens=response.usage.total_tokens,
+            prompt_tokens=response.usage.input_tokens,
+            cached_tokens=response.usage.cache_tokens,
         )
 
     def _require_one_call(self, calls_before: int) -> None:
@@ -551,6 +562,7 @@ class LHTBNativeAgentRuntime:
         agent_max_output_tokens: int = 8192,
         agent_min_output_tokens: int = 64,
         shell_timeout_sec: int = 60,
+        prompt_cache: PromptCacheConfig | None = None,
     ) -> None:
         workspace = PurePosixPath(remote_workspace)
         if not workspace.is_absolute() or workspace == PurePosixPath("/"):
@@ -580,6 +592,7 @@ class LHTBNativeAgentRuntime:
             prefill_estimator=provider.prefill_estimate,
             shell_timeout_sec=shell_timeout_sec,
             user=user,
+            prompt_cache=prompt_cache,
         )
         self._process_quiescer = NativeProcessQuiescer(
             environment,
@@ -724,7 +737,13 @@ def append_verifier_feedback(state: Mapping[str, Any], feedback: str) -> dict[st
     return codec.encode(messages, steps=steps, plan=plan)
 
 
-def _provider_prompt(request: AgentCompletionRequest) -> str:
+@dataclass(frozen=True, slots=True)
+class _ProviderPrompt:
+    text: str
+    cacheable_prefix_characters: int | None
+
+
+def _provider_prompt(request: AgentCompletionRequest) -> _ProviderPrompt:
     tools = [
         {
             "name": tool.name,
@@ -733,20 +752,42 @@ def _provider_prompt(request: AgentCompletionRequest) -> str:
         }
         for tool in request.tools
     ]
+    tool_spec = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+    instruction = (
+        "Continue the tool-agent conversation below. Return exactly one JSON object "
+        "with keys 'text' (string) and 'tool_calls' (array). Each tool call must "
+        "contain 'name', 'arguments', and optional 'call_id'. Do not wrap the JSON "
+        "in Markdown."
+    )
     conversation = json.dumps(
         request.messages,
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    tool_spec = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
-    return (
-        "Continue the tool-agent conversation below. Return exactly one JSON object "
-        "with keys 'text' (string) and 'tool_calls' (array). Each tool call must "
-        "contain 'name', 'arguments', and optional 'call_id'. Do not wrap the JSON "
-        "in Markdown.\n\nConversation JSON:\n"
-        + conversation
-        + "\n\nAvailable tools JSON:\n"
-        + tool_spec
+    conversation_prefix = instruction + "\n\nConversation JSON:\n"
+    text = (
+        conversation_prefix + conversation + "\n\nAvailable tools JSON:\n" + tool_spec
+    )
+    breakpoint = request.cache_breakpoint
+    if breakpoint is None:
+        return _ProviderPrompt(
+            text=text,
+            cacheable_prefix_characters=None,
+        )
+
+    # The prompt text is byte-identical in both arms. The marker stops before
+    # the prefix array's closing bracket so a later request can append a message
+    # without changing any cached byte.
+    cacheable_messages = json.dumps(
+        request.messages[: breakpoint.message_count],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _ProviderPrompt(
+        text=text,
+        cacheable_prefix_characters=(
+            len(conversation_prefix) + len(cacheable_messages) - 1
+        ),
     )
 
 
