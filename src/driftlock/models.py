@@ -14,6 +14,11 @@ from driftlock.prompt_cache import (
     PromptCacheSummary,
     summarize_prompt_cache_reports,
 )
+from driftlock.verification import (
+    VerificationControl,
+    VerificationRecord,
+    VerificationStatus,
+)
 
 
 class Verdict(StrEnum):
@@ -31,6 +36,15 @@ class RunStatus(StrEnum):
     STEP_LIMIT = "step_limit"
     TOKEN_LIMIT = "token_limit"
     ROLLBACK_LIMIT = "rollback_limit"
+
+
+class VerificationRunStatus(StrEnum):
+    """Why an opt-in completion-verification run stopped."""
+
+    VERIFICATION_LIMIT = "verification_limit"
+    VERIFICATION_UNAVAILABLE = "verification_unavailable"
+    VERIFICATION_BUDGET = "verification_budget"
+    VERIFICATION_RESTORE_FAILED = "verification_restore_failed"
 
 
 class JudgeReliabilityStatus(StrEnum):
@@ -136,6 +150,7 @@ class StepOutcome:
     the agent conversation.
     ``context_compactions`` records lossy conversation rewrites at this step.
     ``prompt_cache`` distinguishes an observed hit or miss from absent telemetry.
+    ``verification`` is absent on the replay-compatible unconfigured path.
     """
 
     action: str
@@ -150,6 +165,7 @@ class StepOutcome:
     tool_audits: tuple[Mapping[str, Any], ...] = ()
     context_compactions: tuple[Mapping[str, Any], ...] = ()
     prompt_cache: PromptCacheReport | None = None
+    verification: VerificationRecord | None = None
     error: str | None = None
     reward: float | None = None
     tokens: int = 0
@@ -191,6 +207,16 @@ class StepOutcome:
             self.prompt_cache, PromptCacheReport
         ):
             raise TypeError("prompt_cache must be a PromptCacheReport or None")
+        if self.verification is not None and not isinstance(
+            self.verification, VerificationRecord
+        ):
+            raise TypeError("verification must be a VerificationRecord or None")
+        if self.verification is not None and (
+            self.completed != self.verification.allows_completion
+        ):
+            raise ValueError(
+                "completed must agree with the verification completion outcome"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +242,8 @@ class StepContext:
     attempt: int
     rollback_feedback: str | None
     tokens_remaining: int | None
+    verification_control: VerificationControl | None = None
+    verification_unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,7 +434,7 @@ class DriftTriggerRecord:
 class RunResult:
     """Final state and accounting for a runner invocation."""
 
-    status: RunStatus
+    status: RunStatus | VerificationRunStatus
     state: Mapping[str, Any]
     steps: tuple[StepRecord, ...]
     rollbacks: tuple[RollbackRecord, ...]
@@ -415,6 +443,33 @@ class RunResult:
     agent_tokens_used: int
     judge_tokens_used: int
     coarse_triggers: tuple[DriftTriggerRecord, ...] = ()
+
+    @property
+    def verification_records(self) -> tuple[VerificationRecord, ...]:
+        """Return the bounded per-step completion-verification record."""
+
+        return tuple(
+            step.outcome.verification
+            for step in self.steps
+            if step.outcome.verification is not None
+        )
+
+    @property
+    def verification_status_counts(self) -> dict[str, int]:
+        """Enumerate every verification status, including zero-count outcomes."""
+
+        return {
+            status.value: sum(
+                record.status is status for record in self.verification_records
+            )
+            for status in VerificationStatus
+        }
+
+    @property
+    def verification_tokens_used(self) -> int:
+        """Return billed tokens spent on the bounded verification phase."""
+
+        return sum(record.tokens for record in self.verification_records)
 
     @property
     def prompt_cache_summary(self) -> PromptCacheSummary | None:

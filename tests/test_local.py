@@ -112,6 +112,7 @@ else:
                 os.kill(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
 
     assert result.return_code == 0
+    assert result.lingering_processes >= 1
     assert not late_path.exists()
 
 

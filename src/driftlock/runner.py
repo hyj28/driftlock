@@ -26,6 +26,14 @@ from driftlock.models import (
     StepRecord,
     StepTokenBudgetExhausted,
     Verdict,
+    VerificationRunStatus,
+)
+from driftlock.verification import (
+    VerificationCommandError,
+    VerificationControl,
+    VerificationControlError,
+    VerificationRestorationError,
+    VerificationStatus,
 )
 
 StepFunction = Callable[[StepContext], Awaitable[StepOutcome]]
@@ -90,6 +98,111 @@ class DriftlockRunner:
         checkpoint_histories: dict[str, list[StepRecord]] = {
             checkpoint.checkpoint_id: []
         }
+        verification_control: VerificationControl | None = None
+        verification_unavailable_reason: str | None = None
+        discard_checkpoint = getattr(self.checkpoint_store, "discard", None)
+        if not callable(discard_checkpoint):
+            verification_unavailable_reason = (
+                "The checkpoint store does not support bounded scratch-checkpoint "
+                "discard, so completion verification is unavailable."
+            )
+        else:
+            initial_checkpoint = checkpoint
+
+            async def run_verification_control(
+                current_state: Mapping[str, Any],
+                current_step: int,
+                operation: Callable[[], Awaitable[Any]],
+            ) -> tuple[Any, Any, Any]:
+                # The differential/repeat scheme establishes that the command passes
+                # with the work, fails without it, and repeats under a restored
+                # workspace. It targets optimistic or careless checks, not an
+                # adversarial command: executions are not isolated, so state outside
+                # the checkpoints can counterfeit that signature. Closing that gap
+                # requires run isolation, and driftlock does not run containers in
+                # the agent path. Test-generated workspace files remain safe because
+                # every boundary is restored; environments may separately report
+                # surviving owned processes, which the agent disqualifies.
+                scratch = await self._create_checkpoint(
+                    current_state,
+                    step=current_step,
+                    label="verification-scratch",
+                )
+                commands_run = 0
+                commands_failed = 0
+
+                def command_counts() -> tuple[int, int]:
+                    return commands_run, commands_failed
+
+                async def run_operation() -> Any:
+                    nonlocal commands_run, commands_failed
+                    commands_run += 1
+                    try:
+                        item = await operation()
+                    except Exception as error:
+                        commands_failed += 1
+                        raise VerificationCommandError(
+                            str(error),
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+                    code = getattr(getattr(item, "result", None), "return_code", None)
+                    commands_failed += int(
+                        not isinstance(code, int) or isinstance(code, bool) or code != 0
+                    )
+                    return item
+
+                async def restore_boundary(target: Checkpoint, label: str) -> None:
+                    try:
+                        await self._restore_checkpoint(target)
+                    except Exception as error:
+                        commands_run, commands_failed = command_counts()
+                        raise VerificationRestorationError(
+                            f"{label} restore failed: {error}",
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+
+                try:
+                    first = await run_operation()
+                    await restore_boundary(initial_checkpoint, "initial workspace")
+                    control = await run_operation()
+                    await restore_boundary(scratch, "current workspace")
+                    confirmation = await run_operation()
+                    return first, control, confirmation
+                finally:
+                    try:
+                        await self._restore_checkpoint(scratch)
+                    except Exception as error:
+                        retained = scratch.path.exists()
+                        if retained:
+                            checkpoints.append(scratch)
+                        commands_run, commands_failed = command_counts()
+                        retained_detail = (
+                            f"; scratch checkpoint {scratch.checkpoint_id} retained "
+                            "for recovery"
+                            if retained
+                            else ""
+                        )
+                        raise VerificationRestorationError(
+                            "final current workspace restore failed: "
+                            f"{error}{retained_detail}",
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+                    try:
+                        discarded = discard_checkpoint(scratch)
+                        if isawaitable(discarded):
+                            await discarded
+                    except Exception as error:
+                        commands_run, commands_failed = command_counts()
+                        raise VerificationControlError(
+                            f"scratch checkpoint discard failed: {error}",
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+
+            verification_control = run_verification_control
         all_steps: list[StepRecord] = []
         recent_steps: list[StepRecord] = []
         rollbacks: list[RollbackRecord] = []
@@ -112,6 +225,8 @@ class DriftlockRunner:
                 tokens_remaining=self._tokens_remaining(
                     agent_tokens_used + judge_tokens_used
                 ),
+                verification_control=verification_control,
+                verification_unavailable_reason=verification_unavailable_reason,
             )
             rollback_feedback = None
             try:
@@ -151,9 +266,85 @@ class DriftlockRunner:
                 self.config.max_tokens is not None
                 and tokens_used > self.config.max_tokens
             )
+            if (
+                outcome.verification is not None
+                and outcome.verification.status is VerificationStatus.BUDGET_EXHAUSTED
+            ):
+                return await self._finish(
+                    (
+                        RunStatus.TOKEN_LIMIT
+                        if self._budget_exhausted(tokens_used)
+                        else VerificationRunStatus.VERIFICATION_BUDGET
+                    ),
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
+                )
             if outcome.completed and not over_token_budget:
                 return await self._finish(
                     RunStatus.COMPLETED,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
+                )
+            if (
+                outcome.verification is not None
+                and outcome.verification.status is VerificationStatus.RESTORATION_FAILED
+            ):
+                return await self._finish(
+                    VerificationRunStatus.VERIFICATION_RESTORE_FAILED,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=False,
+                )
+            if (
+                outcome.verification is not None
+                and outcome.verification.status is VerificationStatus.UNVERIFIABLE
+                and not outcome.verification.retryable
+                and not self._budget_exhausted(tokens_used)
+            ):
+                return await self._finish(
+                    VerificationRunStatus.VERIFICATION_UNAVAILABLE,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
+                )
+            if (
+                outcome.verification is not None
+                and outcome.verification.attempt_limit_reached
+                and not outcome.completed
+                and not self._budget_exhausted(tokens_used)
+            ):
+                return await self._finish(
+                    VerificationRunStatus.VERIFICATION_LIMIT,
                     state,
                     all_steps,
                     rollbacks,
@@ -258,7 +449,11 @@ class DriftlockRunner:
                     else:
                         checkpoint = rollback_checkpoint
                         state = await self._restore_checkpoint(checkpoint)
-                        await _restore_step_checkpoint_state(step, state)
+                        restored_step_state = await _restore_step_checkpoint_state(
+                            step, state
+                        )
+                        if restored_step_state is not None:
+                            state = restored_step_state
                         coarse_triggers.append(
                             self._trigger_record(
                                 record,
@@ -512,7 +707,7 @@ class DriftlockRunner:
 
     @staticmethod
     def _result(
-        status: RunStatus,
+        status: RunStatus | VerificationRunStatus,
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
@@ -535,7 +730,7 @@ class DriftlockRunner:
 
     async def _finish(
         self,
-        status: RunStatus,
+        status: RunStatus | VerificationRunStatus,
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
@@ -592,12 +787,17 @@ def _bounded_tool_observations(steps: tuple[StepRecord, ...]) -> tuple[str, ...]
 
 async def _restore_step_checkpoint_state(
     step: StepFunction, state: Mapping[str, Any]
-) -> None:
+) -> dict[str, Any] | None:
     """Let stateful step implementations restore resources outside the workspace."""
 
     restore = getattr(step, "restore_checkpoint_state", None)
     if restore is None:
-        return
+        return None
     result = restore(state)
     if isawaitable(result):
-        await result
+        result = await result
+    if result is None:
+        return None
+    if not isinstance(result, Mapping):
+        raise TypeError("step checkpoint restore must return a mapping or None")
+    return dict(result)

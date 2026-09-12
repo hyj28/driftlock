@@ -299,6 +299,14 @@ class RemoteArchiveCheckpointStore:
         local_recovery.unlink(missing_ok=True)
         return state
 
+    def discard(self, checkpoint: Checkpoint) -> None:
+        """Remove one exact store-owned host-side scratch checkpoint."""
+
+        checkpoint_dir = checkpoint.path.resolve()
+        if checkpoint_dir.parent != self.checkpoints_dir.resolve():
+            raise ValueError("checkpoint does not belong to this store")
+        shutil.rmtree(checkpoint_dir)
+
     def _remote_temp_path(self, identifier: str, suffix: str) -> str:
         return str(PurePosixPath(self._tmp_path) / f"driftlock-{identifier}-{suffix}")
 

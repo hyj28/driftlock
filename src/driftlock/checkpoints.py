@@ -179,6 +179,14 @@ class DirectoryCheckpointStore:
             shutil.rmtree(staging, ignore_errors=True)
         return state
 
+    def discard(self, checkpoint: Checkpoint) -> None:
+        """Remove one exact store-owned scratch checkpoint."""
+
+        checkpoint_dir = checkpoint.path.resolve()
+        if checkpoint_dir.parent != self.checkpoints_dir.resolve():
+            raise ValueError("checkpoint does not belong to this store")
+        shutil.rmtree(checkpoint_dir)
+
 
 def _tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
