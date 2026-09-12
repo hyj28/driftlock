@@ -6,7 +6,7 @@
 >
 > The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
 > retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (1054 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> (1091 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
@@ -41,8 +41,8 @@ own runs; the rest is what any capable agent needs.
 | MCP client support — stdio tool discovery and invocation | done |
 | Bounded opt-in parallel workspace reads | done |
 | MCP Streamable HTTP and authorization | planned |
-| **Prompt-cache management** | **next** |
-| Output self-verification | planned |
+| Prompt-cache management | done |
+| **Output self-verification** | **next** |
 
 The optional `driftlock.st_embedder` module pins the real MiniLM model; installing `sentence-transformers` project-locally enables its integration test without changing retrieval's injected interface.
 
