@@ -27,6 +27,7 @@ from driftlock.models import (
     StepTokenBudgetExhausted,
     Verdict,
 )
+from driftlock.verification import VerificationStatus
 
 StepFunction = Callable[[StepContext], Awaitable[StepOutcome]]
 
@@ -151,9 +152,63 @@ class DriftlockRunner:
                 self.config.max_tokens is not None
                 and tokens_used > self.config.max_tokens
             )
+            if (
+                outcome.verification is not None
+                and outcome.verification.status is VerificationStatus.BUDGET_EXHAUSTED
+            ):
+                return await self._finish(
+                    RunStatus.TOKEN_LIMIT,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
+                )
             if outcome.completed and not over_token_budget:
                 return await self._finish(
                     RunStatus.COMPLETED,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
+                )
+            if (
+                outcome.verification is not None
+                and outcome.verification.status is VerificationStatus.UNVERIFIABLE
+                and not self._budget_exhausted(tokens_used)
+            ):
+                return await self._finish(
+                    RunStatus.STEP_LIMIT,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=outcome.workspace_delta_observed,
+                )
+            if (
+                outcome.verification is not None
+                and outcome.verification.attempt_limit_reached
+                and not outcome.completed
+                and not self._budget_exhausted(tokens_used)
+            ):
+                return await self._finish(
+                    RunStatus.STEP_LIMIT,
                     state,
                     all_steps,
                     rollbacks,
@@ -258,7 +313,11 @@ class DriftlockRunner:
                     else:
                         checkpoint = rollback_checkpoint
                         state = await self._restore_checkpoint(checkpoint)
-                        await _restore_step_checkpoint_state(step, state)
+                        restored_step_state = await _restore_step_checkpoint_state(
+                            step, state
+                        )
+                        if restored_step_state is not None:
+                            state = restored_step_state
                         coarse_triggers.append(
                             self._trigger_record(
                                 record,
@@ -592,12 +651,17 @@ def _bounded_tool_observations(steps: tuple[StepRecord, ...]) -> tuple[str, ...]
 
 async def _restore_step_checkpoint_state(
     step: StepFunction, state: Mapping[str, Any]
-) -> None:
+) -> dict[str, Any] | None:
     """Let stateful step implementations restore resources outside the workspace."""
 
     restore = getattr(step, "restore_checkpoint_state", None)
     if restore is None:
-        return
+        return None
     result = restore(state)
     if isawaitable(result):
-        await result
+        result = await result
+    if result is None:
+        return None
+    if not isinstance(result, Mapping):
+        raise TypeError("step checkpoint restore must return a mapping or None")
+    return dict(result)
