@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from driftlock.agent import (
+    AgentCompletionRequest,
     PromptCachingAgentCompletionRequest,
     ToolDefinition,
 )
@@ -238,7 +239,7 @@ async def test_native_adapter_delivers_cache_breakpoint_to_physical_provider() -
     response = BilledProviderResponse(
         '{"text":"ok","tool_calls":[]}', ProviderUsage(input_tokens=10)
     )
-    call = ScriptedPhysicalCall([response, response])
+    call = ScriptedPhysicalCall([response, response, response])
     provider = SingleAttemptJSONProvider(call)
     tools = (
         ToolDefinition(
@@ -265,14 +266,24 @@ async def test_native_adapter_delivers_cache_breakpoint_to_physical_provider() -
         max_output_tokens=10,
         cache_breakpoint=PromptCacheBreakpoint(3),
     )
+    control = AgentCompletionRequest(
+        messages=first.messages,
+        tools=tools,
+        max_output_tokens=10,
+    )
 
     await provider(first)
+    await provider(control)
     await provider(second)
 
-    first_breakpoint, second_breakpoint = call.cacheable_prefix_characters
-    assert first_breakpoint == 433
-    assert second_breakpoint == 471
-    assert call.prompts[0][:first_breakpoint] == call.prompts[1][:first_breakpoint]
+    first_breakpoint, control_breakpoint, second_breakpoint = (
+        call.cacheable_prefix_characters
+    )
+    assert first_breakpoint == 324
+    assert control_breakpoint is None
+    assert second_breakpoint == 362
+    assert call.prompts[0] == call.prompts[1]
+    assert call.prompts[0][:first_breakpoint] == call.prompts[2][:first_breakpoint]
     assert call.prompts[0][:first_breakpoint].endswith(
         '{"role":"user","content":"goal"}'
     )

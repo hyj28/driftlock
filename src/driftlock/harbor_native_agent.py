@@ -40,13 +40,6 @@ from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.runner import RunnerConfig
 
 
-def _uses_explicit_cache_control(model_name: str) -> bool:
-    """Anthropic requires a marker; OpenAI-compatible providers cache automatically."""
-
-    normalized = model_name.casefold()
-    return "anthropic" in normalized or "claude" in normalized
-
-
 class _HarborLiteLLMSingleAttempt:
     """Expose one unwrapped, exact-usage Harbor LiteLLM request."""
 
@@ -59,12 +52,15 @@ class _HarborLiteLLMSingleAttempt:
         model_info: dict[str, Any],
         timeout_sec: float,
         extra_body: dict[str, Any],
+        explicit_prompt_cache_control: bool,
     ) -> None:
         _validate_pinned_harbor()
         if timeout_sec <= 0:
             raise ValueError("provider timeout must be positive")
+        if not isinstance(explicit_prompt_cache_control, bool):
+            raise TypeError("explicit_prompt_cache_control must be a boolean")
         self.timeout_sec = timeout_sec
-        self.model_name = model_name
+        self.explicit_prompt_cache_control = explicit_prompt_cache_control
         self.llm = LiteLLM(
             model_name=model_name,
             api_base=api_base,
@@ -103,8 +99,9 @@ class _HarborLiteLLMSingleAttempt:
         started = time.monotonic()
         try:
             provider_prompt: str | list[dict[str, Any]] = prompt
-            if cacheable_prefix_characters is not None and _uses_explicit_cache_control(
-                self.model_name
+            if (
+                cacheable_prefix_characters is not None
+                and self.explicit_prompt_cache_control
             ):
                 if not 0 <= cacheable_prefix_characters <= len(prompt):
                     raise ValueError(
@@ -166,6 +163,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_reward_stall_steps: int = 5,
         driftlock_reward_epsilon: float = 1e-6,
         driftlock_prompt_cache: bool = False,
+        driftlock_explicit_prompt_cache_control: bool = False,
         driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
         driftlock_judge_model: str | None = None,
         driftlock_judge_api_base: str | None = None,
@@ -182,6 +180,12 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             raise ValueError("the frozen LHTB native arm records terminal activity")
         if not isinstance(driftlock_prompt_cache, bool):
             raise TypeError("driftlock_prompt_cache must be a boolean")
+        if not isinstance(driftlock_explicit_prompt_cache_control, bool):
+            raise TypeError("driftlock_explicit_prompt_cache_control must be a boolean")
+        if driftlock_explicit_prompt_cache_control and not driftlock_prompt_cache:
+            raise ValueError(
+                "explicit prompt cache control requires driftlock_prompt_cache"
+            )
         super().__init__(*args, **kwargs)
         if not isinstance(self.model_name, str) or not self.model_name:
             raise ValueError("native driftlock requires model_name")
@@ -216,6 +220,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             model_info=model_info,
             timeout_sec=timeout_sec,
             extra_body=call_kwargs["extra_body"],
+            explicit_prompt_cache_control=(driftlock_explicit_prompt_cache_control),
         )
         self._native_low_level = low_level
         self._native_provider = SingleAttemptJSONProvider(low_level)

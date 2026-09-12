@@ -81,7 +81,6 @@ class PromptCacheReport:
     attribution: PromptCacheAttributionStatus = (
         PromptCacheAttributionStatus.NOT_APPLICABLE
     )
-    attributed_input_tokens: int | None = None
     error: str | None = None
     error_truncated: bool = False
 
@@ -101,9 +100,6 @@ class PromptCacheReport:
             raise TypeError("attribution must be a PromptCacheAttributionStatus")
         _validate_optional_token_count("prompt_tokens", self.prompt_tokens)
         _validate_optional_token_count("cached_tokens", self.cached_tokens)
-        _validate_optional_token_count(
-            "attributed_input_tokens", self.attributed_input_tokens
-        )
 
         if self.status in (PromptCacheStatus.HIT, PromptCacheStatus.MISS):
             if self.prompt_tokens is None or self.cached_tokens is None:
@@ -156,21 +152,15 @@ class PromptCacheReport:
             raise PromptCacheReportError(
                 "attribution contradicts the recorded prefix events"
             )
-        if self.attributed_input_tokens is not None:
-            raise PromptCacheReportError(
-                "attributed_input_tokens requires a counterfactual baseline; "
-                "none is available"
-            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": self.status.value,
             "prompt_tokens": self.prompt_tokens,
             "cached_tokens": self.cached_tokens,
             "prefix_events": [event.value for event in self.prefix_events],
             "attribution": self.attribution.value,
-            "attributed_input_tokens": self.attributed_input_tokens,
             "error": self.error,
             "error_truncated": self.error_truncated,
         }
@@ -186,7 +176,6 @@ class PromptCachePrefixEventSummary:
     unobservable_event_count: int
     malformed_event_count: int
     attribution: PromptCacheAttributionStatus
-    attributed_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.event, PromptCachePrefixEvent):
@@ -220,11 +209,6 @@ class PromptCachePrefixEventSummary:
             raise PromptCacheReportError(
                 "event attribution contradicts the event count"
             )
-        if self.attributed_input_tokens is not None:
-            raise PromptCacheReportError(
-                "attributed_input_tokens requires a counterfactual baseline; "
-                "none is available"
-            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -234,7 +218,6 @@ class PromptCachePrefixEventSummary:
             "unobservable_event_count": self.unobservable_event_count,
             "malformed_event_count": self.malformed_event_count,
             "attribution": self.attribution.value,
-            "attributed_input_tokens": self.attributed_input_tokens,
         }
 
 
@@ -256,7 +239,7 @@ class PromptCacheSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "observability": self.observability.value,
             "total_report_count": self.total_report_count,
             "hit_steps": self.hit_steps,

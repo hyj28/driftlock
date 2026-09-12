@@ -16,6 +16,7 @@ from driftlock.agent import (
     AgentConversationCodec,
     ToolCall,
     ToolCallingAgent,
+    conversation_history_characters,
 )
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
@@ -291,6 +292,127 @@ async def test_unchanged_maximum_plan_is_snapshotted_once_without_compaction() -
     assert all(not outcome.context_compactions for outcome in outcomes)
 
 
+async def test_plan_snapshot_budget_pressure_degrades_without_missing_steps(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    plan = AgentPlan(
+        tuple(
+            PlanStep(
+                f"step-{index}",
+                "plan work " * 20,
+                PlanStatus.NOT_STARTED,
+            )
+            for index in range(8)
+        )
+    )
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(text="x" * 2000, prompt_tokens=100, cached_tokens=90)
+            for _ in range(20)
+        ]
+    )
+    agent = _agent(
+        provider,
+        planning=True,
+        bound=MIN_PROMPT_CACHE_PLANNING_HISTORY_CHARACTERS,
+    )
+    judge = HeuristicJudge(
+        HeuristicConfig(
+            no_change_steps=50,
+            loop_window=50,
+            loop_repetitions=50,
+            error_window=50,
+            command_failure_window=50,
+            reward_stall_steps=50,
+        )
+    )
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        judge,
+        config=RunnerConfig(max_steps=20, checkpoint_interval=25),
+    ).run(
+        goal="repair the parser",
+        plan="inspect, patch, verify",
+        step=agent,
+        initial_state=AgentConversationCodec().encode((), steps=0, plan=plan),
+    )
+
+    assert result.status is RunStatus.STEP_LIMIT
+    assert len(result.steps) == 20
+    assert len(provider.requests) == 20
+    assert all(step.outcome.error is None for step in result.steps)
+    summary = result.prompt_cache_summary
+    assert summary is not None
+    assert summary.observability is PromptCacheObservability.OBSERVED
+    assert summary.total_report_count == 20
+    assert summary.malformed_steps == 0
+    assert summary.hit_rate == 1.0
+    transient_requests = [
+        request
+        for request in provider.requests
+        if request.cache_breakpoint.message_count < len(request.messages)
+    ]
+    assert transient_requests
+    assert all(
+        "plan work" in request.messages[-1]["content"] for request in transient_requests
+    )
+    persisted, _steps, _plan = AgentConversationCodec().decode_with_plan(result.state)
+    # History is compacted before a request; the just-returned provider message
+    # may add one bounded turn afterward, but no plan snapshot is re-appended.
+    assert conversation_history_characters(persisted) <= 12_100
+    assert not any(
+        "driftlock_prompt_cache_plan_snapshot" in message for message in persisted
+    )
+
+
+async def test_degraded_compaction_updates_prefix_state_before_a_restore() -> None:
+    plan = AgentPlan(
+        tuple(
+            PlanStep(f"step-{index}", "plan work " * 20, PlanStatus.NOT_STARTED)
+            for index in range(8)
+        )
+    )
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(text="x" * 2000, prompt_tokens=100, cached_tokens=90)
+            for _ in range(12)
+        ]
+    )
+    agent = _agent(
+        provider,
+        planning=True,
+        bound=MIN_PROMPT_CACHE_PLANNING_HISTORY_CHARACTERS,
+    )
+    state: Mapping[str, Any] = AgentConversationCodec().encode((), steps=0, plan=plan)
+    degraded_input: Mapping[str, Any] | None = None
+    sequence = 0
+
+    for sequence in range(1, 11):
+        input_state = state
+        outcome = await agent(_context(input_state, sequence=sequence))
+        state = outcome.state
+        request = provider.requests[-1]
+        if request.cache_breakpoint.message_count < len(request.messages):
+            degraded_input = input_state
+            break
+
+    assert degraded_input is not None
+    restored = await agent(
+        _context(degraded_input, sequence=sequence + 1, rollback_feedback="")
+    )
+
+    assert restored.prompt_cache is not None
+    assert PromptCachePrefixEvent.ROLLBACK_PREFIX_RESTORED in (
+        restored.prompt_cache.prefix_events
+    )
+    assert PromptCachePrefixEvent.UNCLASSIFIED_PREFIX_DIVERGENCE not in (
+        restored.prompt_cache.prefix_events
+    )
+
+
 @pytest.mark.parametrize("cache", [True, False])
 @pytest.mark.parametrize(
     ("prompt_tokens", "cached_tokens", "expected_status"),
@@ -504,8 +626,8 @@ async def test_compaction_records_unattributable_event_not_invented_cost() -> No
         attribution=PromptCacheAttributionStatus.UNATTRIBUTABLE,
     )
     assert baseline_outcome.prompt_cache is not None
-    assert baseline_outcome.prompt_cache.attributed_input_tokens is None
-    assert outcome.prompt_cache.attributed_input_tokens is None
+    assert "attributed_input_tokens" not in baseline_outcome.prompt_cache.to_dict()
+    assert "attributed_input_tokens" not in outcome.prompt_cache.to_dict()
 
 
 async def test_feedback_without_restoration_is_not_a_rollback_event() -> None:
@@ -671,7 +793,7 @@ def test_all_prompt_cache_enum_values_are_unique_and_all_directions_render() -> 
         observed.prefix_events[0].attribution
         is PromptCacheAttributionStatus.UNATTRIBUTABLE
     )
-    assert observed.prefix_events[0].attributed_input_tokens is None
+    assert "attributed_input_tokens" not in observed.prefix_events[0].to_dict()
     assert hash(observed)
     with pytest.raises((AttributeError, TypeError)):
         observed.prefix_events[0].event_count = 999  # type: ignore[misc]

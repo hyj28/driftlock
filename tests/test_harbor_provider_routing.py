@@ -572,7 +572,7 @@ def test_native_agent_forwards_only_audited_call_kwargs_to_litellm(
         )
 
 
-async def test_native_anthropic_adapter_emits_explicit_cache_control(
+async def test_native_adapter_emits_explicit_cache_control_when_configured(
     tmp_path: Path,
     harbor_agent_modules: tuple[Any, Any],
 ) -> None:
@@ -588,6 +588,7 @@ async def test_native_anthropic_adapter_emits_explicit_cache_control(
             "output_cost_per_token": 0,
         },
         driftlock_prompt_cache=True,
+        driftlock_explicit_prompt_cache_control=True,
     )
     captured: dict[str, Any] = {}
 
@@ -619,6 +620,47 @@ async def test_native_anthropic_adapter_emits_explicit_cache_control(
         {"type": "text", "text": "fgh"},
     ]
     assert captured["max_tokens"] == 9
+
+
+async def test_native_adapter_does_not_infer_cache_control_from_model_name(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    agent = native_agent.LHTBNativeDriftlockAgent(
+        logs_dir=tmp_path,
+        model_name="openai-compatible/claude-proxy",
+        llm_call_kwargs=_agent_call_kwargs(),
+        model_info={
+            "max_input_tokens": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+        },
+        driftlock_prompt_cache=True,
+    )
+    captured: dict[str, Any] = {}
+
+    async def respond(_llm: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            content='{"text":"ok","tool_calls":[]}',
+            usage=SimpleNamespace(
+                prompt_tokens=8,
+                cache_tokens=5,
+                completion_tokens=1,
+                cost_usd=0.0,
+            ),
+        )
+
+    agent._native_low_level._unwrapped_call = respond
+    await agent._native_low_level(
+        "abcdefgh",
+        max_output_tokens=9,
+        cacheable_prefix_characters=5,
+    )
+
+    assert captured["prompt"] == "abcdefgh"
 
 
 def test_generated_config_constructs_unchanged_terminus_detector_behavior(

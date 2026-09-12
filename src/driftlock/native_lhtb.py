@@ -764,36 +764,30 @@ def _provider_prompt(request: AgentCompletionRequest) -> _ProviderPrompt:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    conversation_prefix = instruction + "\n\nConversation JSON:\n"
+    text = (
+        conversation_prefix + conversation + "\n\nAvailable tools JSON:\n" + tool_spec
+    )
     breakpoint = request.cache_breakpoint
     if breakpoint is None:
         return _ProviderPrompt(
-            text=(
-                instruction
-                + "\n\nConversation JSON:\n"
-                + conversation
-                + "\n\nAvailable tools JSON:\n"
-                + tool_spec
-            ),
+            text=text,
             cacheable_prefix_characters=None,
         )
 
-    # Tools precede the growing conversation only on the opted-in path. The
-    # marker stops before the prefix array's closing bracket so a later request
-    # can append a message without changing any cached byte.
-    enabled_prefix = (
-        instruction
-        + "\n\nAvailable tools JSON:\n"
-        + tool_spec
-        + "\n\nConversation JSON:\n"
-    )
+    # The prompt text is byte-identical in both arms. The marker stops before
+    # the prefix array's closing bracket so a later request can append a message
+    # without changing any cached byte.
     cacheable_messages = json.dumps(
         request.messages[: breakpoint.message_count],
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return _ProviderPrompt(
-        text=enabled_prefix + conversation,
-        cacheable_prefix_characters=(len(enabled_prefix) + len(cacheable_messages) - 1),
+        text=text,
+        cacheable_prefix_characters=(
+            len(conversation_prefix) + len(cacheable_messages) - 1
+        ),
     )
 
 

@@ -999,34 +999,33 @@ class ToolCallingAgent:
                 summary=message,
             )
         history = list(compaction.messages)
+        transient_plan_snapshot = None
         if current_plan_snapshot is not None and not _contains_plan_snapshot(
             history, current_plan_snapshot
         ):
-            message = (
-                "Cache-managed planning compaction could not retain the current "
-                "plan within max_history_characters."
-            )
-            return StepOutcome(
-                action="Reject cache history budget breach",
-                state=self._encode_state(history, steps=completed_steps + 1, plan=plan),
-                error=message,
-                summary=message,
-                context_compactions=(
-                    (compaction.audit.to_dict(),)
-                    if compaction.audit is not None
-                    else ()
-                ),
-            )
+            # The full plan remains available in checkpoint state. Deliver it as
+            # a transient, non-cacheable suffix rather than exceeding the history
+            # budget or turning an optional optimization into a failed agent step.
+            transient_plan_snapshot = current_plan_snapshot
         compaction_audits = (
             (compaction.audit.to_dict(),) if compaction.audit is not None else ()
         )
-        messages = self._request_messages(context, history, plan)
+        messages = self._request_messages(
+            context,
+            history,
+            plan,
+            transient_plan_snapshot=transient_plan_snapshot,
+        )
         includes_rollback_feedback = (
             context.rollback_feedback is not None
             if self.prompt_cache is not None
             else bool(context.rollback_feedback)
         )
-        cache_message_count = len(messages) - int(includes_rollback_feedback)
+        cache_message_count = (
+            len(messages)
+            - int(includes_rollback_feedback)
+            - int(transient_plan_snapshot is not None)
+        )
         prefix_events: tuple[PromptCachePrefixEvent, ...] = ()
         if self.prompt_cache is not None:
             if (
@@ -1356,6 +1355,8 @@ class ToolCallingAgent:
         context: StepContext,
         history: Sequence[Mapping[str, Any]],
         plan: AgentPlan | None = None,
+        *,
+        transient_plan_snapshot: Mapping[str, Any] | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         if self.planning:
             system_prompt = (
@@ -1405,6 +1406,8 @@ class ToolCallingAgent:
             },
             *[_provider_message(message) for message in history],
         ]
+        if transient_plan_snapshot is not None:
+            messages.append(_provider_message(transient_plan_snapshot))
         includes_rollback_feedback = (
             context.rollback_feedback is not None
             if self.prompt_cache is not None
