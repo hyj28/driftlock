@@ -36,6 +36,8 @@ class CheckpointStore(Protocol):
         self, checkpoint: Checkpoint
     ) -> dict[str, Any] | Awaitable[dict[str, Any]]: ...
 
+    def discard(self, checkpoint: Checkpoint) -> Awaitable[None] | None: ...
+
 
 class DirectoryCheckpointStore:
     """Copy-on-checkpoint storage for a local workspace.
@@ -178,6 +180,14 @@ class DirectoryCheckpointStore:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
         return state
+
+    def discard(self, checkpoint: Checkpoint) -> None:
+        """Remove one exact store-owned scratch checkpoint."""
+
+        checkpoint_dir = checkpoint.path.resolve()
+        if checkpoint_dir.parent != self.checkpoints_dir.resolve():
+            raise ValueError("checkpoint does not belong to this store")
+        shutil.rmtree(checkpoint_dir)
 
 
 def _tree_digest(root: Path) -> str:

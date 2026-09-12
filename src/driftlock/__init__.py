@@ -137,6 +137,7 @@ from driftlock.models import (
     StepOutcome,
     StepTokenBudgetExhausted,
     Verdict,
+    VerificationRunStatus,
     classify_judge_reliability,
     merge_signal_counts,
 )
@@ -448,6 +449,7 @@ __all__ = [
     "Verdict",
     "VerificationCheckpoint",
     "VerificationRecord",
+    "VerificationRunStatus",
     "VerificationStatus",
     "WorkspaceDelta",
     "WorkspaceDeltaObserver",

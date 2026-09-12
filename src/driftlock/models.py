@@ -34,6 +34,14 @@ class RunStatus(StrEnum):
     ROLLBACK_LIMIT = "rollback_limit"
 
 
+class VerificationRunStatus(StrEnum):
+    """Why an opt-in completion-verification run stopped."""
+
+    VERIFICATION_LIMIT = "verification_limit"
+    VERIFICATION_UNAVAILABLE = "verification_unavailable"
+    VERIFICATION_BUDGET = "verification_budget"
+
+
 class JudgeReliabilityStatus(StrEnum):
     """Whether fine-judge availability made the run a valid measurement."""
 
@@ -419,7 +427,7 @@ class DriftTriggerRecord:
 class RunResult:
     """Final state and accounting for a runner invocation."""
 
-    status: RunStatus
+    status: RunStatus | VerificationRunStatus
     state: Mapping[str, Any]
     steps: tuple[StepRecord, ...]
     rollbacks: tuple[RollbackRecord, ...]

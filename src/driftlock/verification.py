@@ -38,8 +38,9 @@ MAX_VERIFICATION_EVIDENCE_CHARACTERS = 4_000
 # without duplicating the separately retained command evidence.
 MAX_VERIFICATION_REASON_CHARACTERS = 512
 
-# Version one is deliberately small and self-contained for checkpoint validation.
-VERIFICATION_CHECKPOINT_SCHEMA_VERSION = 1
+# Version two records counterfactual and retryability facts needed to replay the
+# completion decision rather than reconstructing them from prose.
+VERIFICATION_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class VerificationStatus(StrEnum):
@@ -48,6 +49,7 @@ class VerificationStatus(StrEnum):
     VERIFIED = "verified"
     REFUTED = "refuted"
     UNVERIFIABLE = "unverifiable"
+    TRANSIENT_ERROR = "transient_error"
     MALFORMED = "malformed"
     BUDGET_EXHAUSTED = "budget_exhausted"
 
@@ -57,10 +59,10 @@ class SelfVerificationConfig:
     """Opt into bounded model-selected, command-decided completion checks.
 
     The model chooses a falsifiable command, but never chooses whether that command
-    passed. Exit code zero verifies, exit code one refutes, and any other exit code
-    means the check could not run reliably. An explicitly uncheckable goal may still
-    complete with an ``UNVERIFIABLE`` record: that fact is neither promoted to a
-    pass nor made into a permanent refusal to terminate.
+    passed. Verification requires the same command to fail against the initial
+    workspace and pass against the current one. Exit one on the current workspace
+    refutes; other execution failures are retryable. An explicitly uncheckable goal
+    terminates with an ``UNVERIFIABLE`` record, never a synthetic pass or failure.
     """
 
     max_attempts: int = DEFAULT_MAX_VERIFICATION_ATTEMPTS
@@ -97,10 +99,12 @@ class VerificationRecord:
     reason: str
     command: str | None = None
     return_code: int | None = None
+    control_return_code: int | None = None
     evidence: str = ""
     evidence_truncated: bool = False
     tokens: int = 0
     attempt_limit_reached: bool = False
+    retryable: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, int) or isinstance(self.attempt, bool):
@@ -122,6 +126,11 @@ class VerificationRecord:
             not isinstance(self.return_code, int) or isinstance(self.return_code, bool)
         ):
             raise TypeError("return_code must be an integer or None")
+        if self.control_return_code is not None and (
+            not isinstance(self.control_return_code, int)
+            or isinstance(self.control_return_code, bool)
+        ):
+            raise TypeError("control_return_code must be an integer or None")
         if not isinstance(self.evidence, str):
             raise TypeError("evidence must be a string")
         if len(self.evidence) > MAX_VERIFICATION_EVIDENCE_CHARACTERS:
@@ -134,16 +143,21 @@ class VerificationRecord:
             raise ValueError("tokens cannot be negative")
         if not isinstance(self.attempt_limit_reached, bool):
             raise TypeError("attempt_limit_reached must be a boolean")
-        if self.attempt_limit_reached and self.status not in {
-            VerificationStatus.REFUTED,
-            VerificationStatus.MALFORMED,
-        }:
-            raise ValueError(
-                "only refuted or malformed records may exhaust the attempt limit"
-            )
+        if not isinstance(self.retryable, bool):
+            raise TypeError("retryable must be a boolean")
+        if self.attempt_limit_reached and not self.retryable:
+            raise ValueError("only retryable records may exhaust the attempt limit")
         if self.status is VerificationStatus.VERIFIED:
-            if self.command is None or self.return_code != 0:
-                raise ValueError("verified records require a zero-exit command")
+            if (
+                self.command is None
+                or self.return_code != 0
+                or self.control_return_code in {None, 0}
+            ):
+                raise ValueError(
+                    "verified records require a passing command and failing control"
+                )
+            if self.retryable:
+                raise ValueError("verified records cannot be retryable")
         elif self.status is VerificationStatus.REFUTED:
             if self.command is None or self.return_code != 1:
                 raise ValueError("refuted records require an exit-one command")
@@ -165,16 +179,18 @@ class VerificationRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "attempt": self.attempt,
             "status": self.status.value,
             "reason": self.reason,
             "command": self.command,
             "return_code": self.return_code,
+            "control_return_code": self.control_return_code,
             "evidence": self.evidence,
             "evidence_truncated": self.evidence_truncated,
             "tokens": self.tokens,
             "attempt_limit_reached": self.attempt_limit_reached,
+            "retryable": self.retryable,
         }
 
     @classmethod
@@ -188,12 +204,14 @@ class VerificationRecord:
             "reason",
             "command",
             "return_code",
+            "control_return_code",
             "evidence",
             "evidence_truncated",
             "tokens",
             "attempt_limit_reached",
+            "retryable",
         }
-        if set(value) != expected or value.get("schema_version") != 1:
+        if set(value) != expected or value.get("schema_version") != 2:
             raise ValueError("verification record fields are malformed")
         try:
             status = VerificationStatus(value.get("status"))
@@ -205,12 +223,16 @@ class VerificationRecord:
             reason=value.get("reason"),  # type: ignore[arg-type]
             command=value.get("command"),  # type: ignore[arg-type]
             return_code=value.get("return_code"),  # type: ignore[arg-type]
+            control_return_code=value.get(  # type: ignore[arg-type]
+                "control_return_code"
+            ),
             evidence=value.get("evidence"),  # type: ignore[arg-type]
             evidence_truncated=value.get("evidence_truncated"),  # type: ignore[arg-type]
             tokens=value.get("tokens"),  # type: ignore[arg-type]
             attempt_limit_reached=value.get(  # type: ignore[arg-type]
                 "attempt_limit_reached"
             ),
+            retryable=value.get("retryable"),  # type: ignore[arg-type]
         )
 
 

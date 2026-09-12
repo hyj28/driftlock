@@ -28,6 +28,7 @@ from driftlock.lhtb import (
 from driftlock.models import (
     JudgeReliabilityStatus,
     RunStatus,
+    VerificationRunStatus,
     classify_judge_reliability,
 )
 from driftlock.oracle import (
@@ -90,6 +91,15 @@ _DRIFTLOCK_STATUS_TERMINATIONS = {
     RunStatus.STEP_LIMIT.value: frozenset({"driftlock_step_limit"}),
     RunStatus.TOKEN_LIMIT.value: frozenset({"driftlock_token_limit"}),
     RunStatus.ROLLBACK_LIMIT.value: frozenset({"driftlock_rollback_limit"}),
+    VerificationRunStatus.VERIFICATION_LIMIT.value: frozenset(
+        {"driftlock_verification_limit"}
+    ),
+    VerificationRunStatus.VERIFICATION_UNAVAILABLE.value: frozenset(
+        {"driftlock_verification_unavailable"}
+    ),
+    VerificationRunStatus.VERIFICATION_BUDGET.value: frozenset(
+        {"driftlock_verification_budget"}
+    ),
 }
 
 

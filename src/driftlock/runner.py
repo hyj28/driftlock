@@ -26,6 +26,7 @@ from driftlock.models import (
     StepRecord,
     StepTokenBudgetExhausted,
     Verdict,
+    VerificationRunStatus,
 )
 from driftlock.verification import VerificationStatus
 
@@ -91,6 +92,39 @@ class DriftlockRunner:
         checkpoint_histories: dict[str, list[StepRecord]] = {
             checkpoint.checkpoint_id: []
         }
+        configure_verification = getattr(step, "configure_verification_control", None)
+        if (
+            callable(configure_verification)
+            and getattr(step, "self_verification", None) is not None
+        ):
+            initial_checkpoint = checkpoint
+
+            async def run_verification_control(
+                current_state: Mapping[str, Any],
+                current_step: int,
+                operation: Callable[[], Awaitable[Any]],
+            ) -> tuple[Any, Any]:
+                # A passing command is evidence only when the same command fails
+                # against the pre-work checkpoint. Restoring a scratch checkpoint
+                # after both executions also makes checker writes non-persistent.
+                scratch = await self._create_checkpoint(
+                    current_state,
+                    step=current_step,
+                    label="verification-scratch",
+                )
+                try:
+                    await self._restore_checkpoint(initial_checkpoint)
+                    control_result = await operation()
+                    await self._restore_checkpoint(scratch)
+                    current_result = await operation()
+                    return control_result, current_result
+                finally:
+                    await self._restore_checkpoint(scratch)
+                    discarded = self.checkpoint_store.discard(scratch)
+                    if isawaitable(discarded):
+                        await discarded
+
+            configure_verification(run_verification_control)
         all_steps: list[StepRecord] = []
         recent_steps: list[StepRecord] = []
         rollbacks: list[RollbackRecord] = []
@@ -157,7 +191,11 @@ class DriftlockRunner:
                 and outcome.verification.status is VerificationStatus.BUDGET_EXHAUSTED
             ):
                 return await self._finish(
-                    RunStatus.TOKEN_LIMIT,
+                    (
+                        RunStatus.TOKEN_LIMIT
+                        if self._budget_exhausted(tokens_used)
+                        else VerificationRunStatus.VERIFICATION_BUDGET
+                    ),
                     state,
                     all_steps,
                     rollbacks,
@@ -186,10 +224,11 @@ class DriftlockRunner:
             if (
                 outcome.verification is not None
                 and outcome.verification.status is VerificationStatus.UNVERIFIABLE
+                and not outcome.verification.retryable
                 and not self._budget_exhausted(tokens_used)
             ):
                 return await self._finish(
-                    RunStatus.STEP_LIMIT,
+                    VerificationRunStatus.VERIFICATION_UNAVAILABLE,
                     state,
                     all_steps,
                     rollbacks,
@@ -208,7 +247,7 @@ class DriftlockRunner:
                 and not self._budget_exhausted(tokens_used)
             ):
                 return await self._finish(
-                    RunStatus.STEP_LIMIT,
+                    VerificationRunStatus.VERIFICATION_LIMIT,
                     state,
                     all_steps,
                     rollbacks,
@@ -571,7 +610,7 @@ class DriftlockRunner:
 
     @staticmethod
     def _result(
-        status: RunStatus,
+        status: RunStatus | VerificationRunStatus,
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
@@ -594,7 +633,7 @@ class DriftlockRunner:
 
     async def _finish(
         self,
-        status: RunStatus,
+        status: RunStatus | VerificationRunStatus,
         state: Mapping[str, Any],
         steps: list[StepRecord],
         rollbacks: list[RollbackRecord],
