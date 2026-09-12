@@ -26,7 +26,7 @@ from driftlock.delegation import (
     _report_delegation_tokens,
 )
 from driftlock.lhtb import WorkspaceDelta, WorkspaceDeltaObserver
-from driftlock.mcp import MCPClient, MCPError, MCPTool
+from driftlock.mcp import MCPAuthorizationError, MCPClient, MCPError, MCPTool
 from driftlock.memory import (
     DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS,
     DEFAULT_MAX_MEMORY_REASON_CHARACTERS,
@@ -1891,6 +1891,7 @@ class ToolCallingAgent:
         client, tool = self._mcp_tools[call.name]
         status = "completed"
         error: str | None = None
+        authorization: dict[str, Any] | None = None
         payload = ""
         try:
             arguments = _decode_arguments(call.arguments)
@@ -1907,6 +1908,8 @@ class ToolCallingAgent:
         except MCPError as exception:
             status = exception.status
             error = str(exception)
+            if isinstance(exception, MCPAuthorizationError):
+                authorization = exception.authorization.to_dict()
         except Exception as exception:
             status = "rejected"
             error = f"MCP call failed: {_safe_repr(exception)}"
@@ -1928,6 +1931,8 @@ class ToolCallingAgent:
                 "included": status in {"completed", "tool_error"},
             },
         }
+        if authorization is not None:
+            audit["authorization"] = authorization
         if status not in {"completed", "tool_error"}:
             payload = json.dumps({"status": status, "error": error}, ensure_ascii=True)
             if len(payload) > self.max_tool_output_chars:
