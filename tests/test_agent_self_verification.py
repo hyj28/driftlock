@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import shlex
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
 from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
-from driftlock.models import RunStatus, StepContext, VerificationRunStatus
+from driftlock.models import RunStatus, StepContext, StepOutcome, VerificationRunStatus
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.verification import (
     MAX_VERIFICATION_EVIDENCE_CHARACTERS,
@@ -55,6 +56,15 @@ def _completion(call_id: str = "complete") -> AgentCompletion:
 def _verification(command: str, call_id: str = "verify") -> AgentCompletion:
     return AgentCompletion(
         tool_calls=(ToolCall("run_verification", {"command": command}, call_id),),
+        tokens=5,
+    )
+
+
+def _unverifiable(reason: str = "no checkable surface") -> AgentCompletion:
+    return AgentCompletion(
+        tool_calls=(
+            ToolCall("report_unverifiable", {"reason": reason}, "unverifiable"),
+        ),
         tokens=5,
     )
 
@@ -127,14 +137,15 @@ async def _bind_local_control(
         current_state: Mapping[str, Any],
         current_step: int,
         operation: Callable[[], Awaitable[Any]],
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, Any, Any]:
         scratch = store.create(current_state, step=current_step, label="scratch")
         try:
+            first = await operation()
             store.restore(initial)
-            before = await operation()
+            control_result = await operation()
             store.restore(scratch)
-            after = await operation()
-            return before, after
+            confirmation = await operation()
+            return first, control_result, confirmation
         finally:
             store.restore(scratch)
             store.discard(scratch)
@@ -149,7 +160,7 @@ async def _bind_local_control(
         (_verification("exit 1"), VerificationStatus.REFUTED, False, False),
         (
             AgentCompletion(text="nothing objective exists", tokens=5),
-            VerificationStatus.UNVERIFIABLE,
+            VerificationStatus.MALFORMED,
             False,
             False,
         ),
@@ -189,6 +200,12 @@ async def test_verification_on_enumerates_outcomes_with_budget_boundary(
         assert outcome.completed is False
         assert len(provider.requests) == 1
         assert outcome.tokens == 3
+        assert outcome.error == (
+            "completion rejected: Remaining token allowance cannot cover "
+            "verification prefill (2) plus minimum output (3). Verification "
+            "cannot run."
+        )
+        assert "Repair the work" not in outcome.error
     else:
         assert outcome.verification.status is expected_status
         assert outcome.completed is expected_completed
@@ -222,10 +239,11 @@ def test_verification_status_values_are_unique_and_exhaustive() -> None:
         "refuted",
         "unverifiable",
         "transient_error",
+        "restoration_failed",
         "malformed",
         "budget_exhausted",
     ]
-    assert len({status.value for status in VerificationStatus}) == 6
+    assert len({status.value for status in VerificationStatus}) == 7
     assert [status.value for status in RunStatus] == [
         "completed",
         "step_limit",
@@ -237,8 +255,9 @@ def test_verification_status_values_are_unique_and_exhaustive() -> None:
         "verification_limit",
         "verification_unavailable",
         "verification_budget",
+        "verification_restore_failed",
     ]
-    assert len({status.value for status in VerificationRunStatus}) == 3
+    assert len({status.value for status in VerificationRunStatus}) == 4
 
 
 async def test_passing_verification_reaches_completed_runner_status(
@@ -282,10 +301,131 @@ async def test_passing_verification_reaches_completed_runner_status(
         "refuted": 0,
         "unverifiable": 0,
         "transient_error": 0,
+        "restoration_failed": 0,
         "malformed": 0,
         "budget_exhausted": 0,
     }
     assert result.verification_tokens_used == 5
+
+
+async def test_test_runner_side_effects_are_restored_but_verdict_is_honored(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "write_file",
+                        {"path": "answer.py", "content": "VALUE = 42\n"},
+                        "write",
+                    ),
+                    ToolCall("complete", {"summary": "implemented"}, "complete"),
+                )
+            ),
+            _verification("python3 -c 'import answer; assert answer.VALUE == 42'"),
+        ]
+    )
+    agent = _agent(workspace, provider)
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=3),
+    ).run(
+        goal="write answer.py with VALUE=42",
+        step=agent,
+        initial_state=agent.initial_state(),
+    )
+
+    record = result.verification_records[0]
+    assert result.status is RunStatus.COMPLETED
+    assert record.status is VerificationStatus.VERIFIED
+    assert (record.return_code, record.control_return_code) == (0, 1)
+    assert record.confirmation_return_code == 0
+    assert result.steps[0].outcome.commands_run == 3
+    assert not (workspace / "__pycache__").exists()
+
+
+async def test_out_of_workspace_state_makes_current_runs_noninterchangeable(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sentinel = tmp_path / "sentinel"
+    command = (
+        f"test -e {shlex.quote(str(sentinel))}; rc=$?; "
+        f"touch {shlex.quote(str(sentinel))}; exit $rc"
+    )
+    provider = ScriptedProvider([_completion(), _verification(command)])
+    agent = _agent(workspace, provider)
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=4),
+    ).run(
+        goal="prove the Riemann hypothesis",
+        step=agent,
+        initial_state=agent.initial_state(),
+    )
+
+    record = result.verification_records[0]
+    assert result.status is VerificationRunStatus.VERIFICATION_UNAVAILABLE
+    assert record.status is VerificationStatus.UNVERIFIABLE
+    assert record.retryable is False
+    assert (
+        record.return_code,
+        record.control_return_code,
+        record.confirmation_return_code,
+    ) == (1, 0, 0)
+    assert "disagreed" in record.reason
+
+
+async def test_checkpoint_store_destruction_is_terminal_and_accounted(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store_dir = tmp_path / "checkpoints"
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "write_file",
+                        {"path": "precious.txt", "content": "keep\n"},
+                        "write",
+                    ),
+                    ToolCall("complete", {"summary": "written"}, "complete"),
+                )
+            ),
+            _verification(
+                f"rm -rf {shlex.quote(str(store_dir))}; test -f precious.txt"
+            ),
+        ]
+    )
+    agent = _agent(workspace, provider)
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, store_dir),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=6),
+    ).run(goal="write precious.txt", step=agent, initial_state=agent.initial_state())
+
+    outcome = result.steps[0].outcome
+    assert result.status is VerificationRunStatus.VERIFICATION_RESTORE_FAILED
+    assert outcome.verification is not None
+    assert outcome.verification.status is VerificationStatus.RESTORATION_FAILED
+    assert outcome.verification.retryable is False
+    assert outcome.commands_run == 1
+    assert outcome.commands_failed == 0
+    assert "restoration failed" in outcome.verification.reason
+    assert "run cannot continue" in (outcome.error or "")
+    assert "Repair the work" not in (outcome.error or "")
+    assert (workspace / "precious.txt").read_text(encoding="utf-8") == "keep\n"
 
 
 @pytest.mark.parametrize("command", ["true", ":", "exit 0", "echo ok"])
@@ -337,8 +477,8 @@ async def test_verification_writes_are_restored_and_commands_are_accounted(
     outcome = result.steps[0].outcome
     assert result.status is VerificationRunStatus.VERIFICATION_LIMIT
     assert outcome.verification is not None
-    assert outcome.verification.status is VerificationStatus.TRANSIENT_ERROR
-    assert outcome.commands_run == 2
+    assert outcome.verification.status is VerificationStatus.UNVERIFIABLE
+    assert outcome.commands_run == 3
     assert outcome.commands_failed == 0
     assert outcome.changed_paths == ()
     assert not (workspace / "wiped.txt").exists()
@@ -359,7 +499,7 @@ async def test_transient_verification_failure_retries_before_terminating(
             _completion("c1"),
             transient,
             _completion("c2"),
-            AgentCompletion(text="no checkable surface", tokens=5),
+            _unverifiable(),
         ]
     )
     agent = _agent(workspace, provider, max_attempts=3)
@@ -381,7 +521,117 @@ async def test_transient_verification_failure_retries_before_terminating(
     assert len(result.steps) == 2
     assert result.verification_records[0].status is VerificationStatus.TRANSIENT_ERROR
     assert result.verification_records[0].attempt_limit_reached is False
+    assert result.verification_records[0].reason.endswith(".")
+    assert f"{result.verification_records[0].reason} Repair the work" in (
+        result.steps[0].outcome.error or ""
+    )
     assert result.verification_records[1].status is VerificationStatus.UNVERIFIABLE
+
+
+async def test_zero_tool_verifier_response_retries_like_other_malformed_output(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        [
+            _completion("c1"),
+            AgentCompletion(text="looks done", tokens=5),
+            _completion("c2"),
+            _unverifiable(),
+        ]
+    )
+    agent = _agent(workspace, provider)
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=10,
+                loop_window=10,
+                error_window=10,
+                reward_stall_steps=10,
+            )
+        ),
+        config=RunnerConfig(max_steps=6),
+    ).run(goal="finish", step=agent, initial_state=agent.initial_state())
+
+    assert result.status is VerificationRunStatus.VERIFICATION_UNAVAILABLE
+    assert [record.status for record in result.verification_records] == [
+        VerificationStatus.MALFORMED,
+        VerificationStatus.UNVERIFIABLE,
+    ]
+    assert result.verification_records[0].retryable is True
+    assert result.verification_records[0].attempt_limit_reached is False
+
+
+async def test_wrapped_agent_receives_runner_verification_control(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "write_file",
+                        {"path": "answer.txt", "content": "done\n"},
+                        "write",
+                    ),
+                    ToolCall("complete", {"summary": "done"}, "complete"),
+                )
+            ),
+            _verification("grep -Fx done answer.txt"),
+        ]
+    )
+    agent = _agent(workspace, provider)
+
+    async def audited_step(context: StepContext) -> StepOutcome:
+        return await agent(context)
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=3),
+    ).run(
+        goal="write answer.txt", step=audited_step, initial_state=agent.initial_state()
+    )
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.verification_records[0].status is VerificationStatus.VERIFIED
+
+
+async def test_store_without_discard_reports_control_unavailable_before_verifier(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    delegate = DirectoryCheckpointStore(workspace, tmp_path / "checkpoints")
+
+    class NoDiscardStore:
+        def create(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+            return delegate.create(*args, **kwargs)
+
+        def restore(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+            return delegate.restore(*args, **kwargs)
+
+    provider = ScriptedProvider([_completion()])
+    agent = _agent(workspace, provider)
+
+    result = await DriftlockRunner(
+        NoDiscardStore(),  # type: ignore[arg-type]
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=3),
+    ).run(goal="finish", step=agent, initial_state=agent.initial_state())
+
+    record = result.verification_records[0]
+    assert result.status is VerificationRunStatus.VERIFICATION_UNAVAILABLE
+    assert record.status is VerificationStatus.UNVERIFIABLE
+    assert record.retryable is False
+    assert record.tokens == 0
+    assert "does not support bounded scratch-checkpoint discard" in record.reason
+    assert len(provider.requests) == 1
 
 
 async def test_verification_budget_status_does_not_invent_runner_token_limit(
@@ -485,9 +735,7 @@ async def test_unverifiable_terminates_runner_without_claiming_completion(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    provider = ScriptedProvider(
-        [_completion(), AgentCompletion(text="no checkable surface", tokens=5)]
-    )
+    provider = ScriptedProvider([_completion(), _unverifiable()])
     agent = _agent(workspace, provider)
     result = await DriftlockRunner(
         DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
@@ -530,14 +778,14 @@ async def test_verification_execution_exception_is_unverifiable_not_a_crash() ->
         self_verification=_config(),
     )
 
-    async def execute_twice(
+    async def execute_thrice(
         _state: Mapping[str, Any],
         _step: int,
         operation: Callable[[], Awaitable[Any]],
-    ) -> tuple[Any, Any]:
-        return await operation(), await operation()
+    ) -> tuple[Any, Any, Any]:
+        return await operation(), await operation(), await operation()
 
-    agent.configure_verification_control(execute_twice)
+    agent.configure_verification_control(execute_thrice)
 
     outcome = await agent(_context(agent.initial_state()))
 
@@ -757,6 +1005,7 @@ async def test_verification_checkpoint_survives_runner_rollback_without_orphans(
     )
     checkpoint = VerificationCheckpoint.from_dict(raw_verification, config=_config())
     assert checkpoint.attempts_used == 2
+    assert checkpoint.records[-1].confirmation_return_code == 0
     _assert_no_orphaned_tool_results(messages)
     for step in result.steps:
         step_messages = AgentConversationCodec().decode(step.outcome.state)[0]
@@ -780,8 +1029,9 @@ async def test_malformed_verification_tool_call_is_recorded(
         [_completion(), AgentCompletion(tool_calls=(bad_call,), tokens=5)]
     )
     agent = _agent(workspace, provider)
-
-    outcome = await agent(_context(agent.initial_state()))
+    state = agent.initial_state()
+    await _bind_local_control(agent, workspace, tmp_path / "control", state)
+    outcome = await agent(_context(state))
 
     assert outcome.completed is False
     assert outcome.verification is not None
@@ -823,14 +1073,14 @@ async def test_malformed_verification_result_is_recorded_not_raised() -> None:
         self_verification=_config(),
     )
 
-    async def execute_twice(
+    async def execute_thrice(
         _state: Mapping[str, Any],
         _step: int,
         operation: Callable[[], Awaitable[Any]],
-    ) -> tuple[Any, Any]:
-        return await operation(), await operation()
+    ) -> tuple[Any, Any, Any]:
+        return await operation(), await operation(), await operation()
 
-    agent.configure_verification_control(execute_twice)
+    agent.configure_verification_control(execute_thrice)
 
     outcome = await agent(_context(agent.initial_state()))
 
@@ -865,8 +1115,9 @@ async def test_malformed_verification_provider_result_is_recorded(
         prefill_estimator=lambda _request: 2,
         self_verification=_config(),
     )
-
-    outcome = await agent(_context(agent.initial_state()))
+    state = agent.initial_state()
+    await _bind_local_control(agent, workspace, tmp_path / "control", state)
+    outcome = await agent(_context(state))
 
     assert outcome.completed is False
     assert outcome.verification is not None

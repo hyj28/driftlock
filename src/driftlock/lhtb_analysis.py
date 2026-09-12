@@ -100,6 +100,9 @@ _DRIFTLOCK_STATUS_TERMINATIONS = {
     VerificationRunStatus.VERIFICATION_BUDGET.value: frozenset(
         {"driftlock_verification_budget"}
     ),
+    VerificationRunStatus.VERIFICATION_RESTORE_FAILED.value: frozenset(
+        {"driftlock_verification_restore_failed"}
+    ),
 }
 
 

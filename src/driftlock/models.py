@@ -14,7 +14,11 @@ from driftlock.prompt_cache import (
     PromptCacheSummary,
     summarize_prompt_cache_reports,
 )
-from driftlock.verification import VerificationRecord, VerificationStatus
+from driftlock.verification import (
+    VerificationControl,
+    VerificationRecord,
+    VerificationStatus,
+)
 
 
 class Verdict(StrEnum):
@@ -40,6 +44,7 @@ class VerificationRunStatus(StrEnum):
     VERIFICATION_LIMIT = "verification_limit"
     VERIFICATION_UNAVAILABLE = "verification_unavailable"
     VERIFICATION_BUDGET = "verification_budget"
+    VERIFICATION_RESTORE_FAILED = "verification_restore_failed"
 
 
 class JudgeReliabilityStatus(StrEnum):
@@ -237,6 +242,8 @@ class StepContext:
     attempt: int
     rollback_feedback: str | None
     tokens_remaining: int | None
+    verification_control: VerificationControl | None = None
+    verification_unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

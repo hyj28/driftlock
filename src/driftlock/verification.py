@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -38,9 +38,9 @@ MAX_VERIFICATION_EVIDENCE_CHARACTERS = 4_000
 # without duplicating the separately retained command evidence.
 MAX_VERIFICATION_REASON_CHARACTERS = 512
 
-# Version two records counterfactual and retryability facts needed to replay the
-# completion decision rather than reconstructing them from prose.
-VERIFICATION_CHECKPOINT_SCHEMA_VERSION = 2
+# Version three records both current-workspace executions and restoration failure,
+# making interchangeability and infrastructure loss replayable facts.
+VERIFICATION_CHECKPOINT_SCHEMA_VERSION = 3
 
 
 class VerificationStatus(StrEnum):
@@ -50,6 +50,7 @@ class VerificationStatus(StrEnum):
     REFUTED = "refuted"
     UNVERIFIABLE = "unverifiable"
     TRANSIENT_ERROR = "transient_error"
+    RESTORATION_FAILED = "restoration_failed"
     MALFORMED = "malformed"
     BUDGET_EXHAUSTED = "budget_exhausted"
 
@@ -59,8 +60,9 @@ class SelfVerificationConfig:
     """Opt into bounded model-selected, command-decided completion checks.
 
     The model chooses a falsifiable command, but never chooses whether that command
-    passed. Verification requires the same command to fail against the initial
-    workspace and pass against the current one. Exit one on the current workspace
+    passed. Verification requires the same command to pass on two restored current
+    workspaces and fail against the initial one. Disagreeing current runs are not
+    interchangeable and cannot decide the claim. Exit one on both current runs
     refutes; other execution failures are retryable. An explicitly uncheckable goal
     terminates with an ``UNVERIFIABLE`` record, never a synthetic pass or failure.
     """
@@ -90,6 +92,35 @@ class SelfVerificationConfig:
             raise ValueError("max_output_tokens cannot exceed max_tokens")
 
 
+VerificationControl = Callable[
+    [Mapping[str, Any], int, Callable[[], Awaitable[Any]]],
+    Awaitable[tuple[Any, Any, Any]],
+]
+
+
+class VerificationControlError(RuntimeError):
+    """A control-boundary failure with command accounting preserved."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        commands_run: int,
+        commands_failed: int,
+    ) -> None:
+        super().__init__(message)
+        self.commands_run = commands_run
+        self.commands_failed = commands_failed
+
+
+class VerificationRestorationError(VerificationControlError):
+    """The runner could not restore the protected current workspace."""
+
+
+class VerificationCommandError(VerificationControlError):
+    """A verification command attempt failed before returning a result."""
+
+
 @dataclass(frozen=True, slots=True)
 class VerificationRecord:
     """One bounded completion-verification attempt and its retained evidence."""
@@ -100,6 +131,7 @@ class VerificationRecord:
     command: str | None = None
     return_code: int | None = None
     control_return_code: int | None = None
+    confirmation_return_code: int | None = None
     evidence: str = ""
     evidence_truncated: bool = False
     tokens: int = 0
@@ -131,6 +163,11 @@ class VerificationRecord:
             or isinstance(self.control_return_code, bool)
         ):
             raise TypeError("control_return_code must be an integer or None")
+        if self.confirmation_return_code is not None and (
+            not isinstance(self.confirmation_return_code, int)
+            or isinstance(self.confirmation_return_code, bool)
+        ):
+            raise TypeError("confirmation_return_code must be an integer or None")
         if not isinstance(self.evidence, str):
             raise TypeError("evidence must be a string")
         if len(self.evidence) > MAX_VERIFICATION_EVIDENCE_CHARACTERS:
@@ -147,11 +184,32 @@ class VerificationRecord:
             raise TypeError("retryable must be a boolean")
         if self.attempt_limit_reached and not self.retryable:
             raise ValueError("only retryable records may exhaust the attempt limit")
+        if (
+            self.status
+            in {
+                VerificationStatus.REFUTED,
+                VerificationStatus.TRANSIENT_ERROR,
+                VerificationStatus.MALFORMED,
+            }
+            and not self.retryable
+        ):
+            raise ValueError(f"{self.status.value} records must be retryable")
+        if (
+            self.status
+            in {
+                VerificationStatus.VERIFIED,
+                VerificationStatus.RESTORATION_FAILED,
+                VerificationStatus.BUDGET_EXHAUSTED,
+            }
+            and self.retryable
+        ):
+            raise ValueError(f"{self.status.value} records cannot be retryable")
         if self.status is VerificationStatus.VERIFIED:
             if (
                 self.command is None
                 or self.return_code != 0
                 or self.control_return_code in {None, 0}
+                or self.confirmation_return_code != 0
             ):
                 raise ValueError(
                     "verified records require a passing command and failing control"
@@ -159,8 +217,14 @@ class VerificationRecord:
             if self.retryable:
                 raise ValueError("verified records cannot be retryable")
         elif self.status is VerificationStatus.REFUTED:
-            if self.command is None or self.return_code != 1:
-                raise ValueError("refuted records require an exit-one command")
+            if (
+                self.command is None
+                or self.return_code != 1
+                or self.confirmation_return_code != 1
+            ):
+                raise ValueError(
+                    "refuted records require two agreeing exit-one current runs"
+                )
         elif (
             self.status
             in {
@@ -179,13 +243,14 @@ class VerificationRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "attempt": self.attempt,
             "status": self.status.value,
             "reason": self.reason,
             "command": self.command,
             "return_code": self.return_code,
             "control_return_code": self.control_return_code,
+            "confirmation_return_code": self.confirmation_return_code,
             "evidence": self.evidence,
             "evidence_truncated": self.evidence_truncated,
             "tokens": self.tokens,
@@ -205,13 +270,14 @@ class VerificationRecord:
             "command",
             "return_code",
             "control_return_code",
+            "confirmation_return_code",
             "evidence",
             "evidence_truncated",
             "tokens",
             "attempt_limit_reached",
             "retryable",
         }
-        if set(value) != expected or value.get("schema_version") != 2:
+        if set(value) != expected or value.get("schema_version") != 3:
             raise ValueError("verification record fields are malformed")
         try:
             status = VerificationStatus(value.get("status"))
@@ -225,6 +291,9 @@ class VerificationRecord:
             return_code=value.get("return_code"),  # type: ignore[arg-type]
             control_return_code=value.get(  # type: ignore[arg-type]
                 "control_return_code"
+            ),
+            confirmation_return_code=value.get(  # type: ignore[arg-type]
+                "confirmation_return_code"
             ),
             evidence=value.get("evidence"),  # type: ignore[arg-type]
             evidence_truncated=value.get("evidence_truncated"),  # type: ignore[arg-type]

@@ -28,7 +28,13 @@ from driftlock.models import (
     Verdict,
     VerificationRunStatus,
 )
-from driftlock.verification import VerificationStatus
+from driftlock.verification import (
+    VerificationCommandError,
+    VerificationControl,
+    VerificationControlError,
+    VerificationRestorationError,
+    VerificationStatus,
+)
 
 StepFunction = Callable[[StepContext], Awaitable[StepOutcome]]
 
@@ -92,39 +98,106 @@ class DriftlockRunner:
         checkpoint_histories: dict[str, list[StepRecord]] = {
             checkpoint.checkpoint_id: []
         }
-        configure_verification = getattr(step, "configure_verification_control", None)
-        if (
-            callable(configure_verification)
-            and getattr(step, "self_verification", None) is not None
-        ):
+        verification_control: VerificationControl | None = None
+        verification_unavailable_reason: str | None = None
+        discard_checkpoint = getattr(self.checkpoint_store, "discard", None)
+        if not callable(discard_checkpoint):
+            verification_unavailable_reason = (
+                "The checkpoint store does not support bounded scratch-checkpoint "
+                "discard, so completion verification is unavailable."
+            )
+        else:
             initial_checkpoint = checkpoint
 
             async def run_verification_control(
                 current_state: Mapping[str, Any],
                 current_step: int,
                 operation: Callable[[], Awaitable[Any]],
-            ) -> tuple[Any, Any]:
-                # A passing command is evidence only when the same command fails
-                # against the pre-work checkpoint. Restoring a scratch checkpoint
-                # after both executions also makes checker writes non-persistent.
+            ) -> tuple[Any, Any, Any]:
+                # Current/control/current makes the two treatment runs exchangeable:
+                # disagreement exposes order dependence or nondeterminism. Every
+                # run starts from a checkpoint restore, so test-generated files are
+                # allowed but cannot survive into either a later run or completion.
                 scratch = await self._create_checkpoint(
                     current_state,
                     step=current_step,
                     label="verification-scratch",
                 )
-                try:
-                    await self._restore_checkpoint(initial_checkpoint)
-                    control_result = await operation()
-                    await self._restore_checkpoint(scratch)
-                    current_result = await operation()
-                    return control_result, current_result
-                finally:
-                    await self._restore_checkpoint(scratch)
-                    discarded = self.checkpoint_store.discard(scratch)
-                    if isawaitable(discarded):
-                        await discarded
+                commands_run = 0
+                commands_failed = 0
 
-            configure_verification(run_verification_control)
+                def command_counts() -> tuple[int, int]:
+                    return commands_run, commands_failed
+
+                async def run_operation() -> Any:
+                    nonlocal commands_run, commands_failed
+                    commands_run += 1
+                    try:
+                        item = await operation()
+                    except Exception as error:
+                        commands_failed += 1
+                        raise VerificationCommandError(
+                            str(error),
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+                    code = getattr(getattr(item, "result", None), "return_code", None)
+                    commands_failed += int(
+                        not isinstance(code, int) or isinstance(code, bool) or code != 0
+                    )
+                    return item
+
+                async def restore_boundary(target: Checkpoint, label: str) -> None:
+                    try:
+                        await self._restore_checkpoint(target)
+                    except Exception as error:
+                        commands_run, commands_failed = command_counts()
+                        raise VerificationRestorationError(
+                            f"{label} restore failed: {error}",
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+
+                try:
+                    first = await run_operation()
+                    await restore_boundary(initial_checkpoint, "initial workspace")
+                    control = await run_operation()
+                    await restore_boundary(scratch, "current workspace")
+                    confirmation = await run_operation()
+                    return first, control, confirmation
+                finally:
+                    try:
+                        await self._restore_checkpoint(scratch)
+                    except Exception as error:
+                        retained = scratch.path.exists()
+                        if retained:
+                            checkpoints.append(scratch)
+                        commands_run, commands_failed = command_counts()
+                        retained_detail = (
+                            f"; scratch checkpoint {scratch.checkpoint_id} retained "
+                            "for recovery"
+                            if retained
+                            else ""
+                        )
+                        raise VerificationRestorationError(
+                            "final current workspace restore failed: "
+                            f"{error}{retained_detail}",
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+                    try:
+                        discarded = discard_checkpoint(scratch)
+                        if isawaitable(discarded):
+                            await discarded
+                    except Exception as error:
+                        commands_run, commands_failed = command_counts()
+                        raise VerificationControlError(
+                            f"scratch checkpoint discard failed: {error}",
+                            commands_run=commands_run,
+                            commands_failed=commands_failed,
+                        ) from error
+
+            verification_control = run_verification_control
         all_steps: list[StepRecord] = []
         recent_steps: list[StepRecord] = []
         rollbacks: list[RollbackRecord] = []
@@ -147,6 +220,8 @@ class DriftlockRunner:
                 tokens_remaining=self._tokens_remaining(
                     agent_tokens_used + judge_tokens_used
                 ),
+                verification_control=verification_control,
+                verification_unavailable_reason=verification_unavailable_reason,
             )
             rollback_feedback = None
             try:
@@ -220,6 +295,23 @@ class DriftlockRunner:
                     current_checkpoint=checkpoint,
                     logical_step=logical_step,
                     checkpointable=outcome.workspace_delta_observed,
+                )
+            if (
+                outcome.verification is not None
+                and outcome.verification.status is VerificationStatus.RESTORATION_FAILED
+            ):
+                return await self._finish(
+                    VerificationRunStatus.VERIFICATION_RESTORE_FAILED,
+                    state,
+                    all_steps,
+                    rollbacks,
+                    coarse_triggers,
+                    checkpoints,
+                    agent_tokens_used,
+                    judge_tokens_used,
+                    current_checkpoint=checkpoint,
+                    logical_step=logical_step,
+                    checkpointable=False,
                 )
             if (
                 outcome.verification is not None

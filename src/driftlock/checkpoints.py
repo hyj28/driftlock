@@ -36,8 +36,6 @@ class CheckpointStore(Protocol):
         self, checkpoint: Checkpoint
     ) -> dict[str, Any] | Awaitable[dict[str, Any]]: ...
 
-    def discard(self, checkpoint: Checkpoint) -> Awaitable[None] | None: ...
-
 
 class DirectoryCheckpointStore:
     """Copy-on-checkpoint storage for a local workspace.
