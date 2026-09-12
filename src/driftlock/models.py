@@ -12,7 +12,7 @@ from typing import Any
 from driftlock.prompt_cache import (
     PromptCacheReport,
     PromptCacheSummary,
-    summarize_prompt_cache,
+    summarize_prompt_cache_reports,
 )
 
 
@@ -425,7 +425,7 @@ class RunResult:
             for step in self.steps
             if step.outcome.prompt_cache is not None
         )
-        return summarize_prompt_cache(reports) if reports else None
+        return summarize_prompt_cache_reports(reports) if reports else None
 
     @property
     def judge_attempts(self) -> int:

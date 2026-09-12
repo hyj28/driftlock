@@ -51,8 +51,9 @@ from driftlock.planning import (
 from driftlock.prompt_cache import (
     PromptCacheBreakpoint,
     PromptCacheConfig,
-    PromptCacheInvalidation,
+    PromptCachePrefixEvent,
     PromptCacheReportError,
+    malformed_prompt_cache_report,
     prompt_cache_report,
 )
 from driftlock.remote import RemoteEnvironment
@@ -221,6 +222,10 @@ _PROMPT_CACHE_PLAN_SNAPSHOT_KEY = "driftlock_prompt_cache_plan_snapshot"
 # The marker is versioned independently because archived cache-enabled state may
 # outlive the exact metadata used to recognize locally generated plan messages.
 _PROMPT_CACHE_PLAN_SNAPSHOT_SCHEMA_VERSION = 1
+
+# A maximum-sized rendered plan plus framing must fit inside cache-managed
+# history; otherwise preserving the current plan would silently exceed budget.
+MIN_PROMPT_CACHE_PLANNING_HISTORY_CHARACTERS = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -788,6 +793,15 @@ class ToolCallingAgent:
             raise TypeError("parallel_tool_calls must be a boolean")
         if prompt_cache is not None and not isinstance(prompt_cache, PromptCacheConfig):
             raise TypeError("prompt_cache must be a PromptCacheConfig or None")
+        if (
+            prompt_cache is not None
+            and planning
+            and max_history_characters < MIN_PROMPT_CACHE_PLANNING_HISTORY_CHARACTERS
+        ):
+            raise ValueError(
+                "cache-managed planning requires max_history_characters to be at "
+                f"least {MIN_PROMPT_CACHE_PLANNING_HISTORY_CHARACTERS}"
+            )
         if delegation_tool is not None and not isinstance(
             delegation_tool, DelegationTool
         ):
@@ -848,6 +862,9 @@ class ToolCallingAgent:
                     raise ValueError("at most 64 MCP tools may be exposed per agent")
         self.planning = planning
         self.prompt_cache = prompt_cache
+        self._last_cache_prefix: tuple[bytes, ...] | None = None
+        self._last_cache_completed_steps: int | None = None
+        self._last_cache_sequence: int | None = None
 
     def initial_state(self) -> dict[str, Any]:
         return self.codec.initial_state(
@@ -962,7 +979,8 @@ class ToolCallingAgent:
         current_plan_snapshot = None
         if self.prompt_cache is not None and self.planning:
             current_plan_snapshot = _prompt_cache_plan_snapshot(plan)
-            history.append(current_plan_snapshot)
+            if not _contains_plan_snapshot(history, current_plan_snapshot):
+                history.append(current_plan_snapshot)
         try:
             # Only provider-visible history is compacted and budgeted here. The
             # bounded plan stays beside it in checkpoint state and is injected
@@ -984,14 +1002,52 @@ class ToolCallingAgent:
         if current_plan_snapshot is not None and not _contains_plan_snapshot(
             history, current_plan_snapshot
         ):
-            # A summary-only compaction can be smaller than the bounded plan
-            # rendering. Keep the current plan available after that visible,
-            # recorded rewrite instead of silently replacing it with a summary.
-            history.append(current_plan_snapshot)
+            message = (
+                "Cache-managed planning compaction could not retain the current "
+                "plan within max_history_characters."
+            )
+            return StepOutcome(
+                action="Reject cache history budget breach",
+                state=self._encode_state(history, steps=completed_steps + 1, plan=plan),
+                error=message,
+                summary=message,
+                context_compactions=(
+                    (compaction.audit.to_dict(),)
+                    if compaction.audit is not None
+                    else ()
+                ),
+            )
         compaction_audits = (
             (compaction.audit.to_dict(),) if compaction.audit is not None else ()
         )
         messages = self._request_messages(context, history, plan)
+        includes_rollback_feedback = (
+            context.rollback_feedback is not None
+            if self.prompt_cache is not None
+            else bool(context.rollback_feedback)
+        )
+        cache_message_count = len(messages) - int(includes_rollback_feedback)
+        prefix_events: tuple[PromptCachePrefixEvent, ...] = ()
+        if self.prompt_cache is not None:
+            if (
+                self._last_cache_sequence is not None
+                and context.sequence <= self._last_cache_sequence
+            ):
+                self._last_cache_prefix = None
+                self._last_cache_completed_steps = None
+            current_prefix = _prompt_cache_prefix_fingerprints(
+                messages[:cache_message_count]
+            )
+            prefix_events = _prompt_cache_prefix_events(
+                previous=self._last_cache_prefix,
+                current=current_prefix,
+                previous_completed_steps=self._last_cache_completed_steps,
+                current_completed_steps=completed_steps,
+                compacted=compaction.audit is not None,
+            )
+            self._last_cache_prefix = current_prefix
+            self._last_cache_completed_steps = completed_steps
+            self._last_cache_sequence = context.sequence
         # Construct the historical type itself while cache management is absent:
         # even dataclass reflection must retain its exact archived wire shape.
         if self.prompt_cache is None:
@@ -1005,9 +1061,7 @@ class ToolCallingAgent:
                 messages=messages,
                 tools=self._tool_definitions(),
                 max_output_tokens=self.max_output_tokens,
-                cache_breakpoint=PromptCacheBreakpoint(
-                    len(messages) - int(bool(context.rollback_feedback))
-                ),
+                cache_breakpoint=PromptCacheBreakpoint(cache_message_count),
             )
         request = replace(
             request,
@@ -1042,6 +1096,9 @@ class ToolCallingAgent:
                 error=message,
                 summary=message,
                 context_compactions=compaction_audits,
+                prompt_cache=malformed_prompt_cache_report(
+                    error, prefix_events=prefix_events
+                ),
             )
         except AgentProviderError as error:
             message = f"Provider call failed: {error}"
@@ -1072,10 +1129,7 @@ class ToolCallingAgent:
                     prompt_cache_report(
                         prompt_tokens=None,
                         cached_tokens=None,
-                        invalidation=_prompt_cache_invalidation(
-                            compacted=compaction.audit is not None,
-                            rolled_back=bool(context.rollback_feedback),
-                        ),
+                        prefix_events=prefix_events,
                     )
                     if self.prompt_cache is not None
                     else None
@@ -1095,10 +1149,7 @@ class ToolCallingAgent:
                 cache_report = prompt_cache_report(
                     prompt_tokens=completion.prompt_tokens,
                     cached_tokens=completion.cached_tokens,
-                    invalidation=_prompt_cache_invalidation(
-                        compacted=compaction.audit is not None,
-                        rolled_back=bool(context.rollback_feedback),
-                    ),
+                    prefix_events=prefix_events,
                 )
             except PromptCacheReportError as error:
                 message = f"Malformed provider cache report: {error}"
@@ -1125,6 +1176,9 @@ class ToolCallingAgent:
                     error=message,
                     summary=message,
                     context_compactions=compaction_audits,
+                    prompt_cache=malformed_prompt_cache_report(
+                        error, prefix_events=prefix_events
+                    ),
                 )
 
         errors: list[str] = []
@@ -1351,7 +1405,12 @@ class ToolCallingAgent:
             },
             *[_provider_message(message) for message in history],
         ]
-        if context.rollback_feedback:
+        includes_rollback_feedback = (
+            context.rollback_feedback is not None
+            if self.prompt_cache is not None
+            else bool(context.rollback_feedback)
+        )
+        if includes_rollback_feedback:
             messages.append(
                 {
                     "role": "user",
@@ -2464,25 +2523,71 @@ def _prompt_cache_plan_snapshot(plan: AgentPlan | None) -> dict[str, Any]:
 def _contains_plan_snapshot(
     messages: Sequence[Mapping[str, Any]], snapshot: Mapping[str, Any]
 ) -> bool:
-    return any(
-        message.get(_PROMPT_CACHE_PLAN_SNAPSHOT_KEY)
+    latest = next(
+        (
+            message
+            for message in reversed(messages)
+            if _PROMPT_CACHE_PLAN_SNAPSHOT_KEY in message
+        ),
+        None,
+    )
+    return bool(
+        latest is not None
+        and latest.get(_PROMPT_CACHE_PLAN_SNAPSHOT_KEY)
         == snapshot[_PROMPT_CACHE_PLAN_SNAPSHOT_KEY]
-        and message.get("role") == snapshot["role"]
-        and message.get("content") == snapshot["content"]
+        and latest.get("role") == snapshot["role"]
+        and latest.get("content") == snapshot["content"]
+    )
+
+
+def _prompt_cache_prefix_fingerprints(
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[bytes, ...]:
+    """Fingerprint each cacheable message without retaining another conversation."""
+
+    return tuple(
+        hashlib.sha256(
+            json.dumps(
+                message,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).digest()
         for message in messages
     )
 
 
-def _prompt_cache_invalidation(
-    *, compacted: bool, rolled_back: bool
-) -> PromptCacheInvalidation | None:
-    if compacted and rolled_back:
-        return PromptCacheInvalidation.COMPACTION_AND_ROLLBACK
+def _prompt_cache_prefix_events(
+    *,
+    previous: tuple[bytes, ...] | None,
+    current: tuple[bytes, ...],
+    previous_completed_steps: int | None,
+    current_completed_steps: int,
+    compacted: bool,
+) -> tuple[PromptCachePrefixEvent, ...]:
+    """Classify observable prefix relationships; feedback text is not evidence."""
+
+    events: list[PromptCachePrefixEvent] = []
     if compacted:
-        return PromptCacheInvalidation.COMPACTION
-    if rolled_back:
-        return PromptCacheInvalidation.ROLLBACK
-    return None
+        events.append(PromptCachePrefixEvent.COMPACTION_INVALIDATED)
+    if previous is None or previous_completed_steps is None:
+        return tuple(events)
+    current_is_prior_prefix = (
+        len(current) <= len(previous) and previous[: len(current)] == current
+    )
+    previous_is_current_prefix = (
+        len(previous) <= len(current) and current[: len(previous)] == previous
+    )
+    if current_completed_steps <= previous_completed_steps:
+        events.append(
+            PromptCachePrefixEvent.ROLLBACK_PREFIX_RESTORED
+            if current_is_prior_prefix
+            else PromptCachePrefixEvent.ROLLBACK_PREFIX_DIVERGED
+        )
+    elif not compacted and not previous_is_current_prefix:
+        events.append(PromptCachePrefixEvent.UNCLASSIFIED_PREFIX_DIVERGENCE)
+    return tuple(dict.fromkeys(events))
 
 
 def _copy_conversation_messages(
