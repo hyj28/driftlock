@@ -20,6 +20,8 @@ from pathlib import Path
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
 
 _PROCESS_CLEANUP_TIMEOUT_SEC = 1.0
+# Give a child that immediately calls setsid time to leave its parent's group.
+_PROCESS_GROUP_SETTLE_SEC = 0.01
 _PROCESS_OWNER_ENV = "DRIFTLOCK_PROCESS_OWNER"
 
 
@@ -30,6 +32,8 @@ class LocalExecResult:
     return_code: int
     stdout: str
     stderr: str
+    # None means the producing backend did not observe process lifetime.
+    lingering_processes: int | None = None
 
 
 class LocalEnvironment:
@@ -122,12 +126,18 @@ class LocalEnvironment:
         stderr_task = asyncio.create_task(
             _read_capped(process.stderr, self.max_output_bytes)
         )
-        wait_task = asyncio.create_task(process.wait())
+        # ``Process.wait()`` may wait for inherited stdout/stderr pipes to close
+        # after the direct child exits. A surviving process group is observable
+        # sooner and must be stopped before its background work can run.
+        wait_task = asyncio.create_task(
+            _wait_for_command_boundary(process, stdout_task, stderr_task)
+        )
         timed_out = False
+        lingering_processes = 0
         try:
             await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
             return_code = process.returncode if process.returncode is not None else 1
-            await asyncio.to_thread(
+            lingering_processes = await asyncio.to_thread(
                 _terminate_owned_processes, process.pid, owner_token
             )
         except asyncio.CancelledError:
@@ -192,6 +202,7 @@ class LocalEnvironment:
             return_code=return_code,
             stdout=_decode_capped(stdout, self.max_output_bytes),
             stderr=_decode_capped(stderr, self.max_output_bytes),
+            lingering_processes=lingering_processes,
         )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -363,7 +374,16 @@ def _kill_processes(process_ids: tuple[int, ...]) -> None:
             os.kill(pid, signal.SIGKILL)
 
 
-def _terminate_owned_processes(root_pid: int, owner_token: str) -> None:
+def _terminate_owned_processes(root_pid: int, owner_token: str) -> int:
+    process_group_alive = False
+    try:
+        # A non-interactive shell may orphan a background job before descendant
+        # enumeration sees it, but it remains in the session-leading shell's
+        # process group unless it deliberately detaches.
+        os.killpg(root_pid, signal.SIGSTOP)
+        process_group_alive = True
+    except (ProcessLookupError, PermissionError):
+        pass
     owned = tuple(
         dict.fromkeys(
             (*_descendant_process_ids(root_pid), *_tagged_process_ids(owner_token))
@@ -383,7 +403,11 @@ def _terminate_owned_processes(root_pid: int, owner_token: str) -> None:
             )
         )
     )
+    if process_group_alive:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(root_pid, signal.SIGKILL)
     _kill_processes(tuple(reversed(owned)))
+    return max(len(owned), int(process_group_alive))
 
 
 def _tagged_process_ids(owner_token: str) -> tuple[int, ...]:
@@ -444,6 +468,24 @@ async def _read_capped(stream: asyncio.StreamReader, limit: int) -> bytes:
     except asyncio.CancelledError:
         pass
     return bytes(retained)
+
+
+async def _wait_for_command_boundary(
+    process: asyncio.subprocess.Process,
+    stdout_task: asyncio.Task[bytes],
+    stderr_task: asyncio.Task[bytes],
+) -> int:
+    while process.returncode is None:
+        await asyncio.sleep(0.001)
+    return_code = process.returncode
+    await asyncio.sleep(_PROCESS_GROUP_SETTLE_SEC)
+    try:
+        os.killpg(process.pid, 0)
+    except (ProcessLookupError, PermissionError):
+        # Preserve the existing timeout behavior for a detached process that
+        # outlives the direct child solely by holding inherited output pipes.
+        await asyncio.gather(asyncio.shield(stdout_task), asyncio.shield(stderr_task))
+    return return_code
 
 
 def _close_process_pipes(process: asyncio.subprocess.Process) -> None:

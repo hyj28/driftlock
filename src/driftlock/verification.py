@@ -59,10 +59,15 @@ class VerificationStatus(StrEnum):
 class SelfVerificationConfig:
     """Opt into bounded model-selected, command-decided completion checks.
 
-    The model chooses a falsifiable command, but never chooses whether that command
-    passed. Verification requires the same command to pass on two restored current
-    workspaces and fail against the initial one. Disagreeing current runs are not
-    interchangeable and cannot decide the claim. Exit one on both current runs
+    The model chooses a falsifiable command, but the host evaluates its exit codes.
+    The scheme establishes that the command passes only with the claimed work by
+    comparing a restored current workspace with the initial workspace and a repeat
+    run. It is not adversarially sound: a deliberately evasive command can use state
+    outside the checkpoints to counterfeit that signature. The intended threat is
+    an over-optimistic or careless check. Closing the external-state gap requires
+    run isolation, and driftlock does not run containers in the agent path.
+
+    Disagreeing current runs cannot decide the claim. Exit one on both current runs
     refutes; other execution failures are retryable. An explicitly uncheckable goal
     terminates with an ``UNVERIFIABLE`` record, never a synthetic pass or failure.
     """

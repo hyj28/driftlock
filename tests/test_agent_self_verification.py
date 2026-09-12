@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import shlex
 from collections import Counter
@@ -306,6 +307,26 @@ async def test_passing_verification_reaches_completed_runner_status(
         "budget_exhausted": 0,
     }
     assert result.verification_tokens_used == 5
+    assert provider.requests[1].messages[0]["content"] == (
+        "Independently check the claimed completion using\n"
+        "only the stated goal and a command that reads the workspace or runs its "
+        "own tests.\n"
+        "Do not accept prose as evidence. Call run_verification with exactly one "
+        "falsifiable,\n"
+        "deterministic command whose success depends on the claimed work being "
+        "present and\n"
+        "whose failure would distinguish its absence. The command must finish all "
+        "of its\n"
+        "work before returning and must not rely on invocation order or persistent "
+        "external\n"
+        "state. The host evaluates the evidence and decides whether it supports "
+        "the claim.\n"
+        "If no legitimate command can test any part of the claim, call "
+        "report_unverifiable\n"
+        "and explain why. Never inspect rewards, hidden verifiers, oracle artifacts, "
+        "ops, or\n"
+        "credentials."
+    )
 
 
 async def test_test_runner_side_effects_are_restored_but_verdict_is_honored(
@@ -347,6 +368,58 @@ async def test_test_runner_side_effects_are_restored_but_verdict_is_honored(
     assert record.confirmation_return_code == 0
     assert result.steps[0].outcome.commands_run == 3
     assert not (workspace / "__pycache__").exists()
+
+
+async def test_lingering_verification_process_is_terminated_and_disqualifies_check(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = workspace / "late.txt"
+    command = (
+        f"rm -rf {shlex.quote(str(outside))}; "
+        f"(sleep 0.3; touch {shlex.quote(str(marker))}) & "
+        "test -f answer.txt"
+    )
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "write_file",
+                        {"path": "answer.txt", "content": "done\n"},
+                        "write",
+                    ),
+                    ToolCall("complete", {"summary": "written"}, "complete"),
+                )
+            ),
+            _verification(command),
+        ]
+    )
+    agent = _agent(workspace, provider)
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=4),
+    ).run(
+        goal="write answer.txt",
+        step=agent,
+        initial_state=agent.initial_state(),
+    )
+    await asyncio.sleep(0.4)
+
+    record = result.verification_records[0]
+    assert result.status is VerificationRunStatus.VERIFICATION_UNAVAILABLE
+    assert record.status is VerificationStatus.UNVERIFIABLE
+    assert record.retryable is False
+    assert (record.return_code, record.control_return_code) == (0, 1)
+    assert record.confirmation_return_code == 0
+    assert "owned process(es) running" in record.reason
+    assert result.steps[0].outcome.commands_run == 3
+    assert not marker.exists()
 
 
 async def test_out_of_workspace_state_makes_current_runs_noninterchangeable(

@@ -114,10 +114,15 @@ class DriftlockRunner:
                 current_step: int,
                 operation: Callable[[], Awaitable[Any]],
             ) -> tuple[Any, Any, Any]:
-                # Current/control/current makes the two treatment runs exchangeable:
-                # disagreement exposes order dependence or nondeterminism. Every
-                # run starts from a checkpoint restore, so test-generated files are
-                # allowed but cannot survive into either a later run or completion.
+                # The differential/repeat scheme establishes that the command passes
+                # with the work, fails without it, and repeats under a restored
+                # workspace. It targets optimistic or careless checks, not an
+                # adversarial command: executions are not isolated, so state outside
+                # the checkpoints can counterfeit that signature. Closing that gap
+                # requires run isolation, and driftlock does not run containers in
+                # the agent path. Test-generated workspace files remain safe because
+                # every boundary is restored; environments may separately report
+                # surviving owned processes, which the agent disqualifies.
                 scratch = await self._create_checkpoint(
                     current_state,
                     step=current_step,
