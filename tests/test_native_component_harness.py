@@ -238,6 +238,41 @@ async def test_all_default_harness_request_matches_frozen_literal(
     }
 
 
+async def test_edit_file_harness_flag_off_then_on(tmp_path: Path) -> None:
+    _, default_call, default = _runtime(
+        tmp_path / "off",
+        [_response("complete", {"summary": "done"})],
+    )
+    _, enabled_call, enabled = _runtime(
+        tmp_path / "on",
+        [_response("complete", {"summary": "done"})],
+        edit_file=True,
+    )
+
+    await default.run(goal="literal goal")
+    await enabled.run(goal="literal goal")
+
+    assert [tool.name for tool in default.agent._tool_definitions()] == [
+        "run_shell",
+        "read_file",
+        "write_file",
+        "search_files",
+        "complete",
+    ]
+    assert [tool.name for tool in enabled.agent._tool_definitions()] == [
+        "run_shell",
+        "read_file",
+        "write_file",
+        "search_files",
+        "complete",
+        "edit_file",
+    ]
+    assert default.component_report()["active"] == ["compaction"]
+    assert enabled.component_report()["active"] == ["compaction", "edit_file"]
+    assert default_call.prompts[0] == _LITERAL_DEFAULT_PROMPT
+    assert '"name":"edit_file"' in enabled_call.prompts[0]
+
+
 async def test_planning_and_memory_are_individually_observable(tmp_path: Path) -> None:
     _, planning_call, planning = _runtime(
         tmp_path / "planning",
@@ -998,6 +1033,7 @@ def _lhtb_tree(tmp_path: Path) -> Path:
         "driftlock_memory",
         "driftlock_delegation",
         "driftlock_parallel_reads",
+        "driftlock_edit_file",
         "driftlock_prompt_cache",
         "driftlock_self_verification",
     ],
@@ -1049,6 +1085,7 @@ def test_experiment_config_exposes_retrieval_and_omits_all_default_flags(
             "driftlock_memory",
             "driftlock_delegation",
             "driftlock_parallel_reads",
+            "driftlock_edit_file",
             "driftlock_prompt_cache",
             "driftlock_self_verification",
         )

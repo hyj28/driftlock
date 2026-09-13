@@ -18,6 +18,9 @@ from driftlock.agent import (
     DEFAULT_MAX_HISTORY_CHARACTERS,
     DEFAULT_MAX_TOOL_CALLS_PER_STEP,
     DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+    MAX_EDIT_FILE_BYTES,
+    MAX_EDIT_MATCH_CHARACTERS,
+    MAX_EDIT_REPLACEMENT_CHARACTERS,
     MAX_PLAN_DESCRIPTION_CHARACTERS,
     MAX_PLAN_STEPS,
     PARALLEL_HISTORY_RESERVE_CHARACTERS,
@@ -801,6 +804,7 @@ class LHTBNativeAgentRuntime:
         delegation_tool: DelegationTool | None = None,
         planning: bool = False,
         parallel_tool_calls: bool = False,
+        edit_file: bool = False,
         prompt_cache: PromptCacheConfig | None = None,
         explicit_prompt_cache_control: bool = False,
         self_verification: SelfVerificationConfig | None = None,
@@ -878,6 +882,7 @@ class LHTBNativeAgentRuntime:
             delegation_tool=delegation_tool,
             planning=planning,
             parallel_tool_calls=parallel_tool_calls,
+            edit_file=edit_file,
             prompt_cache=prompt_cache,
             self_verification=self_verification,
         )
@@ -986,6 +991,17 @@ class LHTBNativeAgentRuntime:
                 ),
             },
         }
+        if self.agent.edit_file:
+            # Disabled historical runs retain their exact component report shape;
+            # the new attribution record exists only when the capability exists.
+            components["edit_file"] = {
+                "enabled": True,
+                "match_character_limit": MAX_EDIT_MATCH_CHARACTERS,
+                "replacement_character_limit": MAX_EDIT_REPLACEMENT_CHARACTERS,
+                "file_byte_limit": min(
+                    MAX_EDIT_FILE_BYTES, self.agent.max_tool_output_chars
+                ),
+            }
         return {
             "schema_version": 1,
             "active": [

@@ -226,6 +226,8 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_delegation: bool = False,
         # False preserves the historical serial tool execution order.
         driftlock_parallel_reads: bool = False,
+        # False preserves the archived five-tool request byte-for-byte.
+        driftlock_edit_file: bool = False,
         # Historical defaults are coupled to retain one worst-case parallel turn.
         driftlock_max_tool_output_characters: int = (
             DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS
@@ -257,6 +259,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             "driftlock_memory": driftlock_memory,
             "driftlock_delegation": driftlock_delegation,
             "driftlock_parallel_reads": driftlock_parallel_reads,
+            "driftlock_edit_file": driftlock_edit_file,
             "driftlock_self_verification": driftlock_self_verification,
         }
         for name, value in component_flags.items():
@@ -428,6 +431,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         self._native_planning = driftlock_planning
         self._native_delegation = driftlock_delegation
         self._native_parallel_reads = driftlock_parallel_reads
+        self._native_edit_file = driftlock_edit_file
         self._native_max_tool_output_characters = driftlock_max_tool_output_characters
         self._native_max_tool_calls_per_step = driftlock_max_tool_calls_per_step
         self._native_max_history_characters = driftlock_max_history_characters
@@ -706,6 +710,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             delegation_tool=delegation_tool,
             planning=self._native_planning,
             parallel_tool_calls=self._native_parallel_reads,
+            edit_file=self._native_edit_file,
             prompt_cache=(PromptCacheConfig() if self._native_prompt_cache else None),
             explicit_prompt_cache_control=(
                 self._native_low_level.explicit_prompt_cache_control

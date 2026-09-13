@@ -217,6 +217,7 @@ def build_job_config(
     driftlock_memory: bool = False,
     driftlock_delegation: bool = False,
     driftlock_parallel_reads: bool = False,
+    driftlock_edit_file: bool = False,
     driftlock_prompt_cache: bool = False,
     driftlock_explicit_prompt_cache_control: bool = False,
     driftlock_self_verification: bool = False,
@@ -270,6 +271,7 @@ def build_job_config(
         "driftlock_memory": driftlock_memory,
         "driftlock_delegation": driftlock_delegation,
         "driftlock_parallel_reads": driftlock_parallel_reads,
+        "driftlock_edit_file": driftlock_edit_file,
         "driftlock_prompt_cache": driftlock_prompt_cache,
         "driftlock_explicit_prompt_cache_control": (
             driftlock_explicit_prompt_cache_control
@@ -1576,6 +1578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 driftlock_memory=args.memory,
                 driftlock_delegation=args.delegation,
                 driftlock_parallel_reads=args.parallel_reads,
+                driftlock_edit_file=args.edit_file,
                 driftlock_prompt_cache=args.prompt_cache,
                 driftlock_explicit_prompt_cache_control=(
                     args.explicit_prompt_cache_control
@@ -2152,6 +2155,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--memory", action="store_true")
         command.add_argument("--delegation", action="store_true")
         command.add_argument("--parallel-reads", action="store_true")
+        command.add_argument("--edit-file", action="store_true")
         command.add_argument("--prompt-cache", action="store_true")
         command.add_argument("--explicit-prompt-cache-control", action="store_true")
         command.add_argument("--self-verification", action="store_true")
