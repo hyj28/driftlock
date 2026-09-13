@@ -25,10 +25,13 @@ from driftlock.models import RunStatus, VerificationRunStatus
 from driftlock.native_lhtb import (
     MCP_EXPERIMENT_EXCLUSION_REASON,
     BilledProviderResponse,
+    ContextUsageRecorder,
     LHTBNativeAgentRuntime,
     NativeComponentConfigurationError,
     ProviderUsage,
     SingleAttemptJSONProvider,
+    apply_native_accounting,
+    build_remote_agentic_retrieval_tool,
     set_native_result_metadata,
     validate_parallel_compaction_bounds,
 )
@@ -296,9 +299,71 @@ async def test_retrieval_is_live_beside_the_existing_agent_path(tmp_path: Path) 
     audit = result.steps[0].outcome.tool_audits[0]["result"]
     assert audit["mode"] == "agentic-context-retrieval"
     assert audit["selected_document_count"] == 1
-    assert (
-        runtime.component_report()["components"]["agentic_retrieval"]["enabled"] is True
+    assert isinstance(retrieval.corpus.build_report, dict)
+    retrieval.corpus.build_report["excluded_source_count"] = 100
+    retrieval.corpus.build_report["exclusion_reason_counts"] = {"synthetic": 100}
+    retrieval.corpus.build_report["excluded_sources"] = [
+        {
+            "kind": "workspace",
+            "origin": f"excluded-{index}",
+            "reason": "synthetic",
+            "detail": "x" * 1_000,
+        }
+        for index in range(100)
+    ]
+    component = runtime.component_report()["components"]["agentic_retrieval"]
+    assert component["enabled"] is True
+    corpus = component["corpus"]
+    assert corpus["build_exclusion_count"] == 100
+    assert len(corpus["build_exclusion_sample"]) == 16
+    assert corpus["unreported_build_exclusion_count"] == 84
+    assert all(
+        len(exclusion["detail"]) == 512
+        for exclusion in corpus["build_exclusion_sample"]
     )
+    assert "build_exclusions" not in corpus
+
+
+async def test_retrieval_build_rejects_failed_and_empty_corpora(tmp_path: Path) -> None:
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+    library = SkillLibrary(tmp_path / "library")
+
+    failed_workspace = tmp_path / "failed-workspace"
+    failed_workspace.mkdir()
+    (failed_workspace / "evidence.txt").write_text("evidence", encoding="utf-8")
+
+    def broken_embed(_texts: object) -> object:
+        raise RuntimeError("model unavailable")
+
+    with pytest.raises(
+        NativeComponentConfigurationError,
+        match="retrieval corpus build failed configuration: embedding_callable_failed",
+    ):
+        await build_remote_agentic_retrieval_tool(
+            _Environment(),
+            remote_workspace=str(failed_workspace),
+            store_dir=tmp_path / "failed-store",
+            remote_tmp_dir=str(remote_tmp),
+            user="agent-user",
+            skill_library=library,
+            embed=broken_embed,
+        )
+
+    empty_workspace = tmp_path / "empty-workspace"
+    empty_workspace.mkdir()
+    with pytest.raises(
+        NativeComponentConfigurationError, match="retrieval corpus is empty"
+    ):
+        await build_remote_agentic_retrieval_tool(
+            _Environment(),
+            remote_workspace=str(empty_workspace),
+            store_dir=tmp_path / "empty-store",
+            remote_tmp_dir=str(remote_tmp),
+            user="agent-user",
+            skill_library=library,
+            embed=lambda _texts: pytest.fail("empty corpus must not call embedder"),
+        )
 
 
 async def test_delegated_child_is_bounded_and_cannot_recurse(tmp_path: Path) -> None:
@@ -351,6 +416,205 @@ async def test_delegated_child_is_bounded_and_cannot_recurse(tmp_path: Path) -> 
     assert report["configuration"]["max_tokens_per_call"] == 32_000
 
 
+class _VerificationOverageCall(_PhysicalCall):
+    async def __call__(
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        cacheable_prefix_characters: int | None,
+    ) -> BilledProviderResponse:
+        if self._physical_call_count < 3:
+            return await super().__call__(
+                prompt,
+                max_output_tokens=max_output_tokens,
+                cacheable_prefix_characters=cacheable_prefix_characters,
+            )
+        self._physical_call_count += 1
+        self.prompts.append(prompt)
+        self.output_caps.append(max_output_tokens)
+        self.cache_breakpoints.append(cacheable_prefix_characters)
+        return BilledProviderResponse(
+            self.responses.pop(0), ProviderUsage(input_tokens=5_000)
+        )
+
+
+async def test_delegation_and_post_call_verification_budget_do_not_abort(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _Environment()
+    call = _VerificationOverageCall(
+        [
+            _response("delegate_task", {"objective": "inspect"}),
+            _response("complete", {"summary": "child done"}),
+            _response("complete", {"summary": "parent done"}),
+            _response("report_unverifiable", {"reason": "unused over-budget reply"}),
+        ]
+    )
+    provider = SingleAttemptJSONProvider(call)
+    child = ToolCallingSubagentExecutor(
+        environment,
+        _Observer(workspace),
+        provider,
+        max_output_tokens=512,
+        min_output_tokens=4,
+        prefill_estimator=provider.prefill_estimate,
+    )
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+    runtime = LHTBNativeAgentRuntime(
+        environment,
+        _Observer(workspace),
+        provider,
+        remote_workspace=str(workspace),
+        store_dir=tmp_path / "checkpoints",
+        remote_tmp_dir=str(remote_tmp),
+        user="agent-user",
+        runner_config=RunnerConfig(max_steps=8, max_tokens=1_000_000),
+        agent_max_output_tokens=512,
+        agent_min_output_tokens=4,
+        delegation_tool=DelegationTool(child),
+        self_verification=SelfVerificationConfig(max_tokens=4_096),
+    )
+
+    result = await runtime.run(goal="delegate then verify")
+
+    assert result.status is VerificationRunStatus.VERIFICATION_BUDGET
+    assert call.physical_call_count == 4
+    reconciliation = runtime.last_provider_call_reconciliation
+    assert reconciliation is not None
+    assert reconciliation["status"] == "component_accounting_incomplete"
+    assert reconciliation["unknown_billed_calls"] == 0
+    assert reconciliation["provider_tokens_outside_runner_budget"] == 904
+    assert reconciliation["steps"][1]["incomplete_reasons"] == [
+        "verification_provider_usage_exceeded_allowance"
+    ]
+    context = SimpleNamespace(
+        n_input_tokens=None,
+        n_cache_tokens=None,
+        n_output_tokens=None,
+        cost_usd=None,
+        metadata={},
+    )
+    apply_native_accounting(
+        context,
+        recorder=ContextUsageRecorder(context),
+        runtime=runtime,
+        provider=provider,
+        agent_request_times_msec=(),
+        reconcile=True,
+    )
+    assert context.n_input_tokens == 5_003
+    assert context.n_output_tokens == 3
+
+
+class _TimedDelegationCall(_PhysicalCall):
+    async def __call__(
+        self,
+        prompt: str,
+        *,
+        max_output_tokens: int,
+        cacheable_prefix_characters: int | None,
+    ) -> BilledProviderResponse:
+        if self._physical_call_count == 3:
+            self._physical_call_count += 1
+            self.prompts.append(prompt)
+            self.output_caps.append(max_output_tokens)
+            self.cache_breakpoints.append(cacheable_prefix_characters)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+        return await super().__call__(
+            prompt,
+            max_output_tokens=max_output_tokens,
+            cacheable_prefix_characters=cacheable_prefix_characters,
+        )
+
+
+async def test_delegation_timeout_with_child_calls_is_recorded_not_raised(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _Environment()
+    call = _TimedDelegationCall(
+        [
+            _response("delegate_task", {"objective": "inspect until timeout"}),
+            json.dumps({"text": "child step one", "tool_calls": []}),
+            json.dumps({"text": "child step two", "tool_calls": []}),
+            _response("complete", {"summary": "parent observed timeout"}),
+        ]
+    )
+    provider = SingleAttemptJSONProvider(call)
+    child = ToolCallingSubagentExecutor(
+        environment,
+        _Observer(workspace),
+        provider,
+        max_output_tokens=512,
+        min_output_tokens=4,
+        prefill_estimator=provider.prefill_estimate,
+    )
+    delegation = DelegationTool(child, config=DelegationConfig(timeout_seconds=0.01))
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+    runtime = LHTBNativeAgentRuntime(
+        environment,
+        _Observer(workspace),
+        provider,
+        remote_workspace=str(workspace),
+        store_dir=tmp_path / "checkpoints",
+        remote_tmp_dir=str(remote_tmp),
+        user="agent-user",
+        runner_config=RunnerConfig(max_steps=8, max_tokens=1_000_000),
+        agent_max_output_tokens=512,
+        agent_min_output_tokens=4,
+        delegation_tool=delegation,
+    )
+
+    result = await runtime.run(goal="handle a child timeout")
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.steps[0].outcome.tool_audits[0]["result"]["status"] == "timed_out"
+    assert call.physical_call_count == 5
+    assert provider.exact_usage_request_count == 4
+    assert provider.unknown_billed_request_count == 1
+    reconciliation = runtime.last_provider_call_reconciliation
+    assert reconciliation is not None
+    assert reconciliation["status"] == "component_accounting_incomplete"
+    assert reconciliation["unknown_billed_calls"] == 1
+    assert reconciliation["steps"][0]["expected_physical_calls"] is None
+    assert reconciliation["steps"][0]["incomplete_reasons"] == [
+        "delegation_provider_calls_unknown"
+    ]
+    context = SimpleNamespace(
+        n_input_tokens=None,
+        n_cache_tokens=None,
+        n_output_tokens=None,
+        cost_usd=None,
+        metadata={},
+    )
+    apply_native_accounting(
+        context,
+        recorder=ContextUsageRecorder(context),
+        runtime=runtime,
+        provider=provider,
+        agent_request_times_msec=(),
+        reconcile=True,
+    )
+    assert context.metadata["driftlock_native_usage"] == {
+        "input_tokens": 4,
+        "cache_tokens": 0,
+        "output_tokens": 4,
+        "cost_usd": 0.0,
+        "provider_request_count": 4,
+        "physical_provider_request_count": 5,
+        "unknown_billed_request_count": 1,
+        "usage_complete": False,
+        "judge_request_count": 0,
+    }
+
+
 async def test_parallel_reads_keep_compaction_coupling_at_tight_bound(
     tmp_path: Path,
 ) -> None:
@@ -401,6 +665,16 @@ def test_parallel_compaction_bounds_are_checked_in_both_directions(
         )
 
 
+def test_serial_tool_batches_preserve_the_same_compaction_bound() -> None:
+    with pytest.raises(NativeComponentConfigurationError, match="serial tool-call"):
+        validate_parallel_compaction_bounds(
+            parallel_tool_calls=False,
+            max_tool_calls_per_step=4,
+            max_tool_output_characters=16_001,
+            max_history_characters=96_000,
+        )
+
+
 async def test_self_verification_termination_and_every_status_are_recordable(
     tmp_path: Path,
 ) -> None:
@@ -441,11 +715,54 @@ async def test_self_verification_termination_and_every_status_are_recordable(
         "driftlock_verification_unavailable"
     )
     assert context.metadata["driftlock"]["self_verification"] == {
+        "verification_ran": True,
         "affected_outcome": True,
         "run_status": "verification_unavailable",
         "tokens_used": 2,
         "status_counts": result.verification_status_counts,
     }
+
+
+async def test_verified_record_says_verification_ran_without_changing_outcome(
+    tmp_path: Path,
+) -> None:
+    _, _, runtime = _runtime(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "text": "",
+                    "tool_calls": [
+                        {
+                            "name": "write_file",
+                            "arguments": {"path": "answer.txt", "content": "done\n"},
+                        },
+                        {"name": "complete", "arguments": {"summary": "done"}},
+                    ],
+                }
+            ),
+            _response("run_verification", {"command": "test -f answer.txt"}),
+        ],
+        self_verification=SelfVerificationConfig(max_tokens=4_096),
+    )
+
+    result = await runtime.run(goal="create answer.txt")
+    context = SimpleNamespace(metadata={})
+    set_native_result_metadata(
+        context,
+        result=result,
+        runtime=runtime,
+        trial_token_budget=1_000_000,
+        components=runtime.component_report(),
+    )
+
+    assert result.status is RunStatus.COMPLETED
+    assert (
+        context.metadata["driftlock"]["self_verification"]["verification_ran"] is True
+    )
+    assert (
+        context.metadata["driftlock"]["self_verification"]["affected_outcome"] is False
+    )
 
 
 async def test_plausible_combination_completes_with_all_invariants(
@@ -676,14 +993,19 @@ def test_experiment_config_exposes_retrieval_and_omits_all_default_flags(
 
 
 def test_mcp_is_an_explicit_exclusion_without_a_harness_flag() -> None:
-    source = Path("src/driftlock/harbor_native_agent.py")
+    source = (
+        Path(__file__).resolve().parents[1] / "src/driftlock/harbor_native_agent.py"
+    )
     tree = ast.parse(source.read_text(encoding="utf-8"))
+    agent_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "LHTBNativeDriftlockAgent"
+    )
     constructor = next(
         node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "__init__"
-        and node.lineno > 150
+        for node in agent_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
     )
     keyword_names = {argument.arg for argument in constructor.args.kwonlyargs}
     assert "driftlock_mcp" not in keyword_names

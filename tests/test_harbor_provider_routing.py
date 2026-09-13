@@ -1526,6 +1526,151 @@ def test_native_retrieval_missing_optional_embedder_fails_during_configuration(
     assert _FakeLiteLLM.instances == []
 
 
+@pytest.mark.parametrize("failure", [RuntimeError("model cache missing"), [[0.0, 0.0]]])
+def test_native_retrieval_unusable_embedder_fails_during_configuration(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: object,
+) -> None:
+    _, native_agent = harbor_agent_modules
+    import driftlock.st_embedder as st_embedder
+
+    library = tmp_path / "library"
+    library.mkdir()
+    monkeypatch.setattr(
+        native_agent.importlib.util, "find_spec", lambda _name: object()
+    )
+
+    def probe(_texts: object) -> object:
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(st_embedder, "embed", probe)
+
+    with pytest.raises(
+        native_agent.NativeComponentConfigurationError,
+        match="cannot initialize the pinned optional embedder",
+    ):
+        native_agent.LHTBNativeDriftlockAgent(
+            logs_dir=tmp_path / "logs",
+            model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+            llm_call_kwargs=_agent_call_kwargs(),
+            model_info={
+                "max_input_tokens": 128000,
+                "max_output_tokens": 8192,
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+            },
+            driftlock_agentic_retrieval=True,
+            driftlock_retrieval_skill_library_dir=str(library),
+        )
+
+    assert _FakeLiteLLM.instances == []
+
+
+def test_native_retrieval_empty_skill_library_fails_during_configuration(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, native_agent = harbor_agent_modules
+    import driftlock.st_embedder as st_embedder
+
+    library = tmp_path / "library"
+    library.mkdir()
+    monkeypatch.setattr(
+        native_agent.importlib.util, "find_spec", lambda _name: object()
+    )
+    monkeypatch.setattr(st_embedder, "embed", lambda _texts: [[1.0, 0.0]])
+
+    with pytest.raises(
+        native_agent.NativeComponentConfigurationError,
+        match="requires at least one admitted skill",
+    ):
+        native_agent.LHTBNativeDriftlockAgent(
+            logs_dir=tmp_path / "logs",
+            model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+            llm_call_kwargs=_agent_call_kwargs(),
+            model_info={
+                "max_input_tokens": 128000,
+                "max_output_tokens": 8192,
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+            },
+            driftlock_agentic_retrieval=True,
+            driftlock_retrieval_skill_library_dir=str(library),
+        )
+
+    assert _FakeLiteLLM.instances == []
+
+
+async def test_native_harness_default_constructor_pins_historical_components(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    logs = tmp_path / "default" / "agent"
+    logs.mkdir(parents=True)
+    agent = native_agent.LHTBNativeDriftlockAgent(
+        logs_dir=logs,
+        model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+        llm_call_kwargs=_agent_call_kwargs(),
+        model_info={
+            "max_input_tokens": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+        },
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = SimpleNamespace(
+        default_user="root",
+        task_env_config=SimpleNamespace(workdir=str(workspace)),
+    )
+    context = SimpleNamespace(
+        n_input_tokens=None,
+        n_cache_tokens=None,
+        n_output_tokens=None,
+        cost_usd=None,
+        metadata={},
+    )
+
+    runtime = await agent._ensure_runtime(environment, context, "literal task")
+
+    report = runtime.component_report()
+    assert report["active"] == ["compaction"]
+    assert report["components"]["compaction"] == {
+        "enabled": True,
+        "max_history_characters": 96_000,
+        "max_tool_output_characters": 16_000,
+        "max_tool_calls_per_step": 4,
+        "parallel_history_reserve_characters": 32_000,
+    }
+    assert report["components"]["parallel_reads"] == {
+        "enabled": False,
+        "eligible_tools": ["read_file", "search_files"],
+        "required_history_characters": 96_000,
+    }
+    assert report["components"]["prompt_cache"] == {
+        "enabled": False,
+        "explicit_provider_control": False,
+    }
+    assert [tool.name for tool in runtime.agent._tool_definitions()] == [
+        "run_shell",
+        "read_file",
+        "write_file",
+        "search_files",
+        "complete",
+    ]
+    payload = json.loads(
+        (logs / "driftlock-native-result.json").read_text(encoding="utf-8")
+    )
+    assert payload["active_components"] == ["compaction"]
+
+
 def test_native_harness_memory_roots_are_isolated_per_harbor_trial(
     tmp_path: Path,
     harbor_agent_modules: tuple[Any, Any],
@@ -1565,6 +1710,32 @@ def test_native_harness_memory_roots_are_isolated_per_harbor_trial(
     )
     assert control._native_memory_store.memory_ids() == ("memory-000001",)
     assert treatment._native_memory_store.memory_ids() == ()
+
+
+def test_native_harness_rejects_reused_nonempty_memory_root(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    options = {
+        "logs_dir": tmp_path / "shared" / "agent",
+        "model_name": "openrouter/deepseek/deepseek-v4-flash-0731",
+        "llm_call_kwargs": _agent_call_kwargs(),
+        "model_info": {
+            "max_input_tokens": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+        },
+        "driftlock_memory": True,
+    }
+    native_agent.LHTBNativeDriftlockAgent(**options)
+
+    with pytest.raises(
+        native_agent.NativeComponentConfigurationError,
+        match="memory root must be empty at trial construction",
+    ):
+        native_agent.LHTBNativeDriftlockAgent(**options)
 
 
 async def test_native_harness_constructs_components_and_records_configuration(
@@ -1629,6 +1800,10 @@ async def test_native_harness_constructs_components_and_records_configuration(
         "self_verification",
     ]
     assert payload["components"]["memory"]["scope"] == "harbor_trial"
+    assert payload["components"]["memory"]["limitation"] == (
+        "memory persists across verifier-resume phases within one trial, but never "
+        "across Harbor tasks or paired trials"
+    )
     assert payload["components"]["delegation"]["child_can_delegate"] is False
     assert payload["components"]["mcp"]["availability"] == (
         "excluded_from_lhtb_experiment"

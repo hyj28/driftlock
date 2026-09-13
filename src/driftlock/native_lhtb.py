@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import shlex
@@ -26,7 +27,7 @@ from driftlock.agent import (
     ToolCall,
     ToolCallingAgent,
 )
-from driftlock.agentic_retrieval import AgenticRetrievalTool
+from driftlock.agentic_retrieval import AgenticRetrievalTool, RetrievalCorpusStatus
 from driftlock.delegation import DelegationTool
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import FineJudge
@@ -64,17 +65,18 @@ def validate_parallel_compaction_bounds(
     max_tool_output_characters: int,
     max_history_characters: int,
 ) -> None:
-    """Keep a worst-case parallel read turn retainable by compaction."""
+    """Keep a worst-case multi-tool turn retainable by compaction."""
 
-    if not parallel_tool_calls:
-        return
+    if not isinstance(parallel_tool_calls, bool):
+        raise TypeError("parallel_tool_calls must be a boolean")
     required = (
         max_tool_calls_per_step * max_tool_output_characters
         + PARALLEL_HISTORY_RESERVE_CHARACTERS
     )
     if max_history_characters < required:
         raise NativeComponentConfigurationError(
-            "parallel reads require max_history_characters >= "
+            "parallel reads and serial tool-call batches require "
+            "max_history_characters >= "
             "max_tool_calls_per_step * max_tool_output_characters + "
             f"{PARALLEL_HISTORY_RESERVE_CHARACTERS}; got "
             f"{max_history_characters} < {required}"
@@ -85,26 +87,109 @@ def _dataclass_config(value: Any) -> dict[str, Any]:
     return {field.name: getattr(value, field.name) for field in fields(value)}
 
 
-def _expected_step_provider_calls(outcome: StepOutcome) -> int:
-    """Derive the exact physical-call count from bounded step evidence."""
+@dataclass(frozen=True, slots=True)
+class _ProviderCallExpectation:
+    exact: int | None
+    incomplete_reasons: tuple[str, ...] = ()
+
+
+def _expected_step_provider_calls(outcome: StepOutcome) -> _ProviderCallExpectation:
+    """Derive an exact call count, or preserve why component evidence cannot."""
 
     expected = 1
-    if (
-        outcome.verification is not None
-        and outcome.verification.status is not VerificationStatus.BUDGET_EXHAUSTED
+    verification = outcome.verification
+    # A budget refusal before dispatch records zero tokens. The other
+    # BUDGET_EXHAUSTED path is reached after a paid response reports usage above
+    # the allowance, so it still consumed one physical call.
+    if verification is not None and (
+        verification.status is not VerificationStatus.BUDGET_EXHAUSTED
+        or verification.tokens > 0
     ):
         expected += 1
+    incomplete_reasons: list[str] = []
     for audit in outcome.tool_audits:
         result = audit.get("result") if isinstance(audit, Mapping) else None
         if not isinstance(result, Mapping):
             continue
         if result.get("mode") != "sub-agent-delegation":
             continue
+        tokens = result.get("tokens")
+        if (
+            not isinstance(tokens, Mapping)
+            or tokens.get("accounting_known") is not True
+        ):
+            incomplete_reasons.append("delegation_provider_calls_unknown")
+            continue
         steps = result.get("steps")
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
             raise RuntimeError("delegation audit has invalid child step accounting")
         expected += steps
-    return expected
+    return _ProviderCallExpectation(
+        None if incomplete_reasons else expected,
+        tuple(incomplete_reasons),
+    )
+
+
+def _verification_effect_report(result: RunResult) -> dict[str, Any]:
+    return {
+        "verification_ran": True,
+        "affected_outcome": any(
+            record.status is not VerificationStatus.VERIFIED
+            for record in result.verification_records
+        ),
+        "run_status": result.status.value,
+        "tokens_used": result.verification_tokens_used,
+        "status_counts": result.verification_status_counts,
+    }
+
+
+def _component_token_mismatch_reason(outcome: StepOutcome) -> str | None:
+    verification = outcome.verification
+    if (
+        verification is not None
+        and verification.status is VerificationStatus.BUDGET_EXHAUSTED
+        and verification.tokens > 0
+    ):
+        return "verification_provider_usage_exceeded_allowance"
+    for audit in outcome.tool_audits:
+        result = audit.get("result") if isinstance(audit, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("mode") != "sub-agent-delegation":
+            continue
+        tokens = result.get("tokens")
+        if (
+            not isinstance(tokens, Mapping)
+            or tokens.get("accounting_known") is not True
+        ):
+            return "delegation_token_accounting_unknown"
+    return None
+
+
+_MAX_RETRIEVAL_EXCLUSION_SAMPLES = 16
+_MAX_RETRIEVAL_EXCLUSION_VALUE_CHARACTERS = 512
+
+
+def _bounded_retrieval_corpus_report(tool: AgenticRetrievalTool) -> dict[str, Any]:
+    report = tool.corpus.snapshot_report()
+    exclusions = report.pop("build_exclusions", [])
+    samples = [
+        {
+            str(name): (
+                value[:_MAX_RETRIEVAL_EXCLUSION_VALUE_CHARACTERS]
+                if isinstance(value, str)
+                else value
+            )
+            for name, value in exclusion.items()
+        }
+        for exclusion in exclusions[:_MAX_RETRIEVAL_EXCLUSION_SAMPLES]
+        if isinstance(exclusion, Mapping)
+    ]
+    report["build_exclusion_sample"] = samples
+    report["unreported_build_exclusion_count"] = max(
+        0, report["build_exclusion_count"] - len(samples)
+    )
+    return report
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +441,14 @@ class SingleAttemptJSONProvider:
                 max_output_tokens=request.max_output_tokens,
                 cacheable_prefix_characters=prompt.cacheable_prefix_characters,
             )
+        except asyncio.CancelledError:
+            # A delegation timeout can cancel an in-flight paid request before
+            # usage is returned. Preserve that physical request as explicitly
+            # unknown accounting and let the component outcome remain a normal
+            # trial observation.
+            self._require_one_call(calls_before)
+            self._unknown_billed_request_count += 1
+            raise
         except BilledProviderFailure as error:
             self._require_one_call(calls_before)
             if error.usage is None:
@@ -506,12 +599,25 @@ async def build_remote_agentic_retrieval_tool(
         extracted.mkdir(parents=True)
         with tarfile.open(archive, "r:gz") as handle:
             handle.extractall(extracted, filter="data")
-        return AgenticRetrievalTool.from_workspace(
+        tool = AgenticRetrievalTool.from_workspace(
             extracted,
             skill_library,
             embed,
             memory_store=memory_store,
         )
+        corpus = tool.corpus
+        if corpus.status is not RetrievalCorpusStatus.READY:
+            refusal = dict(corpus.refusal or {})
+            reason = refusal.get("reason", "corpus_build_failed")
+            raise NativeComponentConfigurationError(
+                "driftlock agentic retrieval corpus build failed configuration: "
+                f"{reason}"
+            )
+        if not corpus.documents:
+            raise NativeComponentConfigurationError(
+                "driftlock agentic retrieval corpus is empty; no documents were indexed"
+            )
+        return tool
     finally:
         shutil.rmtree(staging_store, ignore_errors=True)
 
@@ -581,9 +687,22 @@ def apply_native_accounting(
     judge_output = judge.n_output_tokens if judge is not None else 0
     judge_cost = judge.cost_usd if judge is not None else 0.0
     if reconcile:
-        if provider.unknown_billed_request_count:
-            raise RuntimeError("native provider has unknown billed usage")
-        if provider_usage.total_tokens != runtime.agent_tokens_consumed:
+        reconciliation = getattr(runtime, "last_provider_call_reconciliation", None)
+        tolerated_unknown_calls = (
+            reconciliation.get("cumulative_unknown_billed_calls", 0)
+            if isinstance(reconciliation, Mapping)
+            else 0
+        )
+        if provider.unknown_billed_request_count != tolerated_unknown_calls:
+            raise RuntimeError("native provider has unexplained unknown billed usage")
+        tolerated_token_overage = (
+            reconciliation.get("cumulative_provider_tokens_outside_runner_budget", 0)
+            if isinstance(reconciliation, Mapping)
+            else 0
+        )
+        if provider_usage.total_tokens != (
+            runtime.agent_tokens_consumed + tolerated_token_overage
+        ):
             raise RuntimeError("native provider usage does not reconcile with steps")
         if judge_input + judge_output != runtime.judge_tokens_consumed:
             raise RuntimeError("native judge usage does not reconcile with verdicts")
@@ -630,12 +749,12 @@ def set_native_result_metadata(
     if components is not None:
         summary["components"] = dict(components)
     if result.verification_records:
-        summary["self_verification"] = {
-            "affected_outcome": True,
-            "run_status": result.status.value,
-            "tokens_used": result.verification_tokens_used,
-            "status_counts": result.verification_status_counts,
-        }
+        summary["self_verification"] = _verification_effect_report(result)
+    provider_call_reconciliation = getattr(
+        runtime, "last_provider_call_reconciliation", None
+    )
+    if provider_call_reconciliation is not None:
+        summary["provider_call_reconciliation"] = dict(provider_call_reconciliation)
     metadata["driftlock"] = summary
     metadata["termination_reason"] = (
         "confirmed_task_complete"
@@ -793,6 +912,9 @@ class LHTBNativeAgentRuntime:
         self.judge_tokens_consumed = 0
         self.phase_count = 0
         self.last_result: RunResult | None = None
+        self.last_provider_call_reconciliation: dict[str, Any] | None = None
+        self._component_unknown_billed_calls = 0
+        self._component_provider_token_overage = 0
 
     def component_report(self) -> dict[str, Any]:
         """Return the complete effective component configuration for attribution."""
@@ -814,7 +936,7 @@ class LHTBNativeAgentRuntime:
                     else None
                 ),
                 "corpus": (
-                    retrieval.corpus.snapshot_report()
+                    _bounded_retrieval_corpus_report(retrieval)
                     if retrieval is not None
                     else None
                 ),
@@ -836,6 +958,12 @@ class LHTBNativeAgentRuntime:
             "memory": {
                 "enabled": memory is not None,
                 "scope": "harbor_trial" if memory is not None else None,
+                "limitation": (
+                    "memory persists across verifier-resume phases within one "
+                    "trial, but never across Harbor tasks or paired trials"
+                    if memory is not None
+                    else None
+                ),
                 "root_policy": (
                     "agent_logs/driftlock-memory" if memory is not None else None
                 ),
@@ -926,28 +1054,70 @@ class LHTBNativeAgentRuntime:
         calls_before = self.provider.provider_call_count
         exact_calls_before = self.provider.exact_usage_request_count
         unknown_calls_before = self.provider.unknown_billed_request_count
+        step_reconciliations: list[dict[str, Any]] = []
 
         async def audited_step(context: Any) -> StepOutcome:
             step_calls_before = self.provider.provider_call_count
+            step_exact_calls_before = self.provider.exact_usage_request_count
+            step_unknown_calls_before = self.provider.unknown_billed_request_count
             step_usage_before = self.provider.usage
             outcome = await self.agent(context)
+            delegation = self.agent.delegation_tool
+            if delegation is not None:
+                # Interrupted children update cancellation-time physical-call
+                # accounting asynchronously. Settle them before reconciling this
+                # otherwise-successful parent step.
+                await delegation.drain_cancelled()
             calls = self.provider.provider_call_count - step_calls_before
+            exact_calls = (
+                self.provider.exact_usage_request_count - step_exact_calls_before
+            )
+            unknown_calls = (
+                self.provider.unknown_billed_request_count - step_unknown_calls_before
+            )
             usage = self.provider.usage.delta_from(step_usage_before)
-            expected_calls = _expected_step_provider_calls(outcome)
-            if calls != expected_calls:
-                if expected_calls == 1:
+            expectation = _expected_step_provider_calls(outcome)
+            if expectation.exact is not None and calls != expectation.exact:
+                if expectation.exact == 1:
                     raise PhysicalProviderBoundaryError(
                         "one native-agent step must make exactly one physical "
                         f"provider request; observed {calls}"
                     )
                 raise PhysicalProviderBoundaryError(
                     "native-agent step physical provider requests do not match "
-                    f"component evidence; expected {expected_calls}, observed {calls}"
+                    "component evidence; expected "
+                    f"{expectation.exact}, observed {calls}"
                 )
+            if calls != exact_calls + unknown_calls:
+                raise PhysicalProviderBoundaryError(
+                    "native-agent step physical provider requests do not reconcile "
+                    "with exact and unknown billed-call accounting"
+                )
+            step_reconciliations.append(
+                {
+                    "sequence": context.sequence,
+                    "status": (
+                        "complete"
+                        if expectation.exact is not None
+                        else "component_evidence_incomplete"
+                    ),
+                    "expected_physical_calls": expectation.exact,
+                    "observed_physical_calls": calls,
+                    "exact_usage_calls": exact_calls,
+                    "unknown_billed_calls": unknown_calls,
+                    "incomplete_reasons": list(expectation.incomplete_reasons),
+                    "runner_accounted_tokens": outcome.tokens,
+                    "provider_reported_tokens": usage.total_tokens,
+                }
+            )
             if usage.total_tokens != outcome.tokens:
-                raise RuntimeError(
-                    "provider usage does not reconcile with StepOutcome.tokens"
-                )
+                mismatch_reason = _component_token_mismatch_reason(outcome)
+                if usage.total_tokens < outcome.tokens or mismatch_reason is None:
+                    raise RuntimeError(
+                        "provider usage does not reconcile with StepOutcome.tokens"
+                    )
+                step_reconciliations[-1]["status"] = "component_accounting_incomplete"
+                step_reconciliations[-1]["incomplete_reasons"].append(mismatch_reason)
             return outcome
 
         phase_succeeded = False
@@ -971,18 +1141,34 @@ class LHTBNativeAgentRuntime:
             phase_unknown_calls = (
                 self.provider.unknown_billed_request_count - unknown_calls_before
             )
-            expected_phase_calls = sum(
+            expectations = [
                 _expected_step_provider_calls(step.outcome) for step in result.steps
+            ]
+            evidence_complete = all(item.exact is not None for item in expectations)
+            if evidence_complete:
+                expected_phase_calls = sum(
+                    item.exact for item in expectations if item.exact is not None
+                )
+                if phase_calls != expected_phase_calls:
+                    raise RuntimeError(
+                        "physical provider calls do not reconcile with recorded steps"
+                    )
+                if phase_exact_calls != expected_phase_calls or phase_unknown_calls:
+                    raise RuntimeError(
+                        "exact-usage provider calls do not reconcile with recorded "
+                        "steps"
+                    )
+            elif phase_calls != phase_exact_calls + phase_unknown_calls:
+                raise RuntimeError(
+                    "physical provider calls do not reconcile with exact and "
+                    "unknown billed-call accounting"
+                )
+            phase_token_overage = phase_usage.total_tokens - result.agent_tokens_used
+            recorded_step_overage = sum(
+                step["provider_reported_tokens"] - step["runner_accounted_tokens"]
+                for step in step_reconciliations
             )
-            if phase_calls != expected_phase_calls:
-                raise RuntimeError(
-                    "physical provider calls do not reconcile with recorded steps"
-                )
-            if phase_exact_calls != expected_phase_calls or phase_unknown_calls:
-                raise RuntimeError(
-                    "exact-usage provider calls do not reconcile with recorded steps"
-                )
-            if phase_usage.total_tokens != result.agent_tokens_used:
+            if phase_token_overage < 0 or phase_token_overage != recorded_step_overage:
                 raise RuntimeError(
                     "provider usage does not reconcile with agent token accounting"
                 )
@@ -990,6 +1176,32 @@ class LHTBNativeAgentRuntime:
             self.agent_tokens_consumed += result.agent_tokens_used
             self.judge_tokens_consumed += result.judge_tokens_used
             self.last_result = result
+            if not evidence_complete:
+                self._component_unknown_billed_calls += phase_unknown_calls
+            self._component_provider_token_overage += phase_token_overage
+            reconciliation_complete = (
+                evidence_complete
+                and phase_unknown_calls == 0
+                and phase_token_overage == 0
+            )
+            self.last_provider_call_reconciliation = {
+                "status": (
+                    "complete"
+                    if reconciliation_complete
+                    else "component_accounting_incomplete"
+                ),
+                "physical_calls": phase_calls,
+                "exact_usage_calls": phase_exact_calls,
+                "unknown_billed_calls": phase_unknown_calls,
+                "cumulative_unknown_billed_calls": (
+                    self._component_unknown_billed_calls
+                ),
+                "provider_tokens_outside_runner_budget": phase_token_overage,
+                "cumulative_provider_tokens_outside_runner_budget": (
+                    self._component_provider_token_overage
+                ),
+                "steps": step_reconciliations,
+            }
             phase_succeeded = True
             return result
         finally:

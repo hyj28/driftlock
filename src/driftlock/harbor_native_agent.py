@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import time
 from collections.abc import Sequence
 from importlib.metadata import version
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +55,7 @@ from driftlock.native_lhtb import (
 from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.runner import RunnerConfig
 from driftlock.skill_admission import SkillLibrary
-from driftlock.verification import SelfVerificationConfig
+from driftlock.verification import SelfVerificationConfig, VerificationStatus
 
 
 def _pinned_retrieval_embedder() -> Any:
@@ -66,6 +68,28 @@ def _pinned_retrieval_embedder() -> Any:
         )
     from driftlock.st_embedder import embed
 
+    try:
+        vectors = list(embed(("driftlock retrieval configuration probe",)))
+        if len(vectors) != 1:
+            raise ValueError("embedder returned the wrong vector count")
+        raw_vector = list(vectors[0])
+        if any(
+            isinstance(value, bool) or not isinstance(value, Real)
+            for value in raw_vector
+        ):
+            raise ValueError("embedder returned a non-numeric vector")
+        vector = [float(value) for value in raw_vector]
+        if (
+            not vector
+            or any(not math.isfinite(value) for value in vector)
+            or math.fsum(value * value for value in vector) == 0.0
+        ):
+            raise ValueError("embedder returned a malformed vector")
+    except Exception as error:
+        raise NativeComponentConfigurationError(
+            "driftlock_agentic_retrieval cannot initialize the pinned optional "
+            f"embedder all-MiniLM-L6-v2: {type(error).__name__}: {error}"
+        ) from error
     return embed
 
 
@@ -261,6 +285,19 @@ class LHTBNativeDriftlockAgent(BaseAgent):
                     f"{library_dir}"
                 )
             retrieval_embedder = _pinned_retrieval_embedder()
+            retrieval_library = SkillLibrary(library_dir)
+            try:
+                admitted_skill_ids = retrieval_library.admitted_skill_ids()
+            except Exception as error:
+                raise NativeComponentConfigurationError(
+                    "driftlock retrieval skill library cannot be read: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            if not admitted_skill_ids:
+                raise NativeComponentConfigurationError(
+                    "driftlock_agentic_retrieval requires at least one admitted "
+                    "skill in driftlock_retrieval_skill_library_dir"
+                )
         else:
             if driftlock_retrieval_skill_library_dir is not None:
                 raise NativeComponentConfigurationError(
@@ -269,6 +306,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
                 )
             library_dir = None
             retrieval_embedder = None
+            retrieval_library = None
         if (
             not isinstance(driftlock_max_tool_output_characters, int)
             or isinstance(driftlock_max_tool_output_characters, bool)
@@ -385,9 +423,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         self._native_phases: list[dict[str, Any]] = []
         self._native_prompt_cache = driftlock_prompt_cache
         self._native_agentic_retrieval = driftlock_agentic_retrieval
-        self._native_retrieval_library_dir = (
-            library_dir.resolve() if library_dir is not None else None
-        )
+        self._native_retrieval_library = retrieval_library
         self._native_retrieval_embedder = retrieval_embedder
         self._native_planning = driftlock_planning
         self._native_delegation = driftlock_delegation
@@ -400,10 +436,18 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         # directory is unique. Treatment and paired control trials therefore
         # cannot read each other's writes, while verifier-resume phases of the
         # same trial retain the designed persistence.
+        memory_root = (Path(self.logs_dir) / "driftlock-memory").resolve()
+        if (
+            driftlock_memory
+            and memory_root.exists()
+            and (not memory_root.is_dir() or any(memory_root.iterdir()))
+        ):
+            raise NativeComponentConfigurationError(
+                "driftlock memory root must be empty at trial construction: "
+                f"{memory_root}"
+            )
         self._native_memory_store = (
-            MemoryStore(Path(self.logs_dir) / "driftlock-memory")
-            if driftlock_memory
-            else None
+            MemoryStore(memory_root) if driftlock_memory else None
         )
         self._native_memory_run_id = hashlib.sha256(
             str(Path(self.logs_dir).resolve()).encode()
@@ -527,12 +571,20 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             record["prompt_cache"] = result.prompt_cache_summary.to_dict()
         if result.verification_records:
             record["self_verification"] = {
-                "affected_outcome": True,
+                "verification_ran": True,
+                "affected_outcome": any(
+                    record.status is not VerificationStatus.VERIFIED
+                    for record in result.verification_records
+                ),
                 "run_status": result.status.value,
                 "tokens_used": result.verification_tokens_used,
                 "status_counts": result.verification_status_counts,
                 "records": [item.to_dict() for item in result.verification_records],
             }
+        runtime = getattr(self, "_native_runtime", None)
+        reconciliation = getattr(runtime, "last_provider_call_reconciliation", None)
+        if reconciliation is not None:
+            record["provider_call_reconciliation"] = dict(reconciliation)
         self._native_phases.append(record)
 
         self._write_run_record()
@@ -581,7 +633,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         )
         retrieval_tool = None
         if self._native_agentic_retrieval:
-            assert self._native_retrieval_library_dir is not None
+            assert self._native_retrieval_library is not None
             assert self._native_retrieval_embedder is not None
             retrieval_tool = await build_remote_agentic_retrieval_tool(
                 environment,
@@ -589,7 +641,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
                 store_dir=store_root,
                 remote_tmp_dir="/tmp",
                 user=environment.default_user,
-                skill_library=SkillLibrary(self._native_retrieval_library_dir),
+                skill_library=self._native_retrieval_library,
                 embed=self._native_retrieval_embedder,
                 memory_store=self._native_memory_store,
             )
