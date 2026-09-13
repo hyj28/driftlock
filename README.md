@@ -2,20 +2,21 @@
 
 **A self-evolving long-horizon coding agent that learns from its own scored checkpoints.**
 
-> **Status: self-evolution is complete and closed-loop; the agent is being filled out.**
+> **Status: the agent is complete, and its self-evolution loop is closed.**
 >
-> The checkpoint, rollback, judge, checkpoint-scoring, failure-localization, skill-distillation,
-> retrieval, injection, paired-validation and admission layers are implemented and unit-tested
-> (1135 tests). A 170-trial validation run exercised the whole loop end to end for $15.06 — see
+> Every component in the roadmap below is implemented and unit-tested (1181 tests). A 170-trial
+> validation run exercised the self-evolution loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
 > Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
 > against a paired control before entering the library, and a free noise floor tells you when an
 > apparent gain is run-to-run variance. What that run also showed is that **one-shot similarity
 > retrieval is too weak to serve a skill library** — six of fourteen candidates never reached an
-> agent at all. That is the requirement driving the next component.
+> agent at all. Agentic RAG was built to answer that, and the components after it fill out the
+> rest of what a capable terminal agent needs.
 >
-> **Now building: the rest of a complete agent.** See the component roadmap below.
+> Each component states what it does not guarantee as plainly as what it does; the limits are in
+> the code, not only in the docs.
 
 ---
 
@@ -40,7 +41,7 @@ own runs; the rest is what any capable agent needs.
 | Subagents and bounded sequential delegation | done |
 | MCP client support — stdio tool discovery and invocation | done |
 | Bounded opt-in parallel workspace reads | done |
-| **MCP Streamable HTTP and authorization** | **next** |
+| MCP Streamable HTTP and host-supplied authorization | done |
 | Prompt-cache management | done |
 | Output self-verification | done |
 

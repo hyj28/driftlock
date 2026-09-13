@@ -94,7 +94,18 @@ from driftlock.local import (
     LocalExecResult,
     LocalWorkspaceDeltaObserver,
 )
-from driftlock.mcp import MCPClient, MCPError, MCPLimits, MCPServerConfig, MCPTool
+from driftlock.mcp import (
+    MCPAuthorizationDiscoveryStatus,
+    MCPAuthorizationError,
+    MCPAuthorizationResult,
+    MCPAuthorizationStatus,
+    MCPClient,
+    MCPError,
+    MCPLimits,
+    MCPServerConfig,
+    MCPTool,
+    TokenSupplier,
+)
 from driftlock.memory import (
     DEFAULT_MAX_MEMORY_AUDIT_ERROR_CHARACTERS,
     DEFAULT_MAX_MEMORY_CONTENT_CHARACTERS,
@@ -372,6 +383,10 @@ __all__ = [
     "LocalEnvironment",
     "LocalExecResult",
     "LocalWorkspaceDeltaObserver",
+    "MCPAuthorizationDiscoveryStatus",
+    "MCPAuthorizationError",
+    "MCPAuthorizationResult",
+    "MCPAuthorizationStatus",
     "MCPClient",
     "MCPError",
     "MCPLimits",
@@ -442,6 +457,7 @@ __all__ = [
     "TerminusConversationState",
     "TerminusStateError",
     "TerminusStepAdapter",
+    "TokenSupplier",
     "ToolCall",
     "ToolCallingAgent",
     "ToolCallingSubagentExecutor",

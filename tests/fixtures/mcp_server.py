@@ -30,6 +30,9 @@ def tool(name):
 
 print("fixture diagnostics are on stderr", file=sys.stderr, flush=True)
 for line in sys.stdin:
+    if raw_log := os.environ.get("MCP_TEST_RAW_LOG"):
+        with open(raw_log, "ab") as stream:
+            stream.write(line.encode())
     request = json.loads(line)
     if log := os.environ.get("MCP_TEST_LOG"):
         with open(log, "a") as stream:
