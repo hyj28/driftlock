@@ -244,17 +244,34 @@ async def test_redirect_rejects_non_loopback_cleartext_target_before_repost():
         assert len(server.requests) == 1
 
 
+async def test_remote_config_cannot_open_cleartext_loopback_hop():
+    with running_http_server() as sink:
+        client = MCPClient(http_config("https://resource.example/mcp"))
+        with pytest.raises(MCPError) as caught:
+            await client._http_round_trip(
+                "GET",
+                sink.url,
+                None,
+                token=None,
+                forbidden_credential=None,
+                request_id=None,
+                metadata=True,
+            )
+        assert caught.value.status == "redirect_rejected"
+        assert sink.requests == []
+
+
 @pytest.mark.parametrize(
     ("metadata_body", "servers", "limits", "expected_status"),
     [
         (
-            b'{"resource":"https://resource.example","scopes_supported":'
-            b'["tools:call"]}',
+            b'{"resource":"https://resource.example"}',
             None,
             MCPLimits(),
             MCPAuthorizationDiscoveryStatus.DISCOVERED,
         ),
         (b"[]", None, MCPLimits(), MCPAuthorizationDiscoveryStatus.MALFORMED),
+        (b"{}", None, MCPLimits(), MCPAuthorizationDiscoveryStatus.MALFORMED),
         (
             None,
             ["https://one.example", "https://two.example"],
@@ -548,8 +565,47 @@ async def test_external_close_does_not_cancel_or_await_inline_caller():
                 await client.aclose()
 
             watchdog_task = asyncio.create_task(watchdog())
-            with pytest.raises(MCPError) as caught:
-                await client.call_tool("echo", {})
+            async with asyncio.timeout(0.5):
+                with pytest.raises(MCPError) as caught:
+                    await client.call_tool("echo", {})
+            assert caught.value.status == "disconnected"
+            await asyncio.wait_for(watchdog_task, 0.5)
+            await asyncio.sleep(0)
+            assert caller.cancelling() == cancellation_count
+            assert client._http_writers == set()
+            assert client._http_tasks == {}
+            assert not client.ready
+
+
+async def test_cancelled_external_close_does_not_cancel_inline_caller():
+    limits = MCPLimits(
+        request_timeout_seconds=2,
+        shutdown_timeout_seconds=0.05,
+        max_message_bytes=1_000_000,
+    )
+    with running_http_server() as server:
+        async with MCPClient(http_config(server.url), limits=limits) as client:
+            server.mode = "endless_sse"
+            caller = asyncio.current_task()
+            assert caller is not None
+            cancellation_count = caller.cancelling()
+
+            async def watchdog() -> None:
+                for _ in range(50):
+                    if client._http_writers:
+                        break
+                    await asyncio.sleep(0.01)
+                assert client._http_writers
+                closer = asyncio.create_task(client.aclose())
+                await asyncio.sleep(0)
+                closer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await closer
+
+            watchdog_task = asyncio.create_task(watchdog())
+            async with asyncio.timeout(0.5):
+                with pytest.raises(MCPError) as caught:
+                    await client.call_tool("echo", {})
             assert caught.value.status == "disconnected"
             await asyncio.wait_for(watchdog_task, 0.5)
             await asyncio.sleep(0)

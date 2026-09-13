@@ -752,9 +752,18 @@ class MCPClient:
     ) -> _HTTPResponse:
         current = url
         credential_origin = _origin(url)
+        assert self.config.url is not None
+        configured_endpoint = _validated_url(self.config.url, endpoint=True)
+        configured_is_loopback = configured_endpoint.hostname in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }
         for redirect_count in range(self.limits.max_http_redirects + 1):
             try:
                 parsed = _validated_url(current, endpoint=True)
+                if parsed.scheme == "http" and not configured_is_loopback:
+                    raise ValueError("remote endpoint cannot pivot to loopback HTTP")
             except ValueError:
                 raise MCPError(
                     "redirect_rejected", "MCP HTTP redirect was refused"
@@ -786,7 +795,9 @@ class MCPClient:
                 return response
             try:
                 target = urljoin(current, location)
-                _validated_url(target, endpoint=True)
+                parsed_target = _validated_url(target, endpoint=True)
+                if parsed_target.scheme == "http" and not configured_is_loopback:
+                    raise ValueError("remote endpoint cannot pivot to loopback HTTP")
                 if _contains_credential(target, forbidden_credential):
                     raise ValueError("redirect contains credential")
             except ValueError:
@@ -896,17 +907,24 @@ class MCPClient:
                 raise MCPError("disconnected", "MCP server is disconnected") from None
             raise MCPError("protocol_error", "Malformed MCP HTTP response") from None
         finally:
-            if writer is not None:
-                self._http_writers.discard(writer)
-                writer.transport.abort()
-                with contextlib.suppress(OSError, RuntimeError):
-                    await writer.wait_closed()
-            if task is not None:
-                remaining = self._http_tasks.get(task, 1) - 1
-                if remaining:
-                    self._http_tasks[task] = remaining
-                else:
-                    self._http_tasks.pop(task, None)
+            try:
+                if writer is not None:
+                    self._http_writers.discard(writer)
+                    writer.transport.abort()
+                    # StreamWriter exposes one shared close Future. Shielding keeps
+                    # cancellation of an external aclose waiter from propagating
+                    # into this request owner's cleanup wait.
+                    with contextlib.suppress(OSError, RuntimeError):
+                        await asyncio.shield(writer.wait_closed())
+            finally:
+                # A second cancellation during socket cleanup must not retain a
+                # dead caller Task in the bounded request bookkeeping.
+                if task is not None:
+                    remaining = self._http_tasks.get(task, 1) - 1
+                    if remaining:
+                        self._http_tasks[task] = remaining
+                    else:
+                        self._http_tasks.pop(task, None)
 
     async def _read_http_response(
         self,
@@ -1298,6 +1316,15 @@ class MCPClient:
             return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
         if not isinstance(value, dict):
             return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
+        resource_value = value.get("resource")
+        if not isinstance(resource_value, str) or _contains_credential(
+            resource_value, token
+        ):
+            return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
+        try:
+            _validated_url(resource_value, endpoint=True)
+        except ValueError:
+            return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
         servers_value = value.get("authorization_servers", [])
         scopes_value = value.get("scopes_supported", [])
         if not isinstance(servers_value, list) or not isinstance(scopes_value, list):
@@ -1472,13 +1499,15 @@ class MCPClient:
             self._http_open = False
             writers = tuple(self._http_writers)
             self._http_writers.clear()
+            self._session_id = None
+            self._session_origin = None
             for writer in writers:
                 writer.transport.abort()
             for writer in writers:
+                # wait_closed uses a Future shared with the request owner. Shield
+                # it so cancelling this closer cannot cancel that foreign waiter.
                 with contextlib.suppress(OSError, RuntimeError):
-                    await writer.wait_closed()
-            self._session_id = None
-            self._session_origin = None
+                    await asyncio.shield(writer.wait_closed())
             return
         process, self._process = self._process, None
         if process is None:
