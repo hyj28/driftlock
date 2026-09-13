@@ -31,6 +31,7 @@ from driftlock.models import (
     Verdict,
 )
 from driftlock.runner import RunnerConfig
+from driftlock.verification import VerificationRecord, VerificationStatus
 
 
 class _FakeBaseAgent:
@@ -1809,3 +1810,91 @@ async def test_native_harness_constructs_components_and_records_configuration(
         "excluded_from_lhtb_experiment"
     )
     assert payload["phases"] == []
+
+
+def test_native_phase_record_distinguishes_verified_from_affected(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    result = RunResult(
+        status=RunStatus.COMPLETED,
+        state={},
+        steps=(
+            StepRecord(
+                sequence=1,
+                logical_step=1,
+                attempt=1,
+                outcome=StepOutcome(
+                    action="complete",
+                    state={},
+                    tokens=2,
+                    completed=True,
+                    summary="done",
+                    verification=VerificationRecord(
+                        attempt=1,
+                        status=VerificationStatus.VERIFIED,
+                        reason=("workspace check distinguished the claimed artifact"),
+                        command="test -f answer.txt",
+                        return_code=0,
+                        control_return_code=1,
+                        confirmation_return_code=0,
+                        tokens=2,
+                    ),
+                ),
+            ),
+        ),
+        rollbacks=(),
+        checkpoints=(),
+        tokens_used=2,
+        agent_tokens_used=2,
+        judge_tokens_used=0,
+    )
+    agent = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._native_phases = []
+    agent._native_retain_checkpoints = False
+
+    agent._write_phase_record(result)
+
+    phase = json.loads(
+        (tmp_path / "driftlock-native-result.json").read_text(encoding="utf-8")
+    )["phases"][0]
+    assert phase["self_verification"]["verification_ran"] is True
+    assert phase["self_verification"]["affected_outcome"] is False
+
+
+def test_native_memory_unreadable_root_is_typed_configuration_failure(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, native_agent = harbor_agent_modules
+    logs = tmp_path / "trial" / "agent"
+    memory_root = logs / "driftlock-memory"
+    memory_root.mkdir(parents=True)
+    original_iterdir = Path.iterdir
+
+    def unreadable(path: Path) -> Any:
+        if path.resolve() == memory_root.resolve():
+            raise PermissionError("permission denied by test")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+
+    with pytest.raises(
+        native_agent.NativeComponentConfigurationError,
+        match="memory root cannot be inspected at trial construction",
+    ):
+        native_agent.LHTBNativeDriftlockAgent(
+            logs_dir=logs,
+            model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+            llm_call_kwargs=_agent_call_kwargs(),
+            model_info={
+                "max_input_tokens": 128000,
+                "max_output_tokens": 8192,
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+            },
+            driftlock_memory=True,
+        )

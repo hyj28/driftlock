@@ -327,6 +327,43 @@ def test_builder_indexes_skills_and_workspace_with_distinct_origins(
     }
 
 
+def test_retrieval_audit_bounds_corpus_build_exclusion_details(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = "quorum lease fencing evidence\n"
+    query = "quorum lease fencing"
+    (workspace / "evidence.txt").write_text(source, encoding="utf-8")
+    tool = AgenticRetrievalTool.from_workspace(
+        workspace,
+        _library(tmp_path),
+        LiteralEmbedder({source: (1.0, 0.0), query: (1.0, 0.0)}),
+    )
+    assert isinstance(tool.corpus.build_report, dict)
+    tool.corpus.build_report["excluded_source_count"] = 3_000
+    tool.corpus.build_report["exclusion_reason_counts"] = {"binary_file": 3_000}
+    tool.corpus.build_report["excluded_sources"] = [
+        {
+            "kind": "workspace",
+            "origin": f"binary-{index}.dat",
+            "reason": "binary_file",
+            "detail": "x" * 1_000,
+        }
+        for index in range(3_000)
+    ]
+
+    corpus = tool.retrieve(query).to_report()["corpus"]
+
+    assert corpus["build_exclusion_count"] == 3_000
+    assert len(corpus["build_exclusion_sample"]) == 16
+    assert corpus["unreported_build_exclusion_count"] == 2_984
+    assert all(
+        len(exclusion["detail"]) == 512
+        for exclusion in corpus["build_exclusion_sample"]
+    )
+    assert "build_exclusions" not in corpus
+    assert len(json.dumps(corpus)) < 20_000
+
+
 def test_tokenizer_strips_sentence_punctuation_and_splits_compounds(
     tmp_path: Path,
 ) -> None:

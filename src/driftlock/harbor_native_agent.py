@@ -437,11 +437,18 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         # cannot read each other's writes, while verifier-resume phases of the
         # same trial retain the designed persistence.
         memory_root = (Path(self.logs_dir) / "driftlock-memory").resolve()
-        if (
-            driftlock_memory
-            and memory_root.exists()
-            and (not memory_root.is_dir() or any(memory_root.iterdir()))
-        ):
+        try:
+            memory_root_in_use = (
+                driftlock_memory
+                and memory_root.exists()
+                and (not memory_root.is_dir() or any(memory_root.iterdir()))
+            )
+        except OSError as error:
+            raise NativeComponentConfigurationError(
+                "driftlock memory root cannot be inspected at trial construction: "
+                f"{memory_root}: {type(error).__name__}: {error}"
+            ) from error
+        if memory_root_in_use:
             raise NativeComponentConfigurationError(
                 "driftlock memory root must be empty at trial construction: "
                 f"{memory_root}"

@@ -15,9 +15,15 @@ from typing import Any
 
 import pytest
 
-from driftlock.agent import ToolCallingSubagentExecutor
+from driftlock.agent import AgentCompletionRequest, ToolCallingSubagentExecutor
 from driftlock.agentic_retrieval import AgenticRetrievalTool
-from driftlock.delegation import DelegationConfig, DelegationTool
+from driftlock.delegation import (
+    DelegationConfig,
+    DelegationExecutionResult,
+    DelegationRequest,
+    DelegationStatus,
+    DelegationTool,
+)
 from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
 from driftlock.lhtb_experiment import build_job_config
 from driftlock.memory import MemoryStore
@@ -613,6 +619,68 @@ async def test_delegation_timeout_with_child_calls_is_recorded_not_raised(
         "usage_complete": False,
         "judge_request_count": 0,
     }
+
+
+async def test_delegation_contract_error_marks_child_accounting_unknown(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _Environment()
+    call = _PhysicalCall(
+        [
+            _response("delegate_task", {"objective": "custom child"}),
+            json.dumps({"text": "child response", "tool_calls": []}),
+            _response("complete", {"summary": "parent continued"}),
+        ]
+    )
+    provider = SingleAttemptJSONProvider(call)
+
+    async def invalid_executor(request: DelegationRequest) -> DelegationExecutionResult:
+        await provider(
+            AgentCompletionRequest(
+                messages=({"role": "user", "content": "custom child"},),
+                tools=(),
+                max_output_tokens=32,
+            )
+        )
+        return DelegationExecutionResult(
+            DelegationStatus.STEP_LIMIT,
+            "",
+            2,
+            request.max_steps + 1,
+            "custom executor exceeded its step contract",
+        )
+
+    remote_tmp = tmp_path / "remote-tmp"
+    remote_tmp.mkdir()
+    runtime = LHTBNativeAgentRuntime(
+        environment,
+        _Observer(workspace),
+        provider,
+        remote_workspace=str(workspace),
+        store_dir=tmp_path / "checkpoints",
+        remote_tmp_dir=str(remote_tmp),
+        user="agent-user",
+        runner_config=RunnerConfig(max_steps=8, max_tokens=1_000_000),
+        agent_max_output_tokens=512,
+        agent_min_output_tokens=4,
+        delegation_tool=DelegationTool(invalid_executor),
+    )
+
+    result = await runtime.run(goal="contain a custom child contract error")
+
+    assert result.status is RunStatus.COMPLETED
+    audit = result.steps[0].outcome.tool_audits[0]["result"]
+    assert audit["status"] == "failed"
+    assert audit["steps"] == 0
+    assert audit["tokens"]["accounting_known"] is True
+    assert audit["provider_call_accounting_known"] is False
+    assert call.physical_call_count == 3
+    reconciliation = runtime.last_provider_call_reconciliation
+    assert reconciliation is not None
+    assert reconciliation["status"] == "component_accounting_incomplete"
+    assert reconciliation["steps"][0]["expected_physical_calls"] is None
 
 
 async def test_parallel_reads_keep_compaction_coupling_at_tight_bound(

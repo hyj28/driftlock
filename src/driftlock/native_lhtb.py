@@ -27,7 +27,11 @@ from driftlock.agent import (
     ToolCall,
     ToolCallingAgent,
 )
-from driftlock.agentic_retrieval import AgenticRetrievalTool, RetrievalCorpusStatus
+from driftlock.agentic_retrieval import (
+    AgenticRetrievalTool,
+    RetrievalCorpusStatus,
+    bounded_corpus_snapshot_report,
+)
 from driftlock.delegation import DelegationTool
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import FineJudge
@@ -115,7 +119,8 @@ def _expected_step_provider_calls(outcome: StepOutcome) -> _ProviderCallExpectat
             continue
         tokens = result.get("tokens")
         if (
-            not isinstance(tokens, Mapping)
+            result.get("provider_call_accounting_known") is False
+            or not isinstance(tokens, Mapping)
             or tokens.get("accounting_known") is not True
         ):
             incomplete_reasons.append("delegation_provider_calls_unknown")
@@ -164,32 +169,6 @@ def _component_token_mismatch_reason(outcome: StepOutcome) -> str | None:
         ):
             return "delegation_token_accounting_unknown"
     return None
-
-
-_MAX_RETRIEVAL_EXCLUSION_SAMPLES = 16
-_MAX_RETRIEVAL_EXCLUSION_VALUE_CHARACTERS = 512
-
-
-def _bounded_retrieval_corpus_report(tool: AgenticRetrievalTool) -> dict[str, Any]:
-    report = tool.corpus.snapshot_report()
-    exclusions = report.pop("build_exclusions", [])
-    samples = [
-        {
-            str(name): (
-                value[:_MAX_RETRIEVAL_EXCLUSION_VALUE_CHARACTERS]
-                if isinstance(value, str)
-                else value
-            )
-            for name, value in exclusion.items()
-        }
-        for exclusion in exclusions[:_MAX_RETRIEVAL_EXCLUSION_SAMPLES]
-        if isinstance(exclusion, Mapping)
-    ]
-    report["build_exclusion_sample"] = samples
-    report["unreported_build_exclusion_count"] = max(
-        0, report["build_exclusion_count"] - len(samples)
-    )
-    return report
 
 
 @dataclass(frozen=True, slots=True)
@@ -936,7 +915,7 @@ class LHTBNativeAgentRuntime:
                     else None
                 ),
                 "corpus": (
-                    _bounded_retrieval_corpus_report(retrieval)
+                    bounded_corpus_snapshot_report(retrieval.corpus.snapshot_report())
                     if retrieval is not None
                     else None
                 ),
