@@ -75,6 +75,12 @@ DEFAULT_MAX_QUERY_CHARACTERS = 2_000
 # complete per-document decisions remain in the out-of-context step audit.
 DEFAULT_MAX_OBSERVATION_EXCLUSIONS = 20
 
+# Corpus-build exclusions are attribution diagnostics, not retrieval results.
+# A bounded sample keeps one audit independent of corpus traversal size while the
+# total and reason counts retain the complete shape of what was excluded.
+DEFAULT_MAX_BUILD_EXCLUSION_SAMPLES = 16
+DEFAULT_MAX_BUILD_EXCLUSION_VALUE_CHARACTERS = 512
+
 # One memory leaves result slots for validated skills and current workspace
 # observations; the effective cap drops to zero if the overall result cap is one,
 # so an unvalidated hint can never crowd out the whole call under custom limits.
@@ -372,6 +378,29 @@ class RetrievedContext:
         return result
 
 
+def bounded_corpus_snapshot_report(corpus: Mapping[str, Any]) -> dict[str, Any]:
+    """Bound per-source corpus exclusions while retaining aggregate evidence."""
+
+    report = dict(corpus)
+    exclusions = report.pop("build_exclusions", ())
+    samples = [
+        {
+            str(name): (
+                value[:DEFAULT_MAX_BUILD_EXCLUSION_VALUE_CHARACTERS]
+                if isinstance(value, str)
+                else value
+            )
+            for name, value in exclusion.items()
+        }
+        for exclusion in exclusions[:DEFAULT_MAX_BUILD_EXCLUSION_SAMPLES]
+        if isinstance(exclusion, Mapping)
+    ]
+    report["build_exclusion_sample"] = samples
+    count = report.get("build_exclusion_count", len(exclusions))
+    report["unreported_build_exclusion_count"] = max(0, count - len(samples))
+    return report
+
+
 @dataclass(frozen=True, slots=True)
 class AgenticRetrievalResult:
     """A complete audit result with a separately compact agent observation."""
@@ -418,7 +447,7 @@ class AgenticRetrievalResult:
                 **self.config.to_report(),
                 "fingerprint": self.config.fingerprint,
             },
-            "corpus": dict(self.corpus),
+            "corpus": bounded_corpus_snapshot_report(self.corpus),
             "semantic_relevance_floor": self.semantic_relevance_floor,
             "considered_document_count": len(self.considered),
             "considered_documents": [dict(candidate) for candidate in self.considered],

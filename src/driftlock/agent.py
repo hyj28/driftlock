@@ -189,13 +189,13 @@ DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS = 16_000
 
 # Four calls x 16,000 observation characters = 64,000; another 32,000 covers the
 # bounded provider response, four call/result JSON envelopes, and summary marker.
-_DEFAULT_MULTI_TOOL_HISTORY_RESERVE_CHARACTERS = 32_000
+PARALLEL_HISTORY_RESERVE_CHARACTERS = 32_000
 
 # The shipped 96,000-character bound therefore holds one worst-case four-call
 # turn verbatim plus compaction framing instead of immediately becoming summary-only.
 DEFAULT_MAX_HISTORY_CHARACTERS = (
     DEFAULT_MAX_TOOL_CALLS_PER_STEP * DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS
-    + _DEFAULT_MULTI_TOOL_HISTORY_RESERVE_CHARACTERS
+    + PARALLEL_HISTORY_RESERVE_CHARACTERS
 )
 
 # A useful local summary plus its JSON message framing fits at this floor; making

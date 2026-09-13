@@ -22,6 +22,12 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
+from driftlock.agent import (
+    DEFAULT_MAX_HISTORY_CHARACTERS,
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+    DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+    MIN_MAX_HISTORY_CHARACTERS,
+)
 from driftlock.checkpoint_localization import (
     LOCALIZATION_REPORT_NAME,
     load_and_localize_score_report,
@@ -51,6 +57,7 @@ from driftlock.lhtb_analysis import (
     parse_arm_directories,
     task_directory_sha256,
 )
+from driftlock.native_lhtb import validate_parallel_compaction_bounds
 from driftlock.oracle import (
     OracleCheckpointError,
     file_sha256,
@@ -204,6 +211,18 @@ def build_job_config(
     retain_checkpoints: bool = False,
     skill_library_dir: Path | None = None,
     skill_embedder_import_path: str | None = None,
+    driftlock_agentic_retrieval: bool = False,
+    driftlock_retrieval_skill_library_dir: Path | None = None,
+    driftlock_planning: bool = False,
+    driftlock_memory: bool = False,
+    driftlock_delegation: bool = False,
+    driftlock_parallel_reads: bool = False,
+    driftlock_prompt_cache: bool = False,
+    driftlock_explicit_prompt_cache_control: bool = False,
+    driftlock_self_verification: bool = False,
+    driftlock_max_tool_output_characters: int = DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+    driftlock_max_tool_calls_per_step: int = DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+    driftlock_max_history_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
 ) -> dict[str, Any]:
     """Build the exact JSON-compatible Harbor configuration for one run."""
     root = lhtb_dir.expanduser().resolve()
@@ -245,6 +264,74 @@ def build_job_config(
         raise ValueError("n_concurrent_trials must be positive")
     if timeout_sec <= 0 or max_total_tokens <= 0:
         raise ValueError("timeout and token budget must be positive")
+    component_flags = {
+        "driftlock_agentic_retrieval": driftlock_agentic_retrieval,
+        "driftlock_planning": driftlock_planning,
+        "driftlock_memory": driftlock_memory,
+        "driftlock_delegation": driftlock_delegation,
+        "driftlock_parallel_reads": driftlock_parallel_reads,
+        "driftlock_prompt_cache": driftlock_prompt_cache,
+        "driftlock_explicit_prompt_cache_control": (
+            driftlock_explicit_prompt_cache_control
+        ),
+        "driftlock_self_verification": driftlock_self_verification,
+    }
+    for name, value in component_flags.items():
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a boolean")
+    if (
+        not isinstance(driftlock_max_tool_output_characters, int)
+        or isinstance(driftlock_max_tool_output_characters, bool)
+        or driftlock_max_tool_output_characters < 128
+    ):
+        raise ValueError("driftlock_max_tool_output_characters must be at least 128")
+    if (
+        not isinstance(driftlock_max_tool_calls_per_step, int)
+        or isinstance(driftlock_max_tool_calls_per_step, bool)
+        or driftlock_max_tool_calls_per_step <= 0
+    ):
+        raise ValueError("driftlock_max_tool_calls_per_step must be a positive integer")
+    if (
+        not isinstance(driftlock_max_history_characters, int)
+        or isinstance(driftlock_max_history_characters, bool)
+        or driftlock_max_history_characters < MIN_MAX_HISTORY_CHARACTERS
+    ):
+        raise ValueError(
+            "driftlock_max_history_characters must be at least "
+            f"{MIN_MAX_HISTORY_CHARACTERS}"
+        )
+    nondefault_bounds = (
+        driftlock_max_tool_output_characters != DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS
+        or driftlock_max_tool_calls_per_step != DEFAULT_MAX_TOOL_CALLS_PER_STEP
+        or driftlock_max_history_characters != DEFAULT_MAX_HISTORY_CHARACTERS
+    )
+    component_requested = any(component_flags.values()) or (
+        driftlock_retrieval_skill_library_dir is not None or nondefault_bounds
+    )
+    if component_requested and not arm.startswith("native-"):
+        raise ValueError("native agent components require a native-* arm")
+    if driftlock_explicit_prompt_cache_control and not driftlock_prompt_cache:
+        raise ValueError(
+            "driftlock_explicit_prompt_cache_control requires driftlock_prompt_cache"
+        )
+    if driftlock_agentic_retrieval:
+        if driftlock_retrieval_skill_library_dir is None:
+            raise ValueError(
+                "driftlock_agentic_retrieval requires "
+                "driftlock_retrieval_skill_library_dir"
+            )
+        if not driftlock_retrieval_skill_library_dir.expanduser().is_dir():
+            raise ValueError("driftlock retrieval skill library must exist")
+    elif driftlock_retrieval_skill_library_dir is not None:
+        raise ValueError(
+            "driftlock_retrieval_skill_library_dir requires driftlock_agentic_retrieval"
+        )
+    validate_parallel_compaction_bounds(
+        parallel_tool_calls=driftlock_parallel_reads,
+        max_tool_calls_per_step=driftlock_max_tool_calls_per_step,
+        max_tool_output_characters=driftlock_max_tool_output_characters,
+        max_history_characters=driftlock_max_history_characters,
+    )
 
     agent: dict[str, Any] = {
         "model_name": model,
@@ -326,6 +413,29 @@ def build_job_config(
                     ),
                 }
             )
+        if arm.startswith("native-"):
+            enabled_options = {
+                name: value for name, value in component_flags.items() if value
+            }
+            agent["kwargs"].update(enabled_options)
+            if driftlock_retrieval_skill_library_dir is not None:
+                agent["kwargs"]["driftlock_retrieval_skill_library_dir"] = str(
+                    driftlock_retrieval_skill_library_dir.expanduser().resolve()
+                )
+            if nondefault_bounds:
+                agent["kwargs"].update(
+                    {
+                        "driftlock_max_tool_output_characters": (
+                            driftlock_max_tool_output_characters
+                        ),
+                        "driftlock_max_tool_calls_per_step": (
+                            driftlock_max_tool_calls_per_step
+                        ),
+                        "driftlock_max_history_characters": (
+                            driftlock_max_history_characters
+                        ),
+                    }
+                )
         if skill_distillation_arm is not None:
             assert skill_library_dir is not None
             assert skill_embedder_import_path is not None
@@ -1458,6 +1568,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 retain_checkpoints=args.retain_checkpoints,
                 skill_library_dir=args.skill_library_dir,
                 skill_embedder_import_path=args.skill_embedder,
+                driftlock_agentic_retrieval=args.agentic_retrieval,
+                driftlock_retrieval_skill_library_dir=(
+                    args.retrieval_skill_library_dir
+                ),
+                driftlock_planning=args.planning,
+                driftlock_memory=args.memory,
+                driftlock_delegation=args.delegation,
+                driftlock_parallel_reads=args.parallel_reads,
+                driftlock_prompt_cache=args.prompt_cache,
+                driftlock_explicit_prompt_cache_control=(
+                    args.explicit_prompt_cache_control
+                ),
+                driftlock_self_verification=args.self_verification,
+                driftlock_max_tool_output_characters=(args.max_tool_output_characters),
+                driftlock_max_tool_calls_per_step=args.max_tool_calls_per_step,
+                driftlock_max_history_characters=args.max_history_characters,
             )
             config_arg = args.config or Path(f"driftlock-job-{args.job_name}.json")
             config_path = config_arg.expanduser().resolve()
@@ -2019,6 +2145,30 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--skill-embedder",
             help="local embedding callable as module:callable (skill arms only)",
+        )
+        command.add_argument("--agentic-retrieval", action="store_true")
+        command.add_argument("--retrieval-skill-library-dir", type=Path)
+        command.add_argument("--planning", action="store_true")
+        command.add_argument("--memory", action="store_true")
+        command.add_argument("--delegation", action="store_true")
+        command.add_argument("--parallel-reads", action="store_true")
+        command.add_argument("--prompt-cache", action="store_true")
+        command.add_argument("--explicit-prompt-cache-control", action="store_true")
+        command.add_argument("--self-verification", action="store_true")
+        command.add_argument(
+            "--max-tool-output-characters",
+            type=int,
+            default=DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+        )
+        command.add_argument(
+            "--max-tool-calls-per-step",
+            type=int,
+            default=DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+        )
+        command.add_argument(
+            "--max-history-characters",
+            type=int,
+            default=DEFAULT_MAX_HISTORY_CHARACTERS,
         )
     for name in ("oracle-prepare", "oracle-run"):
         oracle = sub.add_parser(

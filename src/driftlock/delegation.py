@@ -202,6 +202,7 @@ class DelegationOutcome:
     error: str | None = None
     executor_invoked: bool = False
     token_accounting_known: bool = True
+    provider_call_accounting_known: bool = True
 
     def to_report(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -213,6 +214,7 @@ class DelegationOutcome:
                 "character_count": self.objective_character_count,
             },
             "calls": {"before": self.calls_before, "after": self.calls_after},
+            "provider_call_accounting_known": (self.provider_call_accounting_known),
             "tokens": {
                 "before": self.tokens_before,
                 "contributed": self.tokens_contributed,
@@ -542,6 +544,7 @@ class DelegationTool:
                             tokens=execution.tokens,
                             error=contract_error,
                             executor_invoked=True,
+                            provider_call_accounting_known=False,
                         )
                     else:
                         effective_status = execution.status
@@ -649,6 +652,7 @@ class DelegationTool:
             error=error,
             executor_invoked=True,
             token_accounting_known=False,
+            provider_call_accounting_known=False,
         )
 
     def _retain_cancelled_task(
@@ -662,6 +666,13 @@ class DelegationTool:
                 completed.exception()
 
         task.add_done_callback(discard)
+
+    async def drain_cancelled(self) -> None:
+        """Wait until every interrupted child has observed cancellation."""
+
+        pending = tuple(self._cancelled_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _outcome(
         self,
@@ -678,6 +689,7 @@ class DelegationTool:
         error: str | None = None,
         executor_invoked: bool = False,
         token_accounting_known: bool = True,
+        provider_call_accounting_known: bool = True,
     ) -> DelegationOutcome:
         return DelegationOutcome(
             status=status,
@@ -695,6 +707,7 @@ class DelegationTool:
             error=_bounded_error(error) if error is not None else None,
             executor_invoked=executor_invoked,
             token_accounting_known=token_accounting_known,
+            provider_call_accounting_known=provider_call_accounting_known,
         )
 
 
@@ -796,6 +809,10 @@ def _safe_str(value: object) -> str:
 
 def _record_from_outcome(outcome: DelegationOutcome) -> dict[str, Any]:
     report = outcome.to_report()
+    # Provider-call reconciliation is a per-live-step boundary. Checkpoints retain
+    # the established schema and token ledger; the parent step audit retains this
+    # independent call-accounting signal.
+    report.pop("provider_call_accounting_known")
     output = report["output"]
     assert isinstance(output, dict)
     output.pop("content", None)

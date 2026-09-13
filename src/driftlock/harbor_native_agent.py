@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import math
 import time
 from collections.abc import Sequence
 from importlib.metadata import version
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
 from harbor.agents.base import BaseAgent
 from harbor.llms.lite_llm import LiteLLM
 
+from driftlock.agent import (
+    DEFAULT_MAX_HISTORY_CHARACTERS,
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+    DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+    MIN_MAX_HISTORY_CHARACTERS,
+    ToolCallingSubagentExecutor,
+)
+from driftlock.delegation import DelegationConfig, DelegationTool
 from driftlock.harbor_agent import _LHTBFineJudge, _LHTBJudgeClient
 from driftlock.heuristics import HeuristicConfig
 from driftlock.judges import DEFAULT_JUDGE_MAX_OUTPUT_TOKENS
@@ -22,22 +34,63 @@ from driftlock.lhtb import (
     _validate_single_attempt_configuration,
     openrouter_provider_from_call_kwargs,
 )
+from driftlock.memory import MemoryStore
 from driftlock.models import RunResult, StepTokenBudgetExhausted
 from driftlock.native_lhtb import (
     BilledProviderResponse,
     ContextUsageRecorder,
     LHTBNativeAgentRuntime,
+    NativeComponentConfigurationError,
     SingleAttemptJSONProvider,
     append_verifier_feedback,
     apply_native_accounting,
     billed_provider_exception,
     billed_provider_response,
+    build_remote_agentic_retrieval_tool,
     native_checkpoint_store_root,
     set_native_result_metadata,
     set_native_token_limit_metadata,
+    validate_parallel_compaction_bounds,
 )
 from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.runner import RunnerConfig
+from driftlock.skill_admission import SkillLibrary
+from driftlock.verification import SelfVerificationConfig, VerificationStatus
+
+
+def _pinned_retrieval_embedder() -> Any:
+    """Load the optional pinned local embedder before any trial can start."""
+
+    if importlib.util.find_spec("sentence_transformers") is None:
+        raise NativeComponentConfigurationError(
+            "driftlock_agentic_retrieval requires the pinned optional embedder "
+            "driftlock.st_embedder (all-MiniLM-L6-v2) to be available"
+        )
+    from driftlock.st_embedder import embed
+
+    try:
+        vectors = list(embed(("driftlock retrieval configuration probe",)))
+        if len(vectors) != 1:
+            raise ValueError("embedder returned the wrong vector count")
+        raw_vector = list(vectors[0])
+        if any(
+            isinstance(value, bool) or not isinstance(value, Real)
+            for value in raw_vector
+        ):
+            raise ValueError("embedder returned a non-numeric vector")
+        vector = [float(value) for value in raw_vector]
+        if (
+            not vector
+            or any(not math.isfinite(value) for value in vector)
+            or math.fsum(value * value for value in vector) == 0.0
+        ):
+            raise ValueError("embedder returned a malformed vector")
+    except Exception as error:
+        raise NativeComponentConfigurationError(
+            "driftlock_agentic_retrieval cannot initialize the pinned optional "
+            f"embedder all-MiniLM-L6-v2: {type(error).__name__}: {error}"
+        ) from error
+    return embed
 
 
 class _HarborLiteLLMSingleAttempt:
@@ -162,6 +215,26 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         driftlock_command_failure_rate: float = 1.0,
         driftlock_reward_stall_steps: int = 5,
         driftlock_reward_epsilon: float = 1e-6,
+        # False preserves the archived five-tool request and once-per-task injection.
+        driftlock_agentic_retrieval: bool = False,
+        driftlock_retrieval_skill_library_dir: str | None = None,
+        # False leaves the caller plan read-only, as in the archived experiment.
+        driftlock_planning: bool = False,
+        # False prevents durable cross-task state from entering historical trials.
+        driftlock_memory: bool = False,
+        # False preserves one provider request per historical parent-agent step.
+        driftlock_delegation: bool = False,
+        # False preserves the historical serial tool execution order.
+        driftlock_parallel_reads: bool = False,
+        # Historical defaults are coupled to retain one worst-case parallel turn.
+        driftlock_max_tool_output_characters: int = (
+            DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS
+        ),
+        driftlock_max_tool_calls_per_step: int = DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+        driftlock_max_history_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
+        # False preserves completion as the historical terminal condition.
+        driftlock_self_verification: bool = False,
+        # False preserves the historical provider request type and prefix handling.
         driftlock_prompt_cache: bool = False,
         driftlock_explicit_prompt_cache_control: bool = False,
         driftlock_corroborating_signals: Sequence[str] = ("no_file_change",),
@@ -178,6 +251,17 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             raise ValueError("native driftlock requires parser_name='json'")
         if not record_terminal_session:
             raise ValueError("the frozen LHTB native arm records terminal activity")
+        component_flags = {
+            "driftlock_agentic_retrieval": driftlock_agentic_retrieval,
+            "driftlock_planning": driftlock_planning,
+            "driftlock_memory": driftlock_memory,
+            "driftlock_delegation": driftlock_delegation,
+            "driftlock_parallel_reads": driftlock_parallel_reads,
+            "driftlock_self_verification": driftlock_self_verification,
+        }
+        for name, value in component_flags.items():
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean")
         if not isinstance(driftlock_prompt_cache, bool):
             raise TypeError("driftlock_prompt_cache must be a boolean")
         if not isinstance(driftlock_explicit_prompt_cache_control, bool):
@@ -186,6 +270,74 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             raise ValueError(
                 "explicit prompt cache control requires driftlock_prompt_cache"
             )
+        if driftlock_agentic_retrieval:
+            if not isinstance(driftlock_retrieval_skill_library_dir, str) or not (
+                driftlock_retrieval_skill_library_dir
+            ):
+                raise NativeComponentConfigurationError(
+                    "driftlock_agentic_retrieval requires "
+                    "driftlock_retrieval_skill_library_dir"
+                )
+            library_dir = Path(driftlock_retrieval_skill_library_dir).expanduser()
+            if not library_dir.is_dir():
+                raise NativeComponentConfigurationError(
+                    "driftlock retrieval skill library directory does not exist: "
+                    f"{library_dir}"
+                )
+            retrieval_embedder = _pinned_retrieval_embedder()
+            retrieval_library = SkillLibrary(library_dir)
+            try:
+                admitted_skill_ids = retrieval_library.admitted_skill_ids()
+            except Exception as error:
+                raise NativeComponentConfigurationError(
+                    "driftlock retrieval skill library cannot be read: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            if not admitted_skill_ids:
+                raise NativeComponentConfigurationError(
+                    "driftlock_agentic_retrieval requires at least one admitted "
+                    "skill in driftlock_retrieval_skill_library_dir"
+                )
+        else:
+            if driftlock_retrieval_skill_library_dir is not None:
+                raise NativeComponentConfigurationError(
+                    "driftlock_retrieval_skill_library_dir requires "
+                    "driftlock_agentic_retrieval"
+                )
+            library_dir = None
+            retrieval_embedder = None
+            retrieval_library = None
+        if (
+            not isinstance(driftlock_max_tool_output_characters, int)
+            or isinstance(driftlock_max_tool_output_characters, bool)
+            or driftlock_max_tool_output_characters < 128
+        ):
+            raise ValueError(
+                "driftlock_max_tool_output_characters must be at least 128"
+            )
+        if (
+            not isinstance(driftlock_max_tool_calls_per_step, int)
+            or isinstance(driftlock_max_tool_calls_per_step, bool)
+            or driftlock_max_tool_calls_per_step <= 0
+        ):
+            raise ValueError(
+                "driftlock_max_tool_calls_per_step must be a positive integer"
+            )
+        if (
+            not isinstance(driftlock_max_history_characters, int)
+            or isinstance(driftlock_max_history_characters, bool)
+            or driftlock_max_history_characters < MIN_MAX_HISTORY_CHARACTERS
+        ):
+            raise ValueError(
+                "driftlock_max_history_characters must be at least "
+                f"{MIN_MAX_HISTORY_CHARACTERS}"
+            )
+        validate_parallel_compaction_bounds(
+            parallel_tool_calls=driftlock_parallel_reads,
+            max_tool_calls_per_step=driftlock_max_tool_calls_per_step,
+            max_tool_output_characters=driftlock_max_tool_output_characters,
+            max_history_characters=driftlock_max_history_characters,
+        )
         super().__init__(*args, **kwargs)
         if not isinstance(self.model_name, str) or not self.model_name:
             raise ValueError("native driftlock requires model_name")
@@ -270,6 +422,43 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         self._native_last_result: RunResult | None = None
         self._native_phases: list[dict[str, Any]] = []
         self._native_prompt_cache = driftlock_prompt_cache
+        self._native_agentic_retrieval = driftlock_agentic_retrieval
+        self._native_retrieval_library = retrieval_library
+        self._native_retrieval_embedder = retrieval_embedder
+        self._native_planning = driftlock_planning
+        self._native_delegation = driftlock_delegation
+        self._native_parallel_reads = driftlock_parallel_reads
+        self._native_max_tool_output_characters = driftlock_max_tool_output_characters
+        self._native_max_tool_calls_per_step = driftlock_max_tool_calls_per_step
+        self._native_max_history_characters = driftlock_max_history_characters
+        self._native_self_verification = driftlock_self_verification
+        # Memory is intentionally scoped to one Harbor trial, whose agent log
+        # directory is unique. Treatment and paired control trials therefore
+        # cannot read each other's writes, while verifier-resume phases of the
+        # same trial retain the designed persistence.
+        memory_root = (Path(self.logs_dir) / "driftlock-memory").resolve()
+        try:
+            memory_root_in_use = (
+                driftlock_memory
+                and memory_root.exists()
+                and (not memory_root.is_dir() or any(memory_root.iterdir()))
+            )
+        except OSError as error:
+            raise NativeComponentConfigurationError(
+                "driftlock memory root cannot be inspected at trial construction: "
+                f"{memory_root}: {type(error).__name__}: {error}"
+            ) from error
+        if memory_root_in_use:
+            raise NativeComponentConfigurationError(
+                "driftlock memory root must be empty at trial construction: "
+                f"{memory_root}"
+            )
+        self._native_memory_store = (
+            MemoryStore(memory_root) if driftlock_memory else None
+        )
+        self._native_memory_run_id = hashlib.sha256(
+            str(Path(self.logs_dir).resolve()).encode()
+        ).hexdigest()
 
     @staticmethod
     def name() -> str:
@@ -314,7 +503,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         context: Any,
         initial_state: dict[str, Any] | None,
     ) -> None:
-        runtime = self._ensure_runtime(environment, context)
+        runtime = await self._ensure_runtime(environment, context, instruction)
         if runtime.tokens_remaining == 0:
             self._set_token_limit_metadata(context)
             return
@@ -334,6 +523,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             result=result,
             runtime=runtime,
             trial_token_budget=self._native_runner_config.max_tokens,
+            components=runtime.component_report(),
         )
         self._write_phase_record(result)
 
@@ -386,14 +576,51 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             record["context_compactions"] = context_compactions
         if result.prompt_cache_summary is not None:
             record["prompt_cache"] = result.prompt_cache_summary.to_dict()
+        if result.verification_records:
+            record["self_verification"] = {
+                "verification_ran": True,
+                "affected_outcome": any(
+                    record.status is not VerificationStatus.VERIFIED
+                    for record in result.verification_records
+                ),
+                "run_status": result.status.value,
+                "tokens_used": result.verification_tokens_used,
+                "status_counts": result.verification_status_counts,
+                "records": [item.to_dict() for item in result.verification_records],
+            }
+        runtime = getattr(self, "_native_runtime", None)
+        reconciliation = getattr(runtime, "last_provider_call_reconciliation", None)
+        if reconciliation is not None:
+            record["provider_call_reconciliation"] = dict(reconciliation)
         self._native_phases.append(record)
+
+        self._write_run_record()
+
+    def _write_run_record(self) -> None:
+        """Persist configuration even when no phase reaches a terminal result."""
+
         output = Path(self.logs_dir) / "driftlock-native-result.json"
+        runtime = getattr(self, "_native_runtime", None)
+        if runtime is None:
+            # Preserve the narrow unit seam used by historical phase-record tests;
+            # real configured runs create the runtime before writing this file.
+            payload = {"phases": self._native_phases}
+        else:
+            component_report = runtime.component_report()
+            payload = {
+                "schema_version": 2,
+                "active_components": component_report["active"],
+                "components": component_report["components"],
+                "phases": self._native_phases,
+            }
         output.write_text(
-            json.dumps({"phases": self._native_phases}, indent=2) + "\n",
+            json.dumps(payload, indent=2) + "\n",
             encoding="utf-8",
         )
 
-    def _ensure_runtime(self, environment: Any, context: Any) -> LHTBNativeAgentRuntime:
+    async def _ensure_runtime(
+        self, environment: Any, context: Any, instruction: str
+    ) -> LHTBNativeAgentRuntime:
         if self._native_runtime is not None:
             if environment is not self._native_environment:
                 raise RuntimeError(
@@ -411,6 +638,34 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             remote_workspace=workspace,
             user=environment.default_user,
         )
+        retrieval_tool = None
+        if self._native_agentic_retrieval:
+            assert self._native_retrieval_library is not None
+            assert self._native_retrieval_embedder is not None
+            retrieval_tool = await build_remote_agentic_retrieval_tool(
+                environment,
+                remote_workspace=workspace,
+                store_dir=store_root,
+                remote_tmp_dir="/tmp",
+                user=environment.default_user,
+                skill_library=self._native_retrieval_library,
+                embed=self._native_retrieval_embedder,
+                memory_store=self._native_memory_store,
+            )
+        delegation_tool = None
+        if self._native_delegation:
+            child = ToolCallingSubagentExecutor(
+                environment,
+                observer,
+                self._native_provider,
+                max_output_tokens=self._native_max_output_tokens,
+                prefill_estimator=self._native_provider.prefill_estimate,
+                max_tool_output_chars=self._native_max_tool_output_characters,
+                max_tool_calls_per_step=self._native_max_tool_calls_per_step,
+                max_history_characters=self._native_max_history_characters,
+                user=environment.default_user,
+            )
+            delegation_tool = DelegationTool(child, config=DelegationConfig())
         runtime = LHTBNativeAgentRuntime(
             environment,
             observer,
@@ -424,12 +679,46 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             plan=self._native_plan,
             retain_checkpoints=self._native_retain_checkpoints,
             agent_max_output_tokens=self._native_max_output_tokens,
+            agent_max_tool_output_characters=(self._native_max_tool_output_characters),
+            agent_max_tool_calls_per_step=self._native_max_tool_calls_per_step,
+            agent_max_history_characters=self._native_max_history_characters,
+            retrieval_tool=retrieval_tool,
+            retrieval_embedder_identity=(
+                {
+                    "import_path": "driftlock.st_embedder:embed",
+                    "model": "sentence-transformers/all-MiniLM-L6-v2",
+                    "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+                }
+                if retrieval_tool is not None
+                else None
+            ),
+            memory_store=self._native_memory_store,
+            memory_task_id=(
+                hashlib.sha256(instruction.encode()).hexdigest()
+                if self._native_memory_store is not None
+                else None
+            ),
+            memory_run_id=(
+                self._native_memory_run_id
+                if self._native_memory_store is not None
+                else None
+            ),
+            delegation_tool=delegation_tool,
+            planning=self._native_planning,
+            parallel_tool_calls=self._native_parallel_reads,
             prompt_cache=(PromptCacheConfig() if self._native_prompt_cache else None),
+            explicit_prompt_cache_control=(
+                self._native_low_level.explicit_prompt_cache_control
+            ),
+            self_verification=(
+                SelfVerificationConfig() if self._native_self_verification else None
+            ),
         )
         self._native_runtime = runtime
         self._native_environment = environment
         self._native_context_id = id(context)
         self._native_usage_recorder = ContextUsageRecorder(context)
+        self._write_run_record()
         return runtime
 
     def _apply_accounting(self, context: Any, *, reconcile: bool) -> None:
@@ -454,4 +743,5 @@ class LHTBNativeDriftlockAgent(BaseAgent):
             context,
             runtime=runtime,
             trial_token_budget=self._native_runner_config.max_tokens,
+            components=runtime.component_report(),
         )
