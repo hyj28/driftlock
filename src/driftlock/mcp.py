@@ -197,9 +197,9 @@ class MCPAuthorizationResult:
         elif self.discovery_status is MCPAuthorizationDiscoveryStatus.NOT_REQUESTED:
             raise ValueError("authorization challenges require a discovery outcome")
         if self.discovery_status is MCPAuthorizationDiscoveryStatus.DISCOVERED and (
-            not self.authorization_servers or self.resource_metadata_url is None
+            self.resource_metadata_url is None
         ):
-            raise ValueError("discovered authorization requires metadata and a server")
+            raise ValueError("discovered authorization requires metadata")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -664,11 +664,14 @@ class MCPClient:
         except asyncio.CancelledError:
             raise
         except BaseException:
-            # A supplier exception may itself contain the credential. Suppressing the
-            # cause keeps it out of tracebacks as well as the fixed public message.
-            raise MCPError(
-                "credential_unavailable", "MCP credential supplier failed"
-            ) from None
+            supplier_failed = True
+        else:
+            supplier_failed = False
+        if supplier_failed:
+            # Raise after leaving the handler: ``from None`` hides a context from
+            # tracebacks but does not clear __context__, which must not retain a
+            # supplier exception that may itself contain the credential.
+            raise MCPError("credential_unavailable", "MCP credential supplier failed")
         if token is None:
             return None
         if (
@@ -716,7 +719,12 @@ class MCPClient:
         if _contains_credential(self.config.url, token):
             raise MCPError("credential_invalid", "MCP credential is invalid")
         response = await self._http_round_trip(
-            "POST", self.config.url, data, token=token, request_id=request_id
+            "POST",
+            self.config.url,
+            data,
+            token=token,
+            forbidden_credential=token,
+            request_id=request_id,
         )
         if response.status in {401, 403}:
             authorization = await self._authorization_challenge(response, token)
@@ -738,14 +746,20 @@ class MCPClient:
         body: bytes | None,
         *,
         token: str | None,
+        forbidden_credential: str | None,
         request_id: int | None,
         metadata: bool = False,
     ) -> _HTTPResponse:
         current = url
         credential_origin = _origin(url)
         for redirect_count in range(self.limits.max_http_redirects + 1):
-            parsed = _validated_url(current)
-            if _contains_credential(current, token):
+            try:
+                parsed = _validated_url(current, endpoint=True)
+            except ValueError:
+                raise MCPError(
+                    "redirect_rejected", "MCP HTTP redirect was refused"
+                ) from None
+            if _contains_credential(current, forbidden_credential):
                 raise MCPError("credential_invalid", "MCP credential is invalid")
             send_credential = (
                 token is not None and _origin(current) == credential_origin
@@ -772,7 +786,9 @@ class MCPClient:
                 return response
             try:
                 target = urljoin(current, location)
-                _validated_url(target)
+                _validated_url(target, endpoint=True)
+                if _contains_credential(target, forbidden_credential):
+                    raise ValueError("redirect contains credential")
             except ValueError:
                 raise MCPError(
                     "redirect_rejected", "MCP HTTP redirect was refused"
@@ -869,6 +885,11 @@ class MCPClient:
                 raise MCPError("disconnected", "MCP server is disconnected") from None
             raise
         except MCPError:
+            # aclose owns the transport shutdown, not the task that happened to
+            # call us.  Its abort can surface as a parser error first; once the
+            # client is closed, expose the stable disconnected outcome instead.
+            if not self._http_open:
+                raise MCPError("disconnected", "MCP server is disconnected") from None
             raise
         except (OSError, UnicodeError, ValueError, asyncio.IncompleteReadError):
             if not self._http_open:
@@ -1219,6 +1240,7 @@ class MCPClient:
                         candidate,
                         None,
                         token=None,
+                        forbidden_credential=token,
                         request_id=None,
                         metadata=True,
                     )
@@ -1227,10 +1249,13 @@ class MCPClient:
                     or _media_type(discovered) != "application/json"
                 ):
                     continue
+                if _contains_credential(discovered.url, token):
+                    discovery_status = MCPAuthorizationDiscoveryStatus.MALFORMED
+                    continue
                 parsed_servers, parsed_scopes, parsed_status = (
                     self._parse_resource_metadata(discovered.body, token)
                 )
-                if parsed_servers:
+                if parsed_status is MCPAuthorizationDiscoveryStatus.DISCOVERED:
                     metadata_url = discovered.url
                     servers = parsed_servers
                     metadata_scopes = parsed_scopes
@@ -1246,6 +1271,8 @@ class MCPClient:
             except MCPError as exc:
                 if exc.status in {"message_too_large", "catalog_too_large"}:
                     discovery_status = MCPAuthorizationDiscoveryStatus.LIMIT_EXCEEDED
+                elif exc.status in {"credential_invalid", "redirect_rejected"}:
+                    discovery_status = MCPAuthorizationDiscoveryStatus.MALFORMED
                 continue
             except TimeoutError:
                 continue
@@ -1271,13 +1298,9 @@ class MCPClient:
             return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
         if not isinstance(value, dict):
             return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
-        servers_value = value.get("authorization_servers")
+        servers_value = value.get("authorization_servers", [])
         scopes_value = value.get("scopes_supported", [])
-        if (
-            not isinstance(servers_value, list)
-            or not servers_value
-            or not isinstance(scopes_value, list)
-        ):
+        if not isinstance(servers_value, list) or not isinstance(scopes_value, list):
             return (), (), MCPAuthorizationDiscoveryStatus.MALFORMED
         if (
             len(servers_value) > self.limits.max_authorization_servers
@@ -1447,10 +1470,6 @@ class MCPClient:
         self._ready = False
         if self.config.url is not None:
             self._http_open = False
-            current = asyncio.current_task()
-            tasks = tuple(task for task in self._http_tasks if task is not current)
-            for task in tasks:
-                task.cancel()
             writers = tuple(self._http_writers)
             self._http_writers.clear()
             for writer in writers:
@@ -1458,9 +1477,6 @@ class MCPClient:
             for writer in writers:
                 with contextlib.suppress(OSError, RuntimeError):
                     await writer.wait_closed()
-            for task in tasks:
-                with contextlib.suppress(asyncio.CancelledError, MCPError):
-                    await task
             self._session_id = None
             self._session_origin = None
             return

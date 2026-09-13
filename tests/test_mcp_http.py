@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from fixtures.mcp_http_server import running_http_server
 
+import driftlock.mcp as mcp_module
 from driftlock import (
     AgentCompletion,
     AgentCompletionRequest,
@@ -91,15 +92,25 @@ async def test_http_discovery_call_sse_and_agent_surface(tmp_path: Path):
             }
 
 
-async def test_supplier_is_only_source_and_is_consulted_per_request(monkeypatch):
-    monkeypatch.setenv("MCP_TOKEN", "ambient-token-must-not-be-read")
+async def test_http_never_consults_process_environment(monkeypatch):
+    class UnreadableOS:
+        @property
+        def environ(self):
+            raise AssertionError("MCP client consulted the process environment")
+
     with running_http_server() as server:
+        # Replace only mcp.py's module binding.  Mutating os.environ globally
+        # would also intercept the stdlib TLS implementation's unrelated
+        # SSLKEYLOGFILE support and would not isolate the behavior under test.
+        monkeypatch.setattr(mcp_module, "os", UnreadableOS())
         async with MCPClient(http_config(server.url)) as client:
             await client.call_tool("echo", {"text": "public"})
         assert all(
             "authorization" not in request["headers"] for request in server.requests
         )
 
+
+async def test_supplier_is_consulted_per_request():
     current = ["first-rotated-token"]
     supplier_calls = 0
 
@@ -183,6 +194,96 @@ async def test_401_returns_actionable_typed_discovery_without_retry(metadata):
             for request in server.requests
             if request["method"] == "GET"
         )
+
+
+async def test_discovery_redirect_cannot_put_credential_in_url_or_audit(
+    tmp_path: Path,
+):
+    with running_http_server() as source, running_http_server() as sink:
+        source.auth_token = FAKE_TOKEN
+        source.include_www_authenticate = False
+        source.metadata_redirect_url = (
+            f"http://127.0.0.1:{sink.server_port}"
+            f"/.well-known/oauth-protected-resource?leak={FAKE_TOKEN}"
+        )
+        async with MCPClient(
+            http_config(source.url), token_supplier=lambda: FAKE_TOKEN
+        ) as client:
+            selected = client.tools[0]
+            source.auth_token = "rotated-away"
+
+            async def provider(_request: AgentCompletionRequest) -> AgentCompletion:
+                return AgentCompletion(
+                    tool_calls=(ToolCall(selected.provider_name, {}, "redirect-auth"),)
+                )
+
+            agent = ToolCallingAgent(
+                LocalEnvironment(tmp_path),
+                LocalWorkspaceDeltaObserver(tmp_path),
+                provider,
+                mcp_clients=(client,),
+            )
+            outcome = await agent(context(agent.initial_state()))
+            authorization = outcome.tool_audits[0]["authorization"]
+            assert authorization["resource_metadata_url"] is None
+            assert authorization["discovery_status"] == "malformed"
+            assert FAKE_TOKEN not in json.dumps(asdict(outcome), sort_keys=True)
+            assert client.authorization is not None
+            assert FAKE_TOKEN not in json.dumps(client.authorization.to_dict())
+        assert sink.requests == []
+        assert all(FAKE_TOKEN not in request["path"] for request in source.requests)
+
+
+async def test_redirect_rejects_non_loopback_cleartext_target_before_repost():
+    with running_http_server() as server:
+        server.redirect_url = "http://example.com/collect"
+        client = MCPClient(http_config(server.url))
+        with pytest.raises(MCPError) as caught:
+            await client.__aenter__()
+        assert caught.value.status == "redirect_rejected"
+        assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata_body", "servers", "limits", "expected_status"),
+    [
+        (
+            b'{"resource":"https://resource.example","scopes_supported":'
+            b'["tools:call"]}',
+            None,
+            MCPLimits(),
+            MCPAuthorizationDiscoveryStatus.DISCOVERED,
+        ),
+        (b"[]", None, MCPLimits(), MCPAuthorizationDiscoveryStatus.MALFORMED),
+        (
+            None,
+            ["https://one.example", "https://two.example"],
+            MCPLimits(max_authorization_servers=1),
+            MCPAuthorizationDiscoveryStatus.LIMIT_EXCEEDED,
+        ),
+    ],
+)
+async def test_resource_metadata_optional_servers_malformed_and_server_cap(
+    metadata_body, servers, limits, expected_status
+):
+    with running_http_server() as server:
+        server.auth_token = "accepted-token"
+        server.metadata_body = metadata_body
+        server.metadata_servers = servers
+        client = MCPClient(
+            http_config(server.url),
+            limits=limits,
+            token_supplier=lambda: FAKE_TOKEN,
+        )
+        with pytest.raises(MCPAuthorizationError) as caught:
+            await client.__aenter__()
+        result = caught.value.authorization
+        assert result.discovery_status is expected_status
+        if expected_status is MCPAuthorizationDiscoveryStatus.DISCOVERED:
+            assert result.authorization_servers == ()
+            assert result.resource_metadata_url == (
+                f"http://127.0.0.1:{server.server_port}/metadata"
+            )
 
 
 @pytest.mark.parametrize("redirect", [False, True])
@@ -394,42 +495,68 @@ async def test_nonresponding_server_timeout_leaves_no_client_work(mode):
             assert not client.ready
 
 
-async def test_http_cancellation_and_external_close_stop_pending_work():
+async def test_http_cancellation_stops_pending_work():
     limits = MCPLimits(
         request_timeout_seconds=2,
         shutdown_timeout_seconds=0.05,
         max_message_bytes=1_000_000,
     )
-    for cancel_directly in (True, False):
-        with running_http_server() as server:
-            async with MCPClient(http_config(server.url), limits=limits) as client:
-                server.mode = "endless_sse"
-                task = asyncio.create_task(client.call_tool("echo", {}))
+    with running_http_server() as server:
+        async with MCPClient(http_config(server.url), limits=limits) as client:
+            server.mode = "endless_sse"
+            task = asyncio.create_task(client.call_tool("echo", {}))
+            for _ in range(50):
+                with server.active_lock:
+                    active = server.active_handlers
+                if active:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            for _ in range(50):
+                with server.active_lock:
+                    active = server.active_handlers
+                if active == 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert active == 0
+            assert client._http_writers == set()
+            assert client._http_tasks == {}
+            assert not client.ready
+
+
+async def test_external_close_does_not_cancel_or_await_inline_caller():
+    limits = MCPLimits(
+        request_timeout_seconds=2,
+        shutdown_timeout_seconds=0.05,
+        max_message_bytes=1_000_000,
+    )
+    with running_http_server() as server:
+        async with MCPClient(http_config(server.url), limits=limits) as client:
+            server.mode = "endless_sse"
+            caller = asyncio.current_task()
+            assert caller is not None
+            cancellation_count = caller.cancelling()
+
+            async def watchdog() -> None:
                 for _ in range(50):
-                    with server.active_lock:
-                        active = server.active_handlers
-                    if active:
+                    if client._http_writers:
                         break
                     await asyncio.sleep(0.01)
-                if cancel_directly:
-                    task.cancel()
-                    with pytest.raises(asyncio.CancelledError):
-                        await task
-                else:
-                    await client.aclose()
-                    with pytest.raises(MCPError) as caught:
-                        await task
-                    assert caught.value.status == "disconnected"
-                for _ in range(50):
-                    with server.active_lock:
-                        active = server.active_handlers
-                    if active == 0:
-                        break
-                    await asyncio.sleep(0.01)
-                assert active == 0
-                assert client._http_writers == set()
-                assert client._http_tasks == {}
-                assert not client.ready
+                assert client._http_writers
+                await client.aclose()
+
+            watchdog_task = asyncio.create_task(watchdog())
+            with pytest.raises(MCPError) as caught:
+                await client.call_tool("echo", {})
+            assert caught.value.status == "disconnected"
+            await asyncio.wait_for(watchdog_task, 0.5)
+            await asyncio.sleep(0)
+            assert caller.cancelling() == cancellation_count
+            assert client._http_writers == set()
+            assert client._http_tasks == {}
+            assert not client.ready
 
 
 @pytest.mark.parametrize(
@@ -520,6 +647,7 @@ async def test_fake_token_absent_from_errors_logs_agent_audit_and_urls(
             await client.__aenter__()
         assert caught.value.status == "credential_unavailable"
         assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
         assert FAKE_TOKEN not in str(caught.value)
         assert server.requests == []
 

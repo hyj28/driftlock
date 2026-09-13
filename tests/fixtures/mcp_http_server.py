@@ -20,8 +20,11 @@ class MCPHTTPServer(ThreadingHTTPServer):
         self.mode = "normal"
         self.auth_token: str | None = None
         self.metadata = True
+        self.include_www_authenticate = True
         self.metadata_servers: list[str] | None = None
         self.metadata_scopes: list[str] | None = None
+        self.metadata_body: bytes | None = None
+        self.metadata_redirect_url: str | None = None
         self.redirect_url: str | None = None
         self.active_handlers = 0
         self.active_lock = threading.Lock()
@@ -85,21 +88,34 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 self.path == "/metadata"
                 or self.path.startswith("/.well-known/oauth-protected-resource")
             ):
-                servers = self.server.metadata_servers or [
-                    f"http://127.0.0.1:{self.server.server_port}/authorize"
-                ]
-                scopes = self.server.metadata_scopes or [
-                    "catalog:read",
-                    "tools:call",
-                ]
-                body = json.dumps(
-                    {
-                        "resource": self.server.url,
-                        "authorization_servers": servers,
-                        "scopes_supported": scopes,
-                    },
-                    separators=(",", ":"),
-                ).encode()
+                if self.server.metadata_redirect_url is not None:
+                    self._headers(
+                        307,
+                        b"",
+                        content_type=None,
+                        extra=(("Location", self.server.metadata_redirect_url),),
+                    )
+                    return
+                servers = (
+                    [f"http://127.0.0.1:{self.server.server_port}/authorize"]
+                    if self.server.metadata_servers is None
+                    else self.server.metadata_servers
+                )
+                scopes = (
+                    ["catalog:read", "tools:call"]
+                    if self.server.metadata_scopes is None
+                    else self.server.metadata_scopes
+                )
+                body = self.server.metadata_body
+                if body is None:
+                    body = json.dumps(
+                        {
+                            "resource": self.server.url,
+                            "authorization_servers": servers,
+                            "scopes_supported": scopes,
+                        },
+                        separators=(",", ":"),
+                    ).encode()
                 self._headers(200, body)
             else:
                 self._headers(404, b"", content_type=None)
@@ -126,7 +142,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 != f"Bearer {self.server.auth_token}"
             ):
                 extra: tuple[tuple[str, str], ...] = ()
-                if self.server.metadata:
+                if self.server.metadata and self.server.include_www_authenticate:
                     extra = (
                         (
                             "WWW-Authenticate",
