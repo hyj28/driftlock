@@ -663,6 +663,13 @@ class DelegationTool:
 
         task.add_done_callback(discard)
 
+    async def drain_cancelled(self) -> None:
+        """Wait until every interrupted child has observed cancellation."""
+
+        pending = tuple(self._cancelled_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     def _outcome(
         self,
         status: DelegationStatus,

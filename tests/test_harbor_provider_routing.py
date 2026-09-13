@@ -14,6 +14,7 @@ from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import JudgeTokenBudgetExhausted
 from driftlock.lhtb import openrouter_provider_from_call_kwargs
 from driftlock.lhtb_experiment import build_job_config
+from driftlock.memory import MemoryProvenance
 from driftlock.models import (
     Checkpoint,
     CheckpointRestoreStatus,
@@ -1489,3 +1490,147 @@ async def test_blind_retry_declines_ineligible_guard_without_mutating_workspace(
             "tar: ./private: Cannot savedir: Permission denied"
         ),
     }
+
+
+def test_native_retrieval_missing_optional_embedder_fails_during_configuration(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, native_agent = harbor_agent_modules
+    library = tmp_path / "library"
+    library.mkdir()
+    monkeypatch.setattr(native_agent.importlib.util, "find_spec", lambda _name: None)
+
+    with pytest.raises(
+        native_agent.NativeComponentConfigurationError,
+        match=(
+            "driftlock_agentic_retrieval requires the pinned optional embedder "
+            r"driftlock\.st_embedder \(all-MiniLM-L6-v2\) to be available"
+        ),
+    ):
+        native_agent.LHTBNativeDriftlockAgent(
+            logs_dir=tmp_path / "logs",
+            model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+            llm_call_kwargs=_agent_call_kwargs(),
+            model_info={
+                "max_input_tokens": 128000,
+                "max_output_tokens": 8192,
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+            },
+            driftlock_agentic_retrieval=True,
+            driftlock_retrieval_skill_library_dir=str(library),
+        )
+
+    assert _FakeLiteLLM.instances == []
+
+
+def test_native_harness_memory_roots_are_isolated_per_harbor_trial(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    common = {
+        "model_name": "openrouter/deepseek/deepseek-v4-flash-0731",
+        "llm_call_kwargs": _agent_call_kwargs(),
+        "model_info": {
+            "max_input_tokens": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+        },
+        "driftlock_memory": True,
+    }
+
+    treatment = native_agent.LHTBNativeDriftlockAgent(
+        logs_dir=tmp_path / "treatment" / "agent", **common
+    )
+    control = native_agent.LHTBNativeDriftlockAgent(
+        logs_dir=tmp_path / "control" / "agent", **common
+    )
+
+    assert (
+        treatment._native_memory_store.root
+        == (tmp_path / "treatment" / "agent" / "driftlock-memory").resolve()
+    )
+    assert (
+        control._native_memory_store.root
+        == (tmp_path / "control" / "agent" / "driftlock-memory").resolve()
+    )
+    assert treatment._native_memory_store.root != control._native_memory_store.root
+    control._native_memory_store.record(
+        "control-only observation",
+        MemoryProvenance("task-a", "control", 1, 1, 1),
+    )
+    assert control._native_memory_store.memory_ids() == ("memory-000001",)
+    assert treatment._native_memory_store.memory_ids() == ()
+
+
+async def test_native_harness_constructs_components_and_records_configuration(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    logs = tmp_path / "trial" / "agent"
+    agent = native_agent.LHTBNativeDriftlockAgent(
+        logs_dir=logs,
+        model_name="openrouter/deepseek/deepseek-v4-flash-0731",
+        llm_call_kwargs=_agent_call_kwargs(),
+        model_info={
+            "max_input_tokens": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0,
+            "output_cost_per_token": 0,
+        },
+        driftlock_planning=True,
+        driftlock_memory=True,
+        driftlock_delegation=True,
+        driftlock_parallel_reads=True,
+        driftlock_prompt_cache=True,
+        driftlock_self_verification=True,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = SimpleNamespace(
+        default_user="root",
+        task_env_config=SimpleNamespace(workdir=str(workspace)),
+    )
+    context = SimpleNamespace(
+        n_input_tokens=None,
+        n_cache_tokens=None,
+        n_output_tokens=None,
+        cost_usd=None,
+        metadata={},
+    )
+
+    runtime = await agent._ensure_runtime(environment, context, "literal task")
+
+    assert [tool.name for tool in runtime.agent._tool_definitions()] == [
+        "run_shell",
+        "read_file",
+        "write_file",
+        "search_files",
+        "complete",
+        "manage_plan",
+        "manage_memory",
+        "delegate_task",
+    ]
+    payload = json.loads(
+        (logs / "driftlock-native-result.json").read_text(encoding="utf-8")
+    )
+    assert payload["active_components"] == [
+        "compaction",
+        "planning",
+        "memory",
+        "delegation",
+        "parallel_reads",
+        "prompt_cache",
+        "self_verification",
+    ]
+    assert payload["components"]["memory"]["scope"] == "harbor_trial"
+    assert payload["components"]["delegation"]["child_can_delegate"] is False
+    assert payload["components"]["mcp"]["availability"] == (
+        "excluded_from_lhtb_experiment"
+    )
+    assert payload["phases"] == []

@@ -752,8 +752,8 @@ def _load_trial(
     )
     provider, judge_provider = _trial_providers(data, arm, result_file)
     usage, usage_source = _usage(data, result_file, provider=provider)
-    driftlock_run_statuses, judge_reliability = _driftlock_run_metadata(
-        data, arm, result_file
+    driftlock_run_statuses, judge_reliability, component_configuration = (
+        _driftlock_run_metadata(data, arm, result_file)
     )
     task_metadata = task_metadata_cache.get(task)
     if task_metadata is None:
@@ -804,6 +804,7 @@ def _load_trial(
         ),
         "driftlock_run_statuses": driftlock_run_statuses,
         "judge_reliability": judge_reliability,
+        "driftlock_components": component_configuration,
         "duration_sec": duration,
         "result_file": str(result_file),
         "result_sha256": _file_sha256(result_file),
@@ -812,10 +813,10 @@ def _load_trial(
 
 def _driftlock_run_metadata(
     data: dict[str, Any], arm: str, result_file: Path
-) -> tuple[tuple[str, ...], str | None]:
+) -> tuple[tuple[str, ...], str | None, dict[str, Any] | None]:
     """Validate terminal and cumulative judge statuses before analysis."""
     if arm not in _DRIFTLOCK_DETECTOR_ARMS:
-        return (), None
+        return (), None, None
     direct = data.get("agent_result")
     step_results = data.get("step_results")
     if isinstance(direct, dict):
@@ -831,6 +832,7 @@ def _driftlock_run_metadata(
 
     statuses: list[str] = []
     reliabilities: list[str] = []
+    component_reports: list[dict[str, Any]] = []
     for context in contexts:
         metadata = context.get("metadata")
         driftlock = metadata.get("driftlock") if isinstance(metadata, dict) else None
@@ -854,6 +856,11 @@ def _driftlock_run_metadata(
                 f"reason {termination_reason!r} in {result_file}"
             )
         statuses.append(status)
+        components = driftlock.get("components")
+        if components is not None:
+            if not isinstance(components, dict):
+                raise ValueError(f"invalid driftlock components in {result_file}")
+            component_reports.append(components)
         reliability = driftlock.get("judge_reliability")
         if reliability is None:
             continue
@@ -891,7 +898,15 @@ def _driftlock_run_metadata(
         raise ValueError(
             f"non-measurable judge reliability {final_reliability!r} in {result_file}"
         )
-    return tuple(statuses), final_reliability
+    if component_reports and any(
+        report != component_reports[0] for report in component_reports[1:]
+    ):
+        raise ValueError(f"driftlock components changed within trial {result_file}")
+    return (
+        tuple(statuses),
+        final_reliability,
+        component_reports[-1] if component_reports else None,
+    )
 
 
 def _lock_trial_signature(task_name: str, config: dict[str, Any]) -> str:

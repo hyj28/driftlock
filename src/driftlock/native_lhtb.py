@@ -6,21 +6,32 @@ import json
 import math
 import shlex
 import shutil
+import tarfile
+import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from driftlock.agent import (
+    DEFAULT_MAX_HISTORY_CHARACTERS,
+    DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+    DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+    MAX_PLAN_DESCRIPTION_CHARACTERS,
+    MAX_PLAN_STEPS,
+    PARALLEL_HISTORY_RESERVE_CHARACTERS,
     AgentCompletion,
     AgentCompletionRequest,
     AgentProviderError,
     ToolCall,
     ToolCallingAgent,
 )
+from driftlock.agentic_retrieval import AgenticRetrievalTool
+from driftlock.delegation import DelegationTool
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.judges import FineJudge
 from driftlock.lhtb import WorkspaceDeltaObserver
+from driftlock.memory import MemoryStore
 from driftlock.models import (
     RunResult,
     RunStatus,
@@ -31,6 +42,69 @@ from driftlock.models import (
 from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteEnvironment
 from driftlock.runner import DriftlockRunner, RunnerConfig
+from driftlock.skill_admission import SkillLibrary
+from driftlock.verification import SelfVerificationConfig, VerificationStatus
+
+
+class NativeComponentConfigurationError(ValueError):
+    """An opted-in native component cannot preserve its declared invariants."""
+
+
+MCP_EXPERIMENT_EXCLUSION_REASON = (
+    "LHTB tasks provide no MCP server or credential-free server configuration; "
+    "exposing an inert flag would make an enabled treatment indistinguishable "
+    "from an empty result. MCP remains available on ToolCallingAgent itself."
+)
+
+
+def validate_parallel_compaction_bounds(
+    *,
+    parallel_tool_calls: bool,
+    max_tool_calls_per_step: int,
+    max_tool_output_characters: int,
+    max_history_characters: int,
+) -> None:
+    """Keep a worst-case parallel read turn retainable by compaction."""
+
+    if not parallel_tool_calls:
+        return
+    required = (
+        max_tool_calls_per_step * max_tool_output_characters
+        + PARALLEL_HISTORY_RESERVE_CHARACTERS
+    )
+    if max_history_characters < required:
+        raise NativeComponentConfigurationError(
+            "parallel reads require max_history_characters >= "
+            "max_tool_calls_per_step * max_tool_output_characters + "
+            f"{PARALLEL_HISTORY_RESERVE_CHARACTERS}; got "
+            f"{max_history_characters} < {required}"
+        )
+
+
+def _dataclass_config(value: Any) -> dict[str, Any]:
+    return {field.name: getattr(value, field.name) for field in fields(value)}
+
+
+def _expected_step_provider_calls(outcome: StepOutcome) -> int:
+    """Derive the exact physical-call count from bounded step evidence."""
+
+    expected = 1
+    if (
+        outcome.verification is not None
+        and outcome.verification.status is not VerificationStatus.BUDGET_EXHAUSTED
+    ):
+        expected += 1
+    for audit in outcome.tool_audits:
+        result = audit.get("result") if isinstance(audit, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("mode") != "sub-agent-delegation":
+            continue
+        steps = result.get("steps")
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 0:
+            raise RuntimeError("delegation audit has invalid child step accounting")
+        expected += steps
+    return expected
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +476,46 @@ def native_checkpoint_store_root(logs_dir: Path | str) -> Path:
     return store_root
 
 
+async def build_remote_agentic_retrieval_tool(
+    environment: RemoteEnvironment,
+    *,
+    remote_workspace: str,
+    store_dir: Path | str,
+    remote_tmp_dir: str,
+    user: str | int | None,
+    skill_library: SkillLibrary,
+    embed: Any,
+    memory_store: MemoryStore | None = None,
+) -> AgenticRetrievalTool:
+    """Snapshot one remote task, build its immutable corpus, and clean staging."""
+
+    if not callable(embed):
+        raise TypeError("retrieval embedder must be callable")
+    staging_store = Path(store_dir) / f".retrieval-{uuid.uuid4().hex}"
+    extracted = staging_store / "workspace"
+    snapshot_store = RemoteArchiveCheckpointStore(
+        environment,
+        remote_workspace=remote_workspace,
+        store_dir=staging_store,
+        remote_tmp_dir=remote_tmp_dir,
+        user=user,
+    )
+    try:
+        checkpoint = await snapshot_store.create({}, step=0, label="retrieval")
+        archive = checkpoint.path / "workspace.tar.gz"
+        extracted.mkdir(parents=True)
+        with tarfile.open(archive, "r:gz") as handle:
+            handle.extractall(extracted, filter="data")
+        return AgenticRetrievalTool.from_workspace(
+            extracted,
+            skill_library,
+            embed,
+            memory_store=memory_store,
+        )
+    finally:
+        shutil.rmtree(staging_store, ignore_errors=True)
+
+
 class NativeProcessQuiescer:
     """Stop processes created by the native agent before restoring its workspace."""
 
@@ -498,6 +612,7 @@ def set_native_result_metadata(
     result: RunResult,
     runtime: Any,
     trial_token_budget: int,
+    components: Mapping[str, Any] | None = None,
 ) -> None:
     """Publish one successful native phase's terminal metadata."""
     metadata = dict(context.metadata or {})
@@ -512,6 +627,15 @@ def set_native_result_metadata(
             "trial_token_budget": trial_token_budget,
         }
     )
+    if components is not None:
+        summary["components"] = dict(components)
+    if result.verification_records:
+        summary["self_verification"] = {
+            "affected_outcome": True,
+            "run_status": result.status.value,
+            "tokens_used": result.verification_tokens_used,
+            "status_counts": result.verification_status_counts,
+        }
     metadata["driftlock"] = summary
     metadata["termination_reason"] = (
         "confirmed_task_complete"
@@ -522,7 +646,11 @@ def set_native_result_metadata(
 
 
 def set_native_token_limit_metadata(
-    context: Any, *, runtime: Any, trial_token_budget: int
+    context: Any,
+    *,
+    runtime: Any,
+    trial_token_budget: int,
+    components: Mapping[str, Any] | None = None,
 ) -> None:
     """Publish native trial budget exhaustion metadata."""
     metadata = dict(context.metadata or {})
@@ -537,6 +665,8 @@ def set_native_token_limit_metadata(
             "trial_token_budget": trial_token_budget,
         }
     )
+    if components is not None:
+        summary["components"] = dict(components)
     metadata["driftlock"] = summary
     context.metadata = metadata
 
@@ -561,8 +691,21 @@ class LHTBNativeAgentRuntime:
         remote_tmp_dir: str = "/tmp",
         agent_max_output_tokens: int = 8192,
         agent_min_output_tokens: int = 64,
+        agent_max_tool_output_characters: int = DEFAULT_MAX_TOOL_OUTPUT_CHARACTERS,
+        agent_max_tool_calls_per_step: int = DEFAULT_MAX_TOOL_CALLS_PER_STEP,
+        agent_max_history_characters: int = DEFAULT_MAX_HISTORY_CHARACTERS,
         shell_timeout_sec: int = 60,
+        retrieval_tool: AgenticRetrievalTool | None = None,
+        retrieval_embedder_identity: Mapping[str, str] | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_task_id: str | None = None,
+        memory_run_id: str | None = None,
+        delegation_tool: DelegationTool | None = None,
+        planning: bool = False,
+        parallel_tool_calls: bool = False,
         prompt_cache: PromptCacheConfig | None = None,
+        explicit_prompt_cache_control: bool = False,
+        self_verification: SelfVerificationConfig | None = None,
     ) -> None:
         workspace = PurePosixPath(remote_workspace)
         if not workspace.is_absolute() or workspace == PurePosixPath("/"):
@@ -571,6 +714,35 @@ class LHTBNativeAgentRuntime:
             raise ValueError("native LHTB runs require a finite total token budget")
         if not isinstance(plan, str):
             raise TypeError("plan must be a string")
+        if not isinstance(explicit_prompt_cache_control, bool):
+            raise TypeError("explicit_prompt_cache_control must be a boolean")
+        if explicit_prompt_cache_control and prompt_cache is None:
+            raise ValueError("explicit prompt cache control requires prompt_cache")
+        if (retrieval_tool is None) != (retrieval_embedder_identity is None):
+            raise ValueError(
+                "retrieval_tool and retrieval_embedder_identity must be configured "
+                "together"
+            )
+        if retrieval_embedder_identity is not None and (
+            not isinstance(retrieval_embedder_identity, Mapping)
+            or not retrieval_embedder_identity
+            or any(
+                not isinstance(name, str)
+                or not name
+                or not isinstance(value, str)
+                or not value
+                for name, value in retrieval_embedder_identity.items()
+            )
+        ):
+            raise TypeError(
+                "retrieval_embedder_identity must be a non-empty text mapping"
+            )
+        validate_parallel_compaction_bounds(
+            parallel_tool_calls=parallel_tool_calls,
+            max_tool_calls_per_step=agent_max_tool_calls_per_step,
+            max_tool_output_characters=agent_max_tool_output_characters,
+            max_history_characters=agent_max_history_characters,
+        )
         self.environment = environment
         self.observer = observer
         self.provider = provider
@@ -583,6 +755,12 @@ class LHTBNativeAgentRuntime:
         self.plan = plan
         self.retain_checkpoints = retain_checkpoints
         self.remote_tmp_dir = remote_tmp_dir
+        self.explicit_prompt_cache_control = explicit_prompt_cache_control
+        self.retrieval_embedder_identity = (
+            dict(retrieval_embedder_identity)
+            if retrieval_embedder_identity is not None
+            else None
+        )
         self.agent = ToolCallingAgent(
             environment,
             observer,
@@ -590,9 +768,20 @@ class LHTBNativeAgentRuntime:
             max_output_tokens=agent_max_output_tokens,
             min_output_tokens=agent_min_output_tokens,
             prefill_estimator=provider.prefill_estimate,
+            max_tool_output_chars=agent_max_tool_output_characters,
+            max_tool_calls_per_step=agent_max_tool_calls_per_step,
+            max_history_characters=agent_max_history_characters,
             shell_timeout_sec=shell_timeout_sec,
             user=user,
+            retrieval_tool=retrieval_tool,
+            memory_store=memory_store,
+            memory_task_id=memory_task_id,
+            memory_run_id=memory_run_id,
+            delegation_tool=delegation_tool,
+            planning=planning,
+            parallel_tool_calls=parallel_tool_calls,
             prompt_cache=prompt_cache,
+            self_verification=self_verification,
         )
         self._process_quiescer = NativeProcessQuiescer(
             environment,
@@ -604,6 +793,99 @@ class LHTBNativeAgentRuntime:
         self.judge_tokens_consumed = 0
         self.phase_count = 0
         self.last_result: RunResult | None = None
+
+    def component_report(self) -> dict[str, Any]:
+        """Return the complete effective component configuration for attribution."""
+
+        retrieval = self.agent.retrieval_tool
+        memory = self.agent.memory_store
+        delegation = self.agent.delegation_tool
+        verification = self.agent.self_verification
+        components: dict[str, Any] = {
+            "agentic_retrieval": {
+                "enabled": retrieval is not None,
+                "configuration": (
+                    {
+                        **retrieval.corpus.config.to_report(),
+                        "fingerprint": retrieval.corpus.config.fingerprint,
+                        "embedder": self.retrieval_embedder_identity,
+                    }
+                    if retrieval is not None
+                    else None
+                ),
+                "corpus": (
+                    retrieval.corpus.snapshot_report()
+                    if retrieval is not None
+                    else None
+                ),
+            },
+            "compaction": {
+                "enabled": True,
+                "max_history_characters": self.agent.max_history_characters,
+                "max_tool_output_characters": self.agent.max_tool_output_chars,
+                "max_tool_calls_per_step": self.agent.max_tool_calls_per_step,
+                "parallel_history_reserve_characters": (
+                    PARALLEL_HISTORY_RESERVE_CHARACTERS
+                ),
+            },
+            "planning": {
+                "enabled": self.agent.planning,
+                "max_steps": MAX_PLAN_STEPS,
+                "max_description_characters": MAX_PLAN_DESCRIPTION_CHARACTERS,
+            },
+            "memory": {
+                "enabled": memory is not None,
+                "scope": "harbor_trial" if memory is not None else None,
+                "root_policy": (
+                    "agent_logs/driftlock-memory" if memory is not None else None
+                ),
+                "configuration": (
+                    _dataclass_config(memory.config) if memory is not None else None
+                ),
+            },
+            "delegation": {
+                "enabled": delegation is not None,
+                "configuration": (
+                    _dataclass_config(delegation.config)
+                    if delegation is not None
+                    else None
+                ),
+                "child_can_delegate": False if delegation is not None else None,
+            },
+            "mcp": {
+                "enabled": False,
+                "availability": "excluded_from_lhtb_experiment",
+                "reason": MCP_EXPERIMENT_EXCLUSION_REASON,
+            },
+            "parallel_reads": {
+                "enabled": self.agent.parallel_tool_calls,
+                "eligible_tools": ["read_file", "search_files"],
+                "required_history_characters": (
+                    self.agent.max_tool_calls_per_step
+                    * self.agent.max_tool_output_chars
+                    + PARALLEL_HISTORY_RESERVE_CHARACTERS
+                ),
+            },
+            "prompt_cache": {
+                "enabled": self.agent.prompt_cache is not None,
+                "explicit_provider_control": self.explicit_prompt_cache_control,
+            },
+            "self_verification": {
+                "enabled": verification is not None,
+                "configuration": (
+                    _dataclass_config(verification)
+                    if verification is not None
+                    else None
+                ),
+            },
+        }
+        return {
+            "schema_version": 1,
+            "active": [
+                name for name, report in components.items() if report["enabled"]
+            ],
+            "components": components,
+        }
 
     @property
     def tokens_remaining(self) -> int:
@@ -651,10 +933,16 @@ class LHTBNativeAgentRuntime:
             outcome = await self.agent(context)
             calls = self.provider.provider_call_count - step_calls_before
             usage = self.provider.usage.delta_from(step_usage_before)
-            if calls != 1:
+            expected_calls = _expected_step_provider_calls(outcome)
+            if calls != expected_calls:
+                if expected_calls == 1:
+                    raise PhysicalProviderBoundaryError(
+                        "one native-agent step must make exactly one physical "
+                        f"provider request; observed {calls}"
+                    )
                 raise PhysicalProviderBoundaryError(
-                    "one native-agent step must make exactly one physical provider "
-                    f"request; observed {calls}"
+                    "native-agent step physical provider requests do not match "
+                    f"component evidence; expected {expected_calls}, observed {calls}"
                 )
             if usage.total_tokens != outcome.tokens:
                 raise RuntimeError(
@@ -683,11 +971,14 @@ class LHTBNativeAgentRuntime:
             phase_unknown_calls = (
                 self.provider.unknown_billed_request_count - unknown_calls_before
             )
-            if phase_calls != len(result.steps):
+            expected_phase_calls = sum(
+                _expected_step_provider_calls(step.outcome) for step in result.steps
+            )
+            if phase_calls != expected_phase_calls:
                 raise RuntimeError(
                     "physical provider calls do not reconcile with recorded steps"
                 )
-            if phase_exact_calls != len(result.steps) or phase_unknown_calls:
+            if phase_exact_calls != expected_phase_calls or phase_unknown_calls:
                 raise RuntimeError(
                     "exact-usage provider calls do not reconcile with recorded steps"
                 )
@@ -702,6 +993,9 @@ class LHTBNativeAgentRuntime:
             phase_succeeded = True
             return result
         finally:
+            delegation = self.agent.delegation_tool
+            if delegation is not None:
+                await delegation.drain_cancelled()
             if phase_succeeded and not self.retain_checkpoints:
                 shutil.rmtree(phase_dir, ignore_errors=True)
 
