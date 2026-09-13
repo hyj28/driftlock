@@ -1001,6 +1001,7 @@ class LHTBNativeAgentRuntime:
                 "file_byte_limit": min(
                     MAX_EDIT_FILE_BYTES, self.agent.max_tool_output_chars
                 ),
+                "absolute_file_byte_limit": MAX_EDIT_FILE_BYTES,
             }
         return {
             "schema_version": 1,

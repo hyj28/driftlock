@@ -271,6 +271,7 @@ async def test_edit_file_harness_flag_off_then_on(tmp_path: Path) -> None:
     assert enabled.component_report()["active"] == ["compaction", "edit_file"]
     assert default_call.prompts[0] == _LITERAL_DEFAULT_PROMPT
     assert '"name":"edit_file"' in enabled_call.prompts[0]
+    assert "other hard links keep the old content" in enabled_call.prompts[0]
 
 
 async def test_planning_and_memory_are_individually_observable(tmp_path: Path) -> None:
