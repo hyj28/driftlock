@@ -5,6 +5,40 @@ this project has not cut a tagged release yet, so everything below is the road t
 
 Dates are the merge dates of the pull requests listed; numbers in brackets are PR numbers.
 
+## [0.1.0] — first release
+
+**2026-09-13 → 2026-09-14.** Documentation, CI, and the platform gap CI immediately found.
+
+### Added
+
+- Documentation for a project someone else could pick up: a README that orients rather than
+  argues, `docs/architecture.md` stating the one invariant each component holds, `docs/usage.md`,
+  `CONTRIBUTING.md`, this file, and a CI workflow running the gates on Linux and macOS.
+
+### Fixed
+
+- **The suite had never run on Linux.** Its first CI run reported 22 failures against a green
+  macOS baseline. The process-identity snapshot emitted PID 1 while the validator rejected it — two
+  halves of one contract disagreeing — and nobody had noticed because macOS has no `/proc`, so an
+  unobservable process table produced exactly what an observed-empty one would. An absent table is
+  now its own status, a kernel where it is structurally unavailable is distinguished from a reading
+  that failed, and the exposure reaches the validation summary.
+- GNU tar and BSD tar disagree about backslashes in paths; the implementation is detected rather
+  than assumed.
+- CI passed `-q` on top of the `-q` already in `pyproject.toml`, making it `-qq` and suppressing the
+  summary line — a log that cannot show a test count cannot distinguish a green suite from one that
+  collected nothing.
+
+### Corrected
+
+- `RESULTS.md` never named the agent that produced its numbers. All 287 archived job configs used
+  the Terminus-2 path, so the report is about the checkpoint, scoring, distillation and validation
+  machinery — not driftlock's own tool-calling agent, which has no published measurement.
+- The Terminus-2 adapter was documented as legacy awaiting deletion. It is the path the published
+  results came from.
+
+---
+
 ## [Unreleased] — the agent and its components
 
 **2026-09-05 → 2026-09-13.** driftlock stops being middleware around someone else's agent and

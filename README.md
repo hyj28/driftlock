@@ -6,7 +6,6 @@ what it learns into skills that must earn their place.**
 [![CI](https://github.com/hyj28/driftlock/actions/workflows/ci.yml/badge.svg)](https://github.com/hyj28/driftlock/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-1260%20passing-brightgreen)
 ![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-none-lightgrey)
 
 Agents fail differently on long tasks than on short ones. Frontier models solve near-100% of tasks a
@@ -149,7 +148,7 @@ one-command LHTB harness — is in **[docs/usage.md](docs/usage.md)**.
 
 ```
 src/driftlock/    # the library: runner, agent, checkpoints, judges, skills, components
-tests/            # 1260 tests: no network, real subprocesses, real loopback servers
+tests/            # no network: real subprocesses and real loopback servers
 docs/             # architecture, usage, design journal
 RESULTS.md        # the measured run
 ```
