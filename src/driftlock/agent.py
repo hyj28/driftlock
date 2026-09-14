@@ -2297,6 +2297,7 @@ class ToolCallingAgent:
                 raw_path,
             )
             detail = _format_exec_result(result)
+            cleanup_detail = None
             cleanup_command = " ".join(
                 (
                     "python3 -c",
@@ -2312,16 +2313,18 @@ class ToolCallingAgent:
                     user=self.user,
                 )
             except Exception as error:
-                detail = (
-                    f"{detail}\nstale edit-stage cleanup raised "
+                cleanup_detail = (
+                    "stale edit-stage cleanup raised "
                     f"{type(error).__name__}: {_safe_repr(error)}"
                 )
             else:
                 if cleanup.return_code != 0:
-                    detail = (
-                        f"{detail}\nstale edit-stage cleanup failed: "
+                    cleanup_detail = (
+                        "stale edit-stage cleanup failed: "
                         f"{_format_exec_result(cleanup)}"
                     )
+            if cleanup_detail is not None:
+                detail = f"{cleanup_detail}\n{detail}"
             return _file_edit_observation(
                 call,
                 edit_result,
@@ -3401,6 +3404,20 @@ def copy_metadata(source, destination, source_stat):
     os.chmod(destination, stat.S_IMODE(source_stat.st_mode))
 
 
+def preserve_recovery(temporary, target):
+    recovery = target.parent / (
+        f".driftlock-edit-recovery-{os.getpid()}-"
+        f"{temporary.name.rsplit('-', 1)[-1]}"
+    )
+    try:
+        temporary.rename(recovery)
+    except OSError:
+        # A stage basename is owned by the stale-file sweep. Preserve its inode
+        # for this attempt, but never advertise that ephemeral name as recovery.
+        return temporary, None
+    return recovery, recovery.name
+
+
 def atomic_exchange(left, right):
     libc = ctypes.CDLL(None, use_errno=True)
     left_bytes = os.fsencode(left)
@@ -3540,15 +3557,7 @@ try:
             try:
                 os.replace(temporary, target)
             except OSError as restore_error:
-                recovery = target.parent / (
-                    f".driftlock-edit-recovery-{os.getpid()}-"
-                    f"{temporary.name.rsplit('-', 1)[-1]}"
-                )
-                try:
-                    temporary.rename(recovery)
-                    temporary = recovery
-                except OSError:
-                    recovery = temporary
+                temporary, recovery = preserve_recovery(temporary, target)
                 try:
                     installed_after_failure = bounded_read(target, limit)
                 except OSError:
@@ -3561,7 +3570,7 @@ try:
                     ),
                     before=before,
                     after=installed_after_failure,
-                    recovery=temporary.name,
+                    recovery=recovery,
                 )
                 temporary = None
             else:
@@ -3612,22 +3621,14 @@ try:
     installed = bounded_read(target, limit)
     installed_stat = target.lstat()
     if not stat.S_ISREG(installed_stat.st_mode) or installed != edited:
-        recovery = target.parent / (
-            f".driftlock-edit-recovery-{os.getpid()}-"
-            f"{temporary.name.rsplit('-', 1)[-1]}"
-        )
-        try:
-            temporary.rename(recovery)
-            temporary = recovery
-        except OSError:
-            recovery = temporary
+        temporary, recovery = preserve_recovery(temporary, target)
         emit(
             "could_not_determine",
             "file_changed_after_atomic_replace",
             count=1,
             before=before,
             after=installed,
-            recovery=temporary.name,
+            recovery=recovery,
         )
         temporary = None
         raise SystemExit
@@ -3653,20 +3654,11 @@ except (OSError, ValueError, UnicodeError) as error:
     recovery = None
     after = None
     if exchange_holds_displaced_file and temporary is not None:
-        recovery = target.parent / (
-            f".driftlock-edit-recovery-{os.getpid()}-"
-            f"{temporary.name.rsplit('-', 1)[-1]}"
-        )
-        try:
-            temporary.rename(recovery)
-            temporary = recovery
-        except OSError:
-            recovery = temporary
+        temporary, recovery = preserve_recovery(temporary, target)
         try:
             after = bounded_read(target, limit)
         except OSError:
             pass
-        recovery = temporary.name
         temporary = None
     if isinstance(error, FileNotFoundError):
         prefix = "target_not_found"

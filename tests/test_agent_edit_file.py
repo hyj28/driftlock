@@ -25,7 +25,11 @@ from driftlock.agent import (
 )
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
-from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
+from driftlock.local import (
+    LocalEnvironment,
+    LocalExecResult,
+    LocalWorkspaceDeltaObserver,
+)
 from driftlock.models import DriftContext, JudgeVerdict, RunStatus, StepContext, Verdict
 from driftlock.runner import DriftlockRunner, RunnerConfig
 
@@ -92,10 +96,12 @@ class _ScriptTransformEnvironment:
         transform: Callable[[str], str],
         *,
         decorate_stdout: bool = False,
+        fail_cleanup: bool = False,
     ) -> None:
         self.environment = LocalEnvironment(workspace)
         self.transform = transform
         self.decorate_stdout = decorate_stdout
+        self.fail_cleanup = fail_cleanup
 
     async def exec(
         self,
@@ -104,6 +110,12 @@ class _ScriptTransformEnvironment:
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ):
+        if (
+            self.fail_cleanup
+            and "DRIFTLOCK_EDIT_RESULT=" not in command
+            and ".driftlock-edit-stage-" in command
+        ):
+            return LocalExecResult(7, "", "forced cleanup failure")
         if "DRIFTLOCK_EDIT_RESULT=" in command:
             arguments = shlex.split(command)
             arguments[2] = self.transform(arguments[2])
@@ -280,6 +292,79 @@ def _kill_after_staging(script: str) -> str:
     return script.replace(needle, replacement)
 
 
+def _fail_after_exchange(script: str) -> str:
+    needle = "    exchange_holds_displaced_file = True\n"
+    replacement = needle + '    raise OSError(errno.EIO, "forced after exchange")\n'
+    assert script.count(needle) == 1
+    return script.replace(needle, replacement)
+
+
+def _fail_recovery_rename(script: str) -> str:
+    transformed = _fail_after_exchange(script)
+    needle = "        temporary.rename(recovery)\n"
+    replacement = '        raise OSError(errno.ENOSPC, "forced recovery rename")\n'
+    assert transformed.count(needle) == 1
+    return transformed.replace(needle, replacement)
+
+
+def _change_restored_file(script: str) -> str:
+    transformed = _write_displaced_inode(script)
+    needle = (
+        "            raise SystemExit\n        restored = bounded_read(target, limit)\n"
+    )
+    replacement = (
+        "            raise SystemExit\n"
+        '        target.write_bytes(b"LATER")\n'
+        "        restored = bounded_read(target, limit)\n"
+    )
+    assert transformed.count(needle) == 1
+    return transformed.replace(needle, replacement)
+
+
+def _make_fallback_restore_unreadable(script: str) -> str:
+    transformed = _fail_second_exchange(script)
+    needle = (
+        "                try:\n"
+        "                    restored = bounded_read(target, limit)\n"
+    )
+    replacement = (
+        "                try:\n"
+        '                    raise OSError(errno.EIO, "forced unreadable restore")\n'
+        "                    restored = bounded_read(target, limit)\n"
+    )
+    assert transformed.count(needle) == 1
+    return transformed.replace(needle, replacement)
+
+
+def _install_symlink_with_edited_bytes(script: str) -> str:
+    needle = "    installed = bounded_read(target, limit)\n"
+    replacement = (
+        '    link_target = target.parent / ".driftlock-installed-target"\n'
+        "    link_target.write_bytes(edited)\n"
+        "    target.unlink()\n"
+        "    target.symlink_to(link_target.name)\n" + needle
+    )
+    assert script.count(needle) == 1
+    return script.replace(needle, replacement)
+
+
+def _kill_after_staging_with_verbose_stderr(script: str) -> str:
+    needle = "    copy_metadata(target, temporary, first_stat)\n"
+    replacement = needle + '    os.write(2, b"x" * 4096)\n' + "    os._exit(9)\n"
+    assert script.count(needle) == 1
+    return script.replace(needle, replacement)
+
+
+def _suppress_remote_result(script: str) -> str:
+    needle = (
+        "def emit(status, reason, *, count=None, before=None, after=None, "
+        "recovery=None):\n"
+    )
+    replacement = needle + "    return\n"
+    assert script.count(needle) == 1
+    return script.replace(needle, replacement)
+
+
 def test_file_edit_status_values_are_complete_and_distinct() -> None:
     assert [(item.name, item.value) for item in FileEditStatus] == [
         ("APPLIED", "applied"),
@@ -389,6 +474,28 @@ def test_applied_result_requires_complete_evidence() -> None:
             "unique_match_replaced",
             "target.txt",
             match_count=1,
+        )
+
+
+def test_applied_result_rejects_a_recovery_path() -> None:
+    with pytest.raises(
+        ValueError,
+        match="an applied edit requires complete before/after evidence",
+    ):
+        FileEditResult(
+            FileEditStatus.APPLIED,
+            "unique_match_replaced",
+            "target.txt",
+            match_count=1,
+            file_bytes_before=3,
+            file_bytes_after=3,
+            before_sha256=(
+                "099d90cbee62f89e6478e153eb3240efcbe4ac2231bedc3e84549bbeaaba87e8"
+            ),
+            after_sha256=(
+                "a253ff09c5a8678e1fd1962b2c329245e139e45f9cc6ced4e5d7ad42c4108fc0"
+            ),
+            recovery_path=".driftlock-edit-recovery-1-literal",
         )
 
 
@@ -526,6 +633,36 @@ async def test_post_exchange_guard_alone_detects_installed_file_change(
     )
     recovery = result["recovery_path"]
     assert isinstance(recovery, str)
+    assert recovery.startswith(".driftlock-edit-recovery-")
+    assert (workspace / recovery).read_bytes() == b"OLD"
+
+
+async def test_non_regular_installed_target_is_detected_independently(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(
+        workspace,
+        _install_symlink_with_edited_bytes,
+    )
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    assert target.is_symlink()
+    assert target.read_bytes() == b"NEW"
+    assert result["status"] == "could_not_determine"
+    assert result["reason"] == "file_changed_after_atomic_replace"
+    recovery = result["recovery_path"]
+    assert isinstance(recovery, str)
+    assert recovery.startswith(".driftlock-edit-recovery-")
     assert (workspace / recovery).read_bytes() == b"OLD"
 
 
@@ -587,6 +724,122 @@ async def test_failed_swap_back_and_fallback_preserve_displaced_recovery(
     recovery = result["recovery_path"]
     assert isinstance(recovery, str)
     assert (workspace / recovery).read_bytes() == b"WRITER"
+
+
+async def test_post_exchange_oserror_preserves_named_recovery_across_later_edits(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(workspace, _fail_after_exchange)
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    assert target.read_bytes() == b"NEW"
+    assert result["reason"] == "remote_file_operation_failed_errno_5"
+    assert result["before_sha256"] == (
+        "099d90cbee62f89e6478e153eb3240efcbe4ac2231bedc3e84549bbeaaba87e8"
+    )
+    assert result["after_sha256"] == (
+        "a253ff09c5a8678e1fd1962b2c329245e139e45f9cc6ced4e5d7ad42c4108fc0"
+    )
+    recovery = result["recovery_path"]
+    assert isinstance(recovery, str)
+    assert recovery.startswith(".driftlock-edit-recovery-")
+    recovery_file = workspace / recovery
+    assert recovery_file.read_bytes() == b"OLD"
+
+    later = await _run_edit(workspace, _edit_call("NEW", "NEXT"))
+
+    assert _result(later)["status"] == "applied"
+    assert target.read_bytes() == b"NEXT"
+    assert recovery_file.read_bytes() == b"OLD"
+
+
+async def test_failed_recovery_rename_never_advertises_a_sweep_owned_name(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(workspace, _fail_recovery_rename)
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    stages = tuple(workspace.glob(".driftlock-edit-stage-*"))
+    assert target.read_bytes() == b"NEW"
+    assert result["reason"] == "remote_file_operation_failed_errno_5"
+    assert result["recovery_path"] is None
+    assert len(stages) == 1
+    assert stages[0].read_bytes() == b"OLD"
+
+    later = await _run_edit(workspace, _edit_call("NEW", "NEXT"))
+
+    assert _result(later)["status"] == "applied"
+    assert stages[0].exists() is False
+
+
+async def test_concurrent_write_during_swap_back_has_its_own_reason(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(workspace, _change_restored_file)
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    assert target.read_bytes() == b"LATER"
+    assert result["reason"] == "file_changed_while_restoring_concurrent_write"
+    assert result["after_sha256"] == (
+        "8a3e05d0736c69c89307714151e94b211f071b402c3ae5f4ef6dab9267930ae0"
+    )
+
+
+async def test_swap_back_fallback_unreadable_restore_has_its_own_reason(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(
+        workspace,
+        _make_fallback_restore_unreadable,
+    )
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    assert target.read_bytes() == b"WRITER"
+    assert result["reason"] == "atomic_swap_back_failed_restore_unreadable_errno_5"
+    assert result["before_sha256"] == (
+        "099d90cbee62f89e6478e153eb3240efcbe4ac2231bedc3e84549bbeaaba87e8"
+    )
+    assert result["after_sha256"] is None
 
 
 async def test_file_beyond_read_limit_is_not_edited(tmp_path: Path) -> None:
@@ -757,6 +1010,57 @@ async def test_failed_remote_process_sweeps_its_killed_stage(tmp_path: Path) -> 
     assert target.read_bytes() == b"OLD"
     assert _result(outcome)["reason"] == "remote_edit_process_failed"
     assert not tuple(workspace.glob(".driftlock-edit-stage-*"))
+
+
+async def test_cleanup_failure_precedes_verbose_remote_diagnostic(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(
+        workspace,
+        _kill_after_staging_with_verbose_stderr,
+        fail_cleanup=True,
+    )
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    assert result["reason"] == "remote_edit_process_failed"
+    assert str(result["detail"]).startswith("stale edit-stage cleanup failed:")
+    assert "forced cleanup failure" in str(result["detail"])
+    assert len(str(result["detail"])) == 1_000
+    assert len(tuple(workspace.glob(".driftlock-edit-stage-*"))) == 1
+
+
+async def test_empty_success_output_is_a_recorded_malformed_result(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target.txt"
+    target.write_bytes(b"OLD")
+    environment = _ScriptTransformEnvironment(workspace, _suppress_remote_result)
+
+    outcome = await _run_edit(
+        workspace,
+        _edit_call(),
+        environment=environment,
+    )
+
+    result = _result(outcome)
+    assert target.read_bytes() == b"NEW"
+    assert result["status"] == "could_not_determine"
+    assert result["reason"] == "malformed_remote_edit_result"
+    assert result["detail"] == (
+        "ValueError: remote edit output must contain exactly one result record"
+    )
 
 
 async def test_stale_stage_scan_cap_is_recorded(tmp_path: Path) -> None:
