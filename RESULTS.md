@@ -28,6 +28,13 @@ skill available and without it, differenced per replicate.
 | Cost | **$15.06** against a $25.67 plan |
 | Model | `deepseek-v4-flash-0731` via OpenRouter, `deepinfra/fp8` |
 | Judge | `deepseek-v4-pro-0813` via `alibaba` |
+| Agent under test | `driftlock.harbor_agent:LHTBDriftlockAgent` — pinned Terminus-2 inside driftlock's checkpoint and rollback loop, in all 287 job configs |
+
+**The agent measured here is Terminus-2, not driftlock's own tool-calling agent.** Everything this
+report establishes is about the checkpoint, scoring, localization, distillation, retrieval,
+injection and paired-validation machinery wrapped around it. driftlock's native agent loop and the
+components built on it shipped later and have no published measurement; see the roadmap in
+[README](README.md).
 
 Validating each candidate on its own source task is a deliberate weakening. An earlier design
 validated across tasks and was abandoned after measurement showed it would produce 140 zero

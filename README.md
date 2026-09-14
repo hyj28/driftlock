@@ -1,610 +1,171 @@
 # driftlock
 
-**A self-evolving long-horizon coding agent that learns from its own scored checkpoints.**
+**A long-horizon coding agent that checkpoints its own work, rolls back when it drifts, and distils
+what it learns into skills that must earn their place.**
 
-> **Status: the agent is complete, and its self-evolution loop is closed.**
->
-> Every component in the roadmap below is implemented and unit-tested (1260 tests). A 170-trial
-> validation run exercised the self-evolution loop end to end for $15.06 — see
-> **[RESULTS.md](RESULTS.md)**.
->
-> Self-evolution works: an agent's failed runs become candidate skills, candidates are validated
-> against a paired control before entering the library, and a free noise floor tells you when an
-> apparent gain is run-to-run variance. What that run also showed is that **one-shot similarity
-> retrieval is too weak to serve a skill library** — six of fourteen candidates never reached an
-> agent at all. Agentic RAG was built to answer that, and the components after it fill out the
-> rest of what a capable terminal agent needs.
->
-> Each component states what it does not guarantee as plainly as what it does; the limits are in
-> the code, not only in the docs.
+[![CI](https://github.com/hyj28/driftlock/actions/workflows/ci.yml/badge.svg)](https://github.com/hyj28/driftlock/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.13-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Tests](https://img.shields.io/badge/tests-1260%20passing-brightgreen)
+![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-none-lightgrey)
+
+Agents fail differently on long tasks than on short ones. Frontier models solve near-100% of tasks a
+human expert finishes in under four minutes and **under 10%** of tasks that take a human more than
+four hours; a recurring rule of thumb is that doubling a task's length roughly quadruples its
+failure rate.
+
+Two failure modes dominate that regime. **Context rot** — relevant information gets harder to
+retrieve as history grows. **Compounding error and goal drift** — small early mistakes snowball
+until the agent is working on the wrong thing. driftlock attacks the second, and turns what it
+learns there into skills it carries into the next task.
 
 ---
 
-## Component roadmap
+## Undo is the missing lever
 
-driftlock is a terminal coding agent. The self-evolution loop is what makes it improve from its
-own runs; the rest is what any capable agent needs.
+The standard vocabulary for context engineering has four levers, and every one of them assumes the
+agent keeps moving forward:
 
-| component | status |
+| Lever | Mechanism in driftlock |
 |---|---|
-| Tool-calling loop (`run_shell`, `read_file`, `write_file`, `search_files`, `complete`) | done |
-| Checkpointing + progress-aware rollback | done |
+| write | Rollback-grounded skill distillation into a persistent library |
+| select | Agent-initiated retrieval over skills, workspace and memory in one corpus |
+| compress | Context compaction at checkpoint boundaries |
+| isolate | Fresh bounded sub-agents with their own conversation and no recursion |
+| **undo** | **Checkpoint + progress-aware rollback** |
+
+Snapshot the filesystem and agent state together, then let a two-tier judge periodically ask whether
+the current state is still a sound basis for continuing. The coarse tier is zero-token heuristics —
+no file changes for N steps, action loops, error spikes, reward stalls. The fine tier is a cheap
+model reading goal, plan, recent trajectory and diff. If the answer is no, roll back to the last
+healthy checkpoint and retry from there.
+
+## Skills have to earn their place
+
+Recent work found that self-evolving agents improve through *validation-filtered search*, not
+accumulation: only **55 of 388** candidate skills produced a real gain, and **every** selected
+improvement was grounded in a *failed* trajectory.
+
+driftlock narrows the grounding further. Because every checkpoint can be scored by the task's own
+verifier for free, a trajectory becomes a timeline, and a flat segment is a stretch of steps that
+provably bought nothing. That localized evidence — a bounded region with a diff attached — becomes
+the supervision signal for distillation, in place of a whole failed trajectory.
+
+A candidate enters the library only after a **paired validation run**: ten replicates of its own
+source task, with and without the skill, differenced per replicate, against a control shared by
+every candidate from that task. When retrieval selects nothing, the treatment prompt is
+byte-identical to its control — which yields a **measured noise floor at no extra cost**.
+
+## What was measured, and what was not
+
+A 170-trial validation run cost **$15.06** and is reported in full, including the parts that did not
+work, in **[RESULTS.md](RESULTS.md)**. One candidate of fourteen was admitted against a chance
+expectation of 0.150; the two distillation arms were indistinguishable at this sample size; and six
+candidates were never retrieved at all, which is the finding that drove the agentic-RAG work.
+
+**That run measured Terminus-2 wrapped in driftlock's checkpoint, rollback, distillation and
+validation machinery.** All 287 archived job configs used
+`driftlock.harbor_agent:LHTBDriftlockAgent`. driftlock's own tool-calling agent, and the components
+built on it, have no published measurement yet. Both paths ship, and which one a run used is
+recoverable from its record.
+
+---
+
+## What is built
+
+| Component | Status |
+|---|---|
+| Checkpointing, progress-aware rollback, two-tier judge | done |
 | Free checkpoint scoring via the task's own verifier | done |
 | Failure localization to a checkpoint segment | done |
-| Skill distillation, retrieval, injection | done |
-| Paired validation + admission with a measured noise floor | done |
+| Skill distillation, retrieval, once-per-task injection | done |
+| Paired validation and admission with a measured noise floor | done |
 | Resumable runs, bounded retries, degraded-observation reporting | done |
-| **Agentic RAG** — retrieval as a tool the agent invokes from live context, over code *and* skills | done |
+| Tool-calling agent (`run_shell`, `read_file`, `write_file`, `search_files`, `complete`) | done |
+| Agentic RAG — retrieval as a tool, over code *and* skills | done |
 | Context compaction | done |
 | Planning / task decomposition | done |
 | Persistent memory across tasks | done |
-| Subagents and bounded sequential delegation | done |
-| MCP client support — stdio tool discovery and invocation | done |
+| Bounded sequential sub-agent delegation | done |
+| MCP client — stdio and Streamable HTTP, host-supplied authorization | done |
 | Bounded opt-in parallel workspace reads | done |
-| MCP Streamable HTTP and host-supplied authorization | done |
 | Prompt-cache management | done |
 | Output self-verification | done |
 | Bounded exact-string file edit | done |
 
-The optional `driftlock.st_embedder` module pins the real MiniLM model; installing `sentence-transformers` project-locally enables its integration test without changing retrieval's injected interface.
-
-## The problem
-
-Agents fail differently on long tasks than on short ones. Frontier models solve
-near-100% of tasks a human expert finishes in under four minutes, and **under 10%**
-of tasks that take a human more than four hours. A recurring rule of thumb across
-recent work: **double a task's length and its failure rate roughly quadruples.**
-
-Two failure modes dominate the long-horizon regime:
-
-1. **Context rot** — as history grows, relevant information gets harder to retrieve,
-   and performance falls off a cliff past a critical context-utilization threshold.
-   This affects frontier and small models alike.
-2. **Compounding error and goal drift** — small early mistakes snowball along the
-   trajectory, gradually steering the agent away from what it was asked to do.
-
-`driftlock` attacks **the second one** — and then turns what it learns there into
-skills the agent carries into the next task.
-
-## Rollback is the missing lever
-
-The standard vocabulary for context engineering has four levers: **write, select,
-compress, isolate**. Every one of them assumes the agent keeps moving forward. None of
-them is *undo*.
-
-| Lever | Mechanism in driftlock |
-| --- | --- |
-| write | Rollback-grounded skill distillation into a persistent library |
-| select | Embedding retrieval over skill activation conditions, plus a router |
-| compress | Context editing at checkpoint boundaries |
-| isolate | Fresh bounded subagents with their own conversation, shared workspace tools, and no recursive delegation |
-| **undo** | **Checkpoint + progress-aware rollback** |
-
-Delegation runs sequentially, so child filesystem changes are observed as part of the
-parent step. Rollback restores those changes together with the checkpointed delegation
-quota; already billed child tokens remain counted.
-
-Checkpoint and restore calls require an idle delegation tool; wait for completion
-or cancellation first. Interrupted calls retain provider-reported tokens as a
-known minimum (`accounting_known=false` means the total may be higher). Further
-delegation is paused on that ledger because the remaining budget is uncertain.
-Custom executors must cooperate with cancellation; a deadline bounds the parent's
-wait, and cannot force arbitrary executor code to stop.
-
-`LocalEnvironment` runs trusted local commands and provides best-effort process
-cleanup, not a security sandbox. A detached program that replaces its inherited
-environment can outlive a command or delegation deadline. For strict process
-lifetime and filesystem isolation, supply a host-managed isolated environment;
-do not rely on local timeout cleanup to contain untrusted shell programs.
-
-## The approach
-
-Snapshot the filesystem and agent state together, then let an independent judge
-periodically ask: *is the current state still a sound basis for continuing?*
-If not, roll back to the last healthy checkpoint and retry from there.
-
-The judge is two-tier by design:
-
-| Tier | Mechanism | Cost |
-| --- | --- | --- |
-| **Coarse** | Heuristics — no file changes for N steps, action loops, error-rate spikes, reward stalls | Zero tokens |
-| **Fine** | An LLM reads (original goal + current plan + recent trajectory + file diff) and judges semantic drift | Cheap model, negligible |
-
-The coarse tier keeps the cost near zero; the fine tier catches what rules can't
-express — *"the agent is now working on the wrong thing."*
-
-## Learning from scored checkpoints
-
-Recent work found that self-evolving agents improve through *validation-filtered
-search*, not accumulation: only **55 of 388** candidate skills produced a real
-validation gain, and **every** selected improvement was grounded in a failed
-trajectory — success-only feedback never produced one. Separately, automatic evolution
-methods measurably trail human curation (+0.4 to +5.7 versus +7.5 to +10.5).
-
-The field feeds the model a *whole* failed trajectory and asks it to work out what
-went wrong. driftlock narrows it: because every checkpoint can be scored by the task's
-own verifier for free, a trajectory becomes a timeline, and a flat segment is a stretch
-of steps that provably bought nothing. The checkpoint delta bounds the failure to that
-region, with a diff attached, and that localized evidence is the supervision signal for
-skill distillation.
-
-The original design keyed this on rollback events and the judge's verdict. Measurement
-retired that version — the judged arm rolled back zero times in eight trials — so the
-localizer is now the score curve, which exists at every checkpoint and depends on the
-benchmark's scoring rather than on a judge being right.
-
-Skills use the ProcMEM `activation` / `execution` / `termination` schema and carry
-preventative content ("when X appears, do not do Y; do Z instead"). A candidate only
-enters the library after a **measured** improvement. For the heterogeneous LHTB pool,
-the current gate validates every candidate on the task it was distilled from over ten
-fresh replicates. One no-skill control is shared by every candidate from the same
-source task inside each `(task, replicate)` pair. That measures repeated same-task
-runs, not ten different tasks; an unfiltered library demonstrably makes agents worse.
-
-## The question this has to answer
-
-> *"How is checkpoint-and-rollback different from just retrying on failure?
-> Aren't you buying success rate with extra compute?"*
-
-The claim only holds if the judge detects a broken trajectory **before** the task
-fails — early stop plus precise rollback, not blind restart. So the experiment
-includes a **compute-matched retry** arm that gets the same token budget to retry
-blindly. If `driftlock` can't beat that, the idea doesn't work, and the writeup
-will say so.
-
-## Experiment design
-
-Two benchmarks, because they answer different questions and neither can answer both.
-
-**Drift — [LHTB (Long-Horizon Terminal-Bench)](https://github.com/zli12321/LHTB)**,
-8 screened tasks, 4 arms:
-
-| Arm | Purpose |
-| --- | --- |
-| No intervention | Baseline |
-| **Compute-matched retry** | Rules out "you just spent more compute" |
-| **driftlock** | The claim |
-| **Oracle upper bound** | A hindsight-perfect judge — shows how much headroom the real judge leaves |
-
-**Transfer — SWE-bench Verified**, 50 tasks split 20 train / 10 validation /
-20 held-out test, 4 arms:
-
-| Arm | Purpose |
-| --- | --- |
-| No skills | Baseline |
-| **Whole-trajectory distillation** | The field's standard grounding — the arm that decides whether localization matters |
-| **Rollback-grounded distillation** | The claim |
-| **Human-curated skills** | Upper bound, mirroring the curated reference other work reports at +7.5 to +10.5 |
-
-Both distillation arms use an identical skill schema. The only difference between them
-is the evidence handed to the distiller; anything else would confound the comparison.
-
-**Metrics**
-
-- Success rate (LHTB continuous reward with partial credit; SWE-bench resolve rate)
-- **Candidate skill pass rate**, against the 14.2% published reference
-- `GD_actions` / `GD_inaction` — the commission and omission definitions from
-  [Arike et al. (2025)](https://arxiv.org/abs/2505.02709), when a task provides
-  aligned-action budget and residual-state annotations. Generic LHTB results do
-  not contain those labels, so the analyzer reports them as unavailable instead
-  of substituting an unvalidated proxy.
-- Token cost per task
-- **Slope of the task-length vs. failure-rate curve** — flattening this is the
-  strongest result available
-
-## Why LHTB is hard (and why a subset)
-
-Of 46 tasks, **29 remain unsolved by every model evaluated**, and only 7% of 782
-recorded runs reached the solve threshold. The best score to date is a mean reward
-of 0.505. Tasks average 69–93 minutes and roughly 231 agent steps.
-
-Running the full suite costs 53–71 hours of wall-clock per model, so this project
-uses a **screened 8-task subset**, chosen by *measured* partial credit — tasks nobody
-can solve provide no headroom to measure against.
-
-This is also why the transfer experiment lives on a different benchmark. Excluding the
-29 unsolved tasks leaves 17 across 9 categories — fewer than 2 per category. A
-train/test split would give roughly 9/8, which has no power to detect an effect the
-field measures at a 14.2% candidate pass rate.
-
-## Planned deliverables
-
-1. This project — a terminal coding agent with checkpointing, free checkpoint scoring,
-   progress-aware rollback, and checkpoint-localized skill distillation. The rollback and
-   scoring layers stay usable standalone around someone else's agent loop.
-2. **[RESULTS.md](RESULTS.md)** — what the self-evolution loop does, the engineering
-   decisions behind it, and the 170-trial validation that exercised it end to end: admission
-   outcomes, the per-task noise floor every effect is read against, and the retrieval
-   requirements driving the agentic RAG component
-
-## Core library quick start
-
-The runner wraps an async function that performs one agent step. Each result carries
-JSON-serializable agent state plus the observations used by the zero-token heuristics.
-The filesystem checkpoint store is deliberately separate from the agent so other
-backends (Docker, Harbor, cloud sandboxes) can implement the same interface.
-Local snapshots include Git metadata, tracked files, and untracked files so a restore
-returns both the worktree and repository state to the same point. Linked Git
-worktrees and submodules are rejected because their mutable Git state lives outside
-the workspace; use a self-contained clone for now. Snapshots are exact by default.
-
-```python
-from pathlib import Path
-
-from driftlock import (
-    DirectoryCheckpointStore,
-    DriftlockRunner,
-    HeuristicJudge,
-    StepOutcome,
-)
-
-workspace = Path("/path/to/agent/workspace")
-snapshots = Path("/path/to/snapshots")  # must be outside workspace
-
-
-async def next_step(context):
-    # Ask your agent for one action, execute it, and return its new state.
-    # Reserve request prefill, then cap output by the remaining token allowance.
-    return StepOutcome(
-        action="pytest -q",
-        state={"messages": []},
-        changed_paths=("src/parser.py",),
-        diff="...",
-        tokens=1200,
-        completed=False,
-    )
-
-
-runner = DriftlockRunner(
-    DirectoryCheckpointStore(workspace, snapshots),
-    HeuristicJudge(),
-)
-result = await runner.run(
-    goal="Fix the parser without changing its public API",
-    plan="Reproduce, patch, test",
-    step=next_step,
-    initial_state={"messages": []},
-)
-```
-
-With no fine judge, coarse signals trigger rollback directly (the heuristics-only
-ablation). Pass `CallableLLMJudge(async_completion_function)` to enable the two-tier
-mode. The callable owns its provider SDK and credentials; driftlock sends it the
-original goal, plan, recent trajectory, heuristic signals, and latest diff, and
-expects a structured JSON verdict.
-
-Periodic snapshots are retained across detector windows. When drift is confirmed,
-the runner selects the newest checkpoint from before the earliest triggered signal
-window, avoiding a superficially recent snapshot that already contains the loop,
-stall, or error spike.
-
-### Parallel workspace reads
-
-Set `parallel_tool_calls=True` on `ToolCallingAgent` to overlap contiguous
-`read_file` and `search_files` calls in one provider response:
-
-```python
-agent = ToolCallingAgent(
-    environment,
-    observer,
-    async_completion_function,
-    parallel_tool_calls=True,
-)
-```
-
-All other tools are serial barriers, including shell commands, writes, completion,
-planning, memory, retrieval, delegation, and MCP. Results, errors, history, and
-audits retain the provider's call order. The existing `max_tool_calls_per_step`
-limits both total calls and concurrency; the defaults remain 4 calls and 96,000
-history characters. Truncated responses and responses above the call limit execute
-no tools. Enabled read failure details are truncated to `max_tool_output_chars`.
-Cancellation cancels and joins launched reads before propagating, without starting
-later barriers.
-
-The default is `False`, preserving serial execution and existing provider requests.
-Opted-in environments must tolerate concurrent read `exec` requests;
-`LocalEnvironment` supports this. Delegated children do not inherit this option.
-
-### MCP tools over stdio
-
-The optional MCP client connects to explicitly configured local servers. It supports
-the [MCP stdio lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
-and [tool discovery/calls](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
-for protocol versions `2025-11-25` and `2025-06-18`. No additional dependencies are
-required. HTTP, resources, prompts, sampling, and authorization flows are not
-implemented in this version.
-
-```python
-import sys
-from driftlock import MCPClient, MCPServerConfig, ToolCallingAgent
-
-config = MCPServerConfig(
-    name="project",
-    command=(sys.executable, "/path/to/mcp_server.py"),
-    allowed_tools=frozenset({"lookup"}),
-)
-async with MCPClient(config) as client:
-    agent = ToolCallingAgent(
-        environment,
-        observer,
-        async_completion_function,
-        mcp_clients=(client,),
-    )
-    result = await runner.run(
-        goal="Look up the project settings",
-        step=agent,
-        initial_state=agent.initial_state(),
-    )
-```
-
-The host owns server lifecycle and authorizes native tool names through the required
-allowlist; an empty allowlist exposes no tools. Names advertised to the model are
-namespaced per server. Tools and schemas are snapshotted at connection time; create
-a new client/agent to adopt a changed catalog. Up to 8 servers and 64 total external
-tools can be attached to one agent. `MCPLimits` bounds requests, responses, discovery,
-results and shutdown. MCP results use the existing per-step call and conversation
-limits. Oversized results become explicit tool errors, not truncated successes.
-
-Client failures and server `isError` results are auditable tool errors. Failed or
-timed-out transport sessions are closed; potentially mutating calls are never retried
-automatically. The parent model's token usage remains separate from server work.
-External tool effects and connections are not checkpoint resources: restoring a
-workspace or conversation does not undo an external action. Choose read-only tools
-or tools with suitable idempotency when using rollback. Server text is untrusted
-data, and configured server programs run with the host's local permissions. Explicit
-environment overrides belong in `MCPServerConfig.env`; the client does not copy the
-host's whole environment. With `mcp_clients=()` the legacy request and checkpoint
-schema are unchanged. Delegated children do not inherit MCP capabilities implicitly.
-
-### Remote and Harbor environments
-
-`RemoteArchiveCheckpointStore` implements the same interface over the three methods
-POSIX Harbor environments already expose: `exec`, `upload_file`, and
-`download_file`. It requires Linux-style `sh`, `tar`, `find`, `rm`, `cp -a`,
-`realpath`, `sha256sum`, `mkfifo`, and `tee`; Windows containers are not supported.
-Archives and agent state are persisted on the host. Remote cleanup failures emit a
-warning instead of being silently treated as success.
-
-```python
-from driftlock import RemoteArchiveCheckpointStore
-
-store = RemoteArchiveCheckpointStore(
-    harbor_environment,
-    remote_workspace="/app",
-    store_dir="./runs/checkpoints",  # keep outside agent-visible mounts
-    user="root",
-)
-```
-
-Restore validates canonical paths remotely, rejects staging directories that resolve
-or mount inside the workspace, and downloads a pre-restore recovery archive to the
-host—and verifies it against the remote SHA-256—before changing live files. It
-preserves the workspace-root inode, but child directories are recreated: a Harbor
-adapter must use `before_restore` to move tmux panes parked in a child directory back
-to the workspace root before applying the snapshot. On an ordinary copy failure, an
-exact pre-restore tree is rebuilt from the untouched remote backup (or a separately
-named, checksum-verified host fallback). Recovery hashes and extracts the same
-archive byte stream before mutating the live tree, so a changed archive is rejected.
-Recovery archives are retained on failure, timeout, or cancellation; other staging
-artifacts are cleaned after ordinary failures. The configured workspace cannot be
-`/`.
-
-### Terminus-2 checkpoint boundaries (being replaced)
-
-> This adapter drives Harbor's stock Terminus-2 agent. It is documented because the
-> code is still present, but the plan now has driftlock supply its own agent loop, at
-> which point this layer and its Harbor coupling are deleted. See `PLAN.md` §3.1.
-
-`TerminusStepAdapter` connects the runner to a small, dependency-free runtime
-protocol that yields after exactly one billed Terminus episode. Its versioned
-codec checkpoints the message history, the terminal observation waiting to become
-the next prompt, the two-step completion-confirmation flag, and the logical episode
-number.
-
-```python
-from driftlock import TerminusStepAdapter
-
-step = TerminusStepAdapter(checkpointable_terminus_runtime)
-result = await runner.run(
-    goal=instruction,
-    plan="inspect, implement, verify",
-    step=step,
-    initial_state=step.initial_state(),
-)
-```
-
-Harbor's stock `Terminus2.run()` owns the whole loop and resets per-run state, so it
-must not be called once per driftlock step. The fork implements a two-phase
-`prepare_start()` / `start()` plus `resume()`, and yields after every LLM response.
-`prepare_start()` performs no model call: it resets semantic state, reads the initial
-terminal screen, and returns the exact rendered Terminus user prompt. The adapter
-passes that string unchanged to `start()` and verifies it is the first chat message,
-so an unrelated or stale initial conversation cannot be checkpointed.
-For a normal response, the boundary is after commands execute and the next terminal
-observation is ready. A parser-error response is also a billed episode: it must yield
-before Harbor's early `continue`, with the parser correction as `next_prompt` and the
-parse failure in `TerminusBoundary.error`. The runtime can use
-`Terminus2StateBridge` to capture and restore the existing `Chat` object. Restoring
-clears the provider response-chain id so the next call sends the restored full
-history.
-
-The same rule applies below `Chat`: Harbor currently turns an output-length response
-into an exception and recursively retries without adding its usage to `Chat`. The
-fork must intercept that response, return it as an error boundary with its actual
-token usage and shorter-response correction prompt, and let driftlock decide whether
-to continue. Multiple provider responses may never be hidden inside one boundary.
-
-Terminus must be constructed with context summarization disabled, and the fork must
-disable `_query_llm`'s internal retry decorator. Summarization can make three
-subagent calls before the main call; it also derives copied audit steps from a
-trajectory prefix that no longer matches restored chat after rollback. The runtime
-therefore exposes `summarization_enabled`, `internal_retries_enabled`, and a monotonic
-`provider_call_count` incremented around the lowest-level provider request. The
-adapter refuses either hidden-call feature and verifies that the physical counter
-advances by exactly one on every driftlock step. It also verifies the captured chat
-is the restored history as an exact prefix followed by the submitted user prompt and
-one assistant response, preventing an early or wrong-branch capture from silently
-discarding context.
-
-The adapter also enforces Terminus's completion handshake: a boundary may report
-`completed=True` only when the restored previous boundary was already awaiting
-completion confirmation and the current boundary still carries that flag. A single
-premature completion claim cannot end the driftlock run.
-
-Only semantic state rewinds. Token/cost accumulators, rollout details, trajectory
-files, session ids, and Harbor's physical turn counter remain monotonic so rolled-back
-work is still billed and auditable. The adapter rejects runtimes that skip or combine
-episode boundaries. A rollback reason is appended to the restored pending observation
-without contaminating stored checkpoint state; when rollback reaches the initial
-checkpoint, the same reason is passed explicitly to `prepare_start()`.
-
-Filesystem rollback is not enough for Terminus's persistent tmux shell: rejected
-branches can leave a different cwd, exported variables, aliases, foreground jobs, or
-background servers behind. Pass the adapter hook to the remote store:
-
-```python
-store = RemoteArchiveCheckpointStore(
-    harbor_environment,
-    remote_workspace="/app",
-    store_dir="./runs/checkpoints",
-    before_restore=step.before_workspace_restore,
-)
-```
-
-The runtime implementation must quiesce every process from the rejected branch,
-replace the tmux shell, start the new shell at the canonical workspace root, and
-reset incremental terminal-output tracking. If cleanup fails, it must raise; the
-remote store then aborts before mutating the workspace.
-
-The concrete `LHTBTerminusRuntime` targets LHTB commit
-`0d9918f6b66eda0752f8c7d17c9a73a18ee32f98`. Its companion patch preserves the
-otherwise discarded LiteLLM usage on output truncation, counts the lowest-level
-provider attempt, disables both retry layers, and installs a revision marker that the
-runtime checks before making a provider call. The runtime also verifies Harbor's
-frozen LiteLLM version, reserves input tokens before capping output, and retains pane
-and cast audit history across shell replacement. The patch also makes terminal
-commands reach a shell completion marker before a workspace boundary is observed.
-Installation and construction
-instructions are in [`integrations/lhtb/README.md`](integrations/lhtb/README.md).
-`HarborWorkspaceDeltaObserver` hashes content and POSIX metadata for the full remote
-workspace around each episode and records a before/after Git view, so the heuristics
-receive metadata-only edits and changes made to files that were already dirty as well
-as newly changed paths.
-
-`RunnerConfig.max_tokens` is shared by agent and fine-judge calls. The step adapter
-receives the total remaining budget in `context.tokens_remaining`. Before issuing a
-provider call, it must reserve the request prefill plus a usable output allowance;
-when that cannot fit, it must raise `StepTokenBudgetExhausted`. Otherwise it caps output
-at the smaller of its configured maximum and the budget left after prefill, then reports
-actual billed tokens in `StepOutcome.tokens`, including failed model calls.
-Unexpected adapter exceptions propagate because treating them as zero-token agent
-steps would corrupt compute-matched experiments. For fine judges, return
-`JudgeCompletion(text=..., tokens=...)` from the completion callback to include judge
-usage; returning a bare string is supported when usage is genuinely unavailable.
-
-### One-command LHTB runs
-
-Install driftlock into the pinned Harbor virtual environment and apply the companion
-patch as described in
-[`integrations/lhtb/README.md`](integrations/lhtb/README.md). On a native amd64 host,
-the experiment CLI checks the exact LHTB revision, patch, LiteLLM version, Docker
-architecture, and credential presence before a paid request. It never accepts or
-writes a credential value.
+Everything past the tool-calling loop is **opt-in**. An agent built without them offers exactly the
+five historical tools and sends a byte-identical request, which is what keeps the archived
+experiment replayable. Each carries a `driftlock_*` flag into the experiment harness and appears in
+the run record's active-component set, so a trial can always be attributed to the configuration that
+produced it.
+
+## Install
 
 ```bash
-: "${OPENROUTER_API_KEY:?inject OPENROUTER_API_KEY with your secret manager}"
-driftlock-lhtb run \
-  --lhtb-dir /srv/LHTB \
-  --arm driftlock \
-  --job-name driftlock-smoke \
-  --tasks 2048 chess-mate \
-  --max-total-tokens 2000000
-```
-
-The `retry`, `driftlock-heuristic`, and `driftlock` arms share one total-token budget
-across all Harbor `continue_until_timeout` phases. `retry` discards verifier text and
-blindly restores the original workspace and fresh conversation after a binary
-rejection. `driftlock-heuristic` is the zero-judge-token ablation; `driftlock` adds a
-single-attempt DeepSeek V4-Flash fine judge and folds its input, cache, output, and
-dollar usage into Harbor's trial accounting. The harness pins controlled arms to
-Harbor's `same_conversation` mode and starts Harbor with the same Python environment
-that passed preflight. It also rejects task-tree changes and any Harbor bytes beyond
-the packaged patch. A stock Terminus run has no comparable total-token ceiling; the CLI
-therefore requires an explicit `--ack-unbounded-stock-tokens` after a provider-side
-spend cap is configured. After screening, `driftlock-lhtb select JOB_DIR` ranks tasks
-by measured mean partial credit and records the trial result files behind the choice.
-
-Completed arms can be aggregated into one strict, auditable report. By default the
-analyzer requires identical task/attempt matrices, task checksums, and model identity;
-it rejects missing rewards or usage instead of silently turning infrastructure errors
-into model failures. It also requires each Harbor job summary to be finished and
-error-free, and verifies each recorded task checksum against the selected LHTB
-checkout. Arm labels are checked against the pinned agent configuration, controlled
-arms must share one total-token budget, and every trial's job ID and name must match
-its job summary and directory. Canonical namespaced Harbor task names are resolved
-through each `task.toml`, while agent versions and all common non-treatment settings
-(model API, temperatures, request limits, timeouts, environment, and verifier) are
-validated and summarized by a configuration SHA-256. Harbor retries must be zero,
-and official job-level token/cache/cost totals must reconcile with the trial files.
-The canonical Harbor `lock.json` binds zero configured retries, concurrency, task
-matrix, pinned Harbor revision, and a build fingerprint over all installed driftlock
-Python sources plus the companion patch. Trial UUIDs must be globally unique. Every
-input `result.json` path and SHA-256 is retained.
-
-```bash
-driftlock-lhtb analyze --lhtb-dir /srv/LHTB \
-  --arm-dir stock=/srv/LHTB/jobs/stock \
-  --arm-dir retry=/srv/LHTB/jobs/retry \
-  --arm-dir driftlock-heuristic=/srv/LHTB/jobs/driftlock-heuristic \
-  --arm-dir driftlock=/srv/LHTB/jobs/driftlock \
-  --arm-dir oracle=/srv/LHTB/jobs/oracle \
-  --output analysis.json
-```
-
-The report includes reward and solved-rate summaries, token/cache/cost accounting,
-paired task deltas versus stock, and an ordinary least-squares failure-rate slope
-against `log2(expert_time_estimate_min)`. Missing planned arms are explicit.
-
-The planned hindsight oracle is not exposed as an online agent arm. A valid oracle
-must replay retained candidate checkpoints in isolated copies against the hidden
-verifier, then choose with hindsight; the CLI rejects attempts to label an ordinary
-agent config as that upper bound.
-
-Retained checkpoints can also be measured as a scored timeline without creating an
-oracle analysis arm or calling a model:
-
-```bash
-driftlock-lhtb score-checkpoints \
-  --lhtb-dir /srv/LHTB \
-  --source-job-dir /srv/LHTB/jobs/round-five-driftlock \
-  --output-dir /srv/LHTB/jobs/round-five-checkpoint-scores
-```
-
-Each checkpoint is restored into a fresh task environment and graded by the task's
-ordinary hidden verifier. The resulting `checkpoint-scores.json` records phase,
-step, checkpoint reward, the source trial's job-level final reward, and computable
-best-versus-final headroom. It is written after every score; reruns reuse completed
-entries. The replay agent reports zero provider tokens and needs no provider
-credential. Use `--dry-run` to enumerate retained and missing checkpoint timelines
-without Docker.
-
-Development uses Python 3.11+ and `uv`:
-
-```bash
-uv sync --extra dev
+git clone https://github.com/hyj28/driftlock
+cd driftlock
+uv venv && uv pip install -e ".[dev]"
 uv run pytest
-uv run ruff check .
 ```
+
+Python 3.13. **No runtime dependencies** — the library is stdlib-only. `pytest` and `ruff` are dev
+extras; `sentence-transformers` is optional and needed only for the pinned-embedder integration
+test.
+
+## Quick start
+
+```python
+from driftlock.runner import DriftlockRunner, RunnerConfig
+from driftlock.checkpoints import DirectoryCheckpointStore
+from driftlock.heuristics import HeuristicJudge, HeuristicConfig
+
+result = await DriftlockRunner(
+    DirectoryCheckpointStore(workspace, store_dir),
+    HeuristicJudge(HeuristicConfig()),
+    config=RunnerConfig(max_steps=50, max_rollbacks=3, checkpoint_interval=5),
+).run(
+    goal="repair the parser",
+    plan="inspect, patch, verify",
+    step=agent,
+    initial_state=agent.initial_state(),
+)
+```
+
+Full usage — the native agent, every optional component, remote and Harbor environments, and the
+one-command LHTB harness — is in **[docs/usage.md](docs/usage.md)**.
+
+## Documentation
+
+| | |
+|---|---|
+| **[RESULTS.md](RESULTS.md)** | The 170-trial run, its numbers, and its limits |
+| **[docs/architecture.md](docs/architecture.md)** | How the pieces fit, and the invariant each one holds |
+| **[docs/usage.md](docs/usage.md)** | Running the library, the agent, and the experiment harness |
+| **[docs/design-journal.md](docs/design-journal.md)** | The dated working plan, kept as a record of how the design moved |
+| **[CONTRIBUTING.md](CONTRIBUTING.md)** | The engineering discipline this repository holds itself to |
+| **[CHANGELOG.md](CHANGELOG.md)** | What landed, in order |
 
 ## Repo layout
 
 ```
-src/driftlock/   # local/remote checkpoint stores, judges, heuristics, runner
-tests/           # unit and integration-style local tests
-PLAN.md          # full working plan, risk register, phase gates
-README.md        # this file
+src/driftlock/    # the library: runner, agent, checkpoints, judges, skills, components
+tests/            # 1260 tests: no network, real subprocesses, real loopback servers
+docs/             # architecture, usage, design journal
+RESULTS.md        # the measured run
 ```
+
+## What this repository optimizes for
+
+Every component states what it does **not** guarantee as plainly as what it does, and that statement
+lives in the code rather than only in the docs. Self-verification says it is not adversarially sound,
+and why. The MCP client says a credential reaches it only from an injected supplier. The local
+environment says it is not a process sandbox. The file edit says hard links break.
+
+The same standard applies to measurement. A status that cannot distinguish *we could not observe
+this* from *we observed nothing* is treated as a defect, because a blind channel reading as a
+negative result has destroyed real measurements here — five separate times, catalogued in
+[RESULTS.md §6](RESULTS.md).
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
