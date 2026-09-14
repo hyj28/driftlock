@@ -4,7 +4,7 @@
 
 > **Status: the agent is complete, and its self-evolution loop is closed.**
 >
-> Every component in the roadmap below is implemented and unit-tested (1181 tests). A 170-trial
+> Every component in the roadmap below is implemented and unit-tested (1260 tests). A 170-trial
 > validation run exercised the self-evolution loop end to end for $15.06 — see
 > **[RESULTS.md](RESULTS.md)**.
 >
@@ -44,6 +44,7 @@ own runs; the rest is what any capable agent needs.
 | MCP Streamable HTTP and host-supplied authorization | done |
 | Prompt-cache management | done |
 | Output self-verification | done |
+| Bounded exact-string file edit | done |
 
 The optional `driftlock.st_embedder` module pins the real MiniLM model; installing `sentence-transformers` project-locally enables its integration test without changing retrieval's injected interface.
 
