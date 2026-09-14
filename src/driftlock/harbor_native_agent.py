@@ -596,6 +596,8 @@ class LHTBNativeDriftlockAgent(BaseAgent):
         reconciliation = getattr(runtime, "last_provider_call_reconciliation", None)
         if reconciliation is not None:
             record["provider_call_reconciliation"] = dict(reconciliation)
+        if runtime is not None:
+            record["process_lifetime"] = runtime.component_report()["process_lifetime"]
         self._native_phases.append(record)
 
         self._write_run_record()
@@ -615,6 +617,7 @@ class LHTBNativeDriftlockAgent(BaseAgent):
                 "schema_version": 2,
                 "active_components": component_report["active"],
                 "components": component_report["components"],
+                "process_lifetime": component_report["process_lifetime"],
                 "phases": self._native_phases,
             }
         output.write_text(

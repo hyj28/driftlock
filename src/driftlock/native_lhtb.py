@@ -47,6 +47,15 @@ from driftlock.models import (
     StepTokenBudgetExhausted,
     aggregate_run_summary,
 )
+from driftlock.processes import (
+    PROCESS_TABLE_KERNEL_PREFIX,
+    PROCESS_TABLE_SNAPSHOT_PREFIX,
+    PROCESS_TABLE_UNAVAILABLE_KERNELS,
+    ProcessIdentitySnapshot,
+    ProcessTableStatus,
+    parse_process_identity_snapshot,
+    valid_process_identity,
+)
 from driftlock.prompt_cache import PromptCacheConfig
 from driftlock.remote import RemoteArchiveCheckpointStore, RemoteEnvironment
 from driftlock.runner import DriftlockRunner, RunnerConfig
@@ -613,43 +622,90 @@ class NativeProcessQuiescer:
         *,
         user: str | int | None,
         timeout_sec: int = 60,
+        process_table_root: str = "/proc",
     ) -> None:
         if timeout_sec <= 0:
             raise ValueError("process cleanup timeout must be positive")
         self.environment = environment
         self.user = user
         self.timeout_sec = timeout_sec
-        self._baseline: tuple[str, ...] | None = None
+        process_root = PurePosixPath(process_table_root)
+        if not process_root.is_absolute() or ".." in process_root.parts:
+            raise ValueError("process_table_root must be an absolute normalized path")
+        self.process_table_root = str(process_root)
+        self._baseline: ProcessIdentitySnapshot | None = None
 
-    async def prepare(self) -> None:
+    async def prepare(self) -> ProcessIdentitySnapshot:
         """Capture the pre-agent PID/start-time identities once per trial."""
         if self._baseline is not None:
-            return
+            return self._baseline
         result = await self.environment.exec(
-            _process_identity_snapshot_script(),
+            _process_identity_snapshot_script(self.process_table_root),
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
         _require_exec_success(result, "capture pre-agent process baseline")
-        identities = tuple((getattr(result, "stdout", None) or "").splitlines())
-        if any(not _valid_process_identity(value) for value in identities) or len(
-            identities
-        ) != len(set(identities)):
-            raise RuntimeError("remote process baseline is malformed")
-        self._baseline = identities
+        try:
+            baseline = parse_process_identity_snapshot(getattr(result, "stdout", None))
+        except ValueError as error:
+            raise RuntimeError("remote process baseline is malformed") from error
+        self._baseline = baseline
+        return baseline
 
     async def before_restore(self, remote_workspace: str) -> None:
         """Freeze and kill every non-baseline process, or abort the restore."""
         if self._baseline is None:
             raise RuntimeError("process baseline must be captured before restore")
+        expected_absence = (
+            self._baseline.status is ProcessTableStatus.ABSENT
+            and self._baseline.kernel in PROCESS_TABLE_UNAVAILABLE_KERNELS
+        )
+        if (
+            self._baseline.status is not ProcessTableStatus.OBSERVED
+            and not expected_absence
+        ):
+            raise RuntimeError(
+                "failed to quiesce rejected native-agent processes: process table "
+                f"was {self._baseline.status.value} when the baseline was captured"
+            )
         result = await self.environment.exec(
             _quiesce_native_processes_script(
-                remote_workspace, process_baseline=self._baseline
+                remote_workspace, process_baseline=self._baseline.identities
             ),
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
         _require_exec_success(result, "quiesce rejected native-agent processes")
+
+    def observation_report(self) -> dict[str, Any]:
+        """Return the process-lifetime exposure recorded for this trial."""
+
+        baseline = self._baseline
+        if baseline is None:
+            return {
+                "status": None,
+                "kernel": None,
+                "baseline_process_count": None,
+                "observation_degraded": None,
+                "rollback_process_cleanup": None,
+            }
+        degraded = baseline.status is not ProcessTableStatus.OBSERVED
+        if not degraded:
+            rollback_cleanup = "enabled"
+        elif (
+            baseline.status is ProcessTableStatus.ABSENT
+            and baseline.kernel in PROCESS_TABLE_UNAVAILABLE_KERNELS
+        ):
+            rollback_cleanup = "unavailable_recorded"
+        else:
+            rollback_cleanup = "refused"
+        return {
+            "status": baseline.status.value,
+            "kernel": baseline.kernel,
+            "baseline_process_count": len(baseline.identities),
+            "observation_degraded": degraded,
+            "rollback_process_cleanup": rollback_cleanup,
+        }
 
 
 def apply_native_accounting(
@@ -1009,6 +1065,7 @@ class LHTBNativeAgentRuntime:
                 name for name, report in components.items() if report["enabled"]
             ],
             "components": components,
+            "process_lifetime": self._process_quiescer.observation_report(),
         }
 
     @property
@@ -1333,32 +1390,51 @@ def _require_exec_success(result: Any, operation: str) -> None:
 
 
 def _valid_process_identity(value: str) -> bool:
-    pid, separator, started = value.partition(":")
-    return (
-        separator == ":"
-        and pid.isascii()
-        and pid.isdigit()
-        and int(pid) > 1
-        and started.isascii()
-        and started.isdigit()
-        and int(started) >= 0
-    )
+    return valid_process_identity(value)
 
 
-def _process_identity_snapshot_script() -> str:
-    return r"""
+def _process_identity_snapshot_script(process_table_root: str = "/proc") -> str:
+    root = shlex.quote(str(PurePosixPath(process_table_root)))
+    prefix = shlex.quote(PROCESS_TABLE_SNAPSHOT_PREFIX)
+    kernel_prefix = shlex.quote(PROCESS_TABLE_KERNEL_PREFIX)
+    return f"""
 set -eu
-for stat in /proc/[0-9]*/stat; do
-  [ -r "$stat" ] || continue
-  pid=${stat#/proc/}
-  pid=${pid%/stat}
+process_root={root}
+prefix={prefix}
+kernel_prefix={kernel_prefix}
+kernel=$(uname -s 2>/dev/null || printf unknown)
+if [ ! -e "$process_root" ]; then
+  printf '%s%s\n' "$prefix" absent
+  printf '%s%s\n' "$kernel_prefix" "$kernel"
+  exit 0
+fi
+if [ ! -d "$process_root" ] || [ ! -r "$process_root" ] ||
+   [ ! -x "$process_root" ]; then
+  printf '%s%s\n' "$prefix" unreadable
+  printf '%s%s\n' "$kernel_prefix" "$kernel"
+  exit 0
+fi
+snapshot=$(mktemp "${{TMPDIR:-/tmp}}/driftlock-processes.XXXXXX")
+trap 'rm -f -- "$snapshot"' EXIT HUP INT TERM
+for stat in "$process_root"/[0-9]*/stat; do
+  [ -e "$stat" ] || continue
+  if [ ! -r "$stat" ]; then
+    printf '%s%s\n' "$prefix" unreadable
+    printf '%s%s\n' "$kernel_prefix" "$kernel"
+    exit 0
+  fi
+  pid=${{stat#"$process_root"/}}
+  pid=${{pid%/stat}}
   IFS= read -r value < "$stat" || continue
-  rest=${value##*) }
+  rest=${{value##*) }}
   set -- $rest
-  start=${20:-}
+  start=${{20:-}}
   case "$start" in ''|*[!0-9]*) continue;; esac
-  printf '%s:%s\n' "$pid" "$start"
+  printf '%s:%s\n' "$pid" "$start" >> "$snapshot"
 done
+printf '%s%s\n' "$prefix" observed
+printf '%s%s\n' "$kernel_prefix" "$kernel"
+cat "$snapshot"
 """.strip()
 
 

@@ -25,6 +25,15 @@ from types import MethodType
 from typing import Any, Protocol
 
 from driftlock.models import StepTokenBudgetExhausted
+from driftlock.processes import (
+    PROCESS_TABLE_KERNEL_PREFIX,
+    PROCESS_TABLE_SNAPSHOT_PREFIX,
+    PROCESS_TABLE_UNAVAILABLE_KERNELS,
+    ProcessIdentitySnapshot,
+    ProcessTableStatus,
+    parse_process_identity_snapshot,
+    valid_process_identity,
+)
 from driftlock.terminus import (
     Terminus2StateBridge,
     TerminusBoundary,
@@ -585,7 +594,7 @@ class LHTBTerminusRuntime:
         self.bridge = Terminus2StateBridge()
         self._prepared_prompt: str | None = None
         self._initialized = False
-        self._process_baseline: tuple[str, ...] | None = None
+        self._process_baseline: ProcessIdentitySnapshot | tuple[str, ...] | None = None
         self._canonical_workspace: str | None = None
         self._recording_generation = 0
         self._require_pinned_harbor = require_pinned_harbor
@@ -919,6 +928,25 @@ class LHTBTerminusRuntime:
             raise LHTBRuntimeCompatibilityError("TmuxSession._session_name is required")
         if self._process_baseline is None:
             raise RuntimeError("prepare_start must capture the process baseline first")
+        process_baseline = self._process_baseline
+        if isinstance(process_baseline, ProcessIdentitySnapshot):
+            expected_absence = (
+                process_baseline.status is ProcessTableStatus.ABSENT
+                and process_baseline.kernel in PROCESS_TABLE_UNAVAILABLE_KERNELS
+            )
+            if (
+                process_baseline.status is not ProcessTableStatus.OBSERVED
+                and not expected_absence
+            ):
+                raise RuntimeError(
+                    "failed to quiesce rejected tmux process tree: process table "
+                    f"was {process_baseline.status.value} when the baseline was "
+                    "captured"
+                )
+            process_identities = process_baseline.identities
+        else:
+            # Direct tuple assignment remains supported for pinned-runtime fixtures.
+            process_identities = process_baseline
         if self._canonical_workspace is None:
             raise RuntimeError("prepare_start must canonicalize the workspace first")
         user = getattr(session, "_user", None)
@@ -934,7 +962,7 @@ class LHTBTerminusRuntime:
             _kill_tmux_tree_command(
                 session_name,
                 canonical,
-                process_baseline=self._process_baseline,
+                process_baseline=process_identities,
             ),
             user=user,
             timeout_sec=30,
@@ -963,7 +991,7 @@ class LHTBTerminusRuntime:
             )
         session._previous_buffer = None
 
-    async def _capture_process_baseline(self) -> tuple[str, ...]:
+    async def _capture_process_baseline(self) -> ProcessIdentitySnapshot:
         session = self.agent._session
         session_name = getattr(session, "_session_name", None)
         if not isinstance(session_name, str) or not session_name:
@@ -975,13 +1003,10 @@ class LHTBTerminusRuntime:
         )
         # A process baseline is required to identify safe rollback kill targets.
         _require_remote_success(result, "capture pre-agent process baseline")
-        identities: list[str] = []
-        for line in (result.stdout or "").splitlines():
-            identity = line.strip()
-            if not _valid_process_identity(identity) or identity in identities:
-                raise RuntimeError("remote process baseline is malformed")
-            identities.append(identity)
-        return tuple(identities)
+        try:
+            return parse_process_identity_snapshot(result.stdout)
+        except ValueError as error:
+            raise RuntimeError("remote process baseline is malformed") from error
 
     def _validate_agent(self) -> None:
         agent = self.agent
@@ -1419,8 +1444,25 @@ def _require_workspace_observation(result: Any, operation: str) -> None:
 
 def _process_baseline_command(session_name: str) -> str:
     session = shlex.quote(session_name)
+    prefix = shlex.quote(PROCESS_TABLE_SNAPSHOT_PREFIX)
+    kernel_prefix = shlex.quote(PROCESS_TABLE_KERNEL_PREFIX)
     return f"""
 set -eu
+prefix={prefix}
+kernel_prefix={kernel_prefix}
+kernel=$(uname -s 2>/dev/null || printf unknown)
+if [ ! -e /proc ]; then
+  printf '%s%s\n' "$prefix" absent
+  printf '%s%s\n' "$kernel_prefix" "$kernel"
+  exit 0
+fi
+if [ ! -d /proc ] || [ ! -r /proc ] || [ ! -x /proc ]; then
+  printf '%s%s\n' "$prefix" unreadable
+  printf '%s%s\n' "$kernel_prefix" "$kernel"
+  exit 0
+fi
+snapshot=$(mktemp "${{TMPDIR:-/tmp}}/driftlock-processes.XXXXXX")
+trap 'rm -f -- "$snapshot"' EXIT HUP INT TERM
 pane=$(tmux display-message -p -t {session} '#{{pane_pid}}')
 case "$pane" in ''|*[!0-9]*) exit 31;; esac
 excluded=$pane
@@ -1428,7 +1470,12 @@ changed=1
 while [ "$changed" -eq 1 ]; do
   changed=0
   for status in /proc/[0-9]*/status; do
-    [ -r "$status" ] || continue
+    [ -e "$status" ] || continue
+    if [ ! -r "$status" ]; then
+      printf '%s%s\n' "$prefix" unreadable
+      printf '%s%s\n' "$kernel_prefix" "$kernel"
+      exit 0
+    fi
     pid=${{status#/proc/}}
     pid=${{pid%/status}}
     case " $excluded " in *" $pid "*) continue;; esac
@@ -1442,7 +1489,12 @@ while [ "$changed" -eq 1 ]; do
   done
 done
 for stat in /proc/[0-9]*/stat; do
-  [ -r "$stat" ] || continue
+  [ -e "$stat" ] || continue
+  if [ ! -r "$stat" ]; then
+    printf '%s%s\n' "$prefix" unreadable
+    printf '%s%s\n' "$kernel_prefix" "$kernel"
+    exit 0
+  fi
   pid=${{stat#/proc/}}
   pid=${{pid%/stat}}
   case " $excluded " in *" $pid "*) continue;; esac
@@ -1451,8 +1503,11 @@ for stat in /proc/[0-9]*/stat; do
   set -- $rest
   start=${{20:-}}
   case "$start" in ''|*[!0-9]*) continue;; esac
-  printf '%s:%s\n' "$pid" "$start"
+  printf '%s:%s\n' "$pid" "$start" >> "$snapshot"
 done
+printf '%s%s\n' "$prefix" observed
+printf '%s%s\n' "$kernel_prefix" "$kernel"
+cat "$snapshot"
 """.strip()
 
 
@@ -1600,13 +1655,7 @@ exit 42
 
 
 def _valid_process_identity(value: str) -> bool:
-    pid, separator, start = value.partition(":")
-    return (
-        separator == ":"
-        and pid.isascii()
-        and start.isascii()
-        and (pid.isdigit() and start.isdigit() and int(pid) > 0 and int(start) > 0)
-    )
+    return valid_process_identity(value)
 
 
 def _validate_loop_signature(agent: Any) -> None:

@@ -1441,6 +1441,34 @@ async def test_restore_supports_backslash_in_remote_temp_path(tmp_path: Path) ->
     assert not any(remote_tmp.iterdir())
 
 
+async def test_backslash_tar_handling_matches_supported_implementation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    remote_tmp = tmp_path / "remote\\tmp"
+    workspace.mkdir()
+    remote_tmp.mkdir()
+    environment = LocalRemoteEnvironment()
+    store = RemoteArchiveCheckpointStore(
+        environment,
+        str(workspace),
+        tmp_path / "host",
+        remote_tmp_dir=str(remote_tmp),
+    )
+    (workspace / "state.txt").write_text("checkpoint", encoding="utf-8")
+
+    await store.create({}, step=0)
+    version = await environment.exec("tar --version")
+
+    assert version.return_code == 0
+    if "GNU tar" in (version.stdout or ""):
+        assert store._tar_no_unquote is True
+    elif "bsdtar" in (version.stdout or ""):
+        assert store._tar_no_unquote is False
+    else:
+        pytest.fail("supported tar implementations are GNU tar and bsdtar")
+
+
 def test_remote_temp_directory_must_be_outside_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
