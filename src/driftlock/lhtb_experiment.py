@@ -1190,6 +1190,14 @@ class _HarborSkillValidationRunner:
                 f"{type(error).__name__}: {error}"
             )
         try:
+            audit["unobservable_process_baseline_count"] = (
+                _validation_unobservable_process_baseline_count(run_record)
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            audit["process_baseline_evidence_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+        try:
             reward = (
                 single_job_reward(job_dir)
                 if (job_dir / "result.json").is_file()
@@ -1485,6 +1493,27 @@ def _validation_non_restorable_checkpoint_count(run_record: Path) -> int:
             )
         total += count
     return total
+
+
+def _validation_unobservable_process_baseline_count(run_record: Path) -> int:
+    """Count a trial whose native process-lifetime baseline was unobservable."""
+
+    data = json.loads(run_record.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"validation run record must be an object: {run_record}")
+    observation = data.get("process_lifetime")
+    if observation is None:
+        return 0
+    if not isinstance(observation, dict):
+        raise ValueError(
+            f"validation process-lifetime record must be an object: {run_record}"
+        )
+    degraded = observation.get("observation_degraded")
+    if not isinstance(degraded, bool):
+        raise ValueError(
+            f"validation process-lifetime degradation must be a boolean: {run_record}"
+        )
+    return int(degraded)
 
 
 def _validation_injection_evidence(

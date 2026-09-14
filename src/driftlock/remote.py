@@ -84,6 +84,7 @@ class RemoteArchiveCheckpointStore:
         self.before_restore = before_restore
         self._canonical_workspace: str | None = None
         self._canonical_tmp_dir: str | None = None
+        self._tar_no_unquote = False
         (self.store_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     @property
@@ -113,6 +114,7 @@ class RemoteArchiveCheckpointStore:
                 [
                     "tar -czf",
                     shlex.quote(remote_archive),
+                    *(["--no-unquote"] if self._tar_no_unquote else []),
                     "-C",
                     shlex.quote(self._workspace_path),
                     ".",
@@ -325,12 +327,13 @@ class RemoteArchiveCheckpointStore:
         archive_q = shlex.quote(archive)
         backup_q = shlex.quote(backup)
         staging_q = shlex.quote(staging)
+        tar_name_option = " --no-unquote" if self._tar_no_unquote else ""
         script = f"""set -eu
 rm -rf -- {staging_q}
 rm -f -- {backup_q}
 mkdir -p -- {staging_q}
-tar -xzf {archive_q} -C {staging_q}
-tar -czf {backup_q} -C {workspace} .
+tar -xzf {archive_q}{tar_name_option} -C {staging_q}
+tar -czf {backup_q}{tar_name_option} -C {workspace} .
 sha256sum < {backup_q}
 """
         return "sh -ceu " + shlex.quote(script)
@@ -398,6 +401,7 @@ cp -a {staging_q}/. {workspace}/
         fifo_q = shlex.quote(staging + ".sha256-fifo")
         digest_file_q = shlex.quote(staging + ".sha256-result")
         expected_q = shlex.quote(expected_digest)
+        tar_name_option = " --no-unquote" if self._tar_no_unquote else ""
         clear_workspace = (
             f"find {workspace} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +"
         )
@@ -412,7 +416,7 @@ exec 3< {archive_q}
 mkfifo {fifo_q}
 sha256sum < {fifo_q} > {digest_file_q} &
 hash_pid=$!
-if tee {fifo_q} <&3 | tar -xzf - -C {staging_q}; then
+if tee {fifo_q} <&3 | tar -xzf -{tar_name_option} -C {staging_q}; then
     wait "$hash_pid"
 else
     wait "$hash_pid" || true
@@ -439,16 +443,22 @@ test -d {workspace}
 test -d {tmp_dir}
 workspace_real=$(realpath -- {workspace})
 tmp_real=$(realpath -- {tmp_dir})
-printf '%s\n' "$workspace_real" "$tmp_real"
+if tar --no-unquote --version >/dev/null 2>&1; then
+    tar_no_unquote=1
+else
+    tar_no_unquote=0
+fi
+printf '%s\n' "$workspace_real" "$tmp_real" "$tar_no_unquote"
 """
         result = await self._checked_exec(
             "sh -ceu " + shlex.quote(script),
             operation="validate remote checkpoint paths and tools",
         )
         lines = (result.stdout or "").splitlines()
-        if len(lines) < 2:
+        if len(lines) < 3:
             raise RemoteCheckpointError(
-                "remote path validation did not return canonical paths"
+                "remote path validation did not return canonical paths and tar "
+                "capabilities"
             )
         canonical_workspace = _validated_remote_path(
             lines[0], name="canonical remote_workspace", allow_root=False
@@ -460,6 +470,10 @@ printf '%s\n' "$workspace_real" "$tmp_real"
             raise ValueError(
                 "remote_tmp_dir resolves to or aliases a directory inside "
                 "remote_workspace"
+            )
+        if lines[2] not in {"0", "1"}:
+            raise RemoteCheckpointError(
+                "remote path validation returned an invalid tar capability"
             )
         alias_result = await self.environment.exec(
             "find "
@@ -486,6 +500,7 @@ printf '%s\n' "$workspace_real" "$tmp_real"
             )
         self._canonical_workspace = canonical_workspace
         self._canonical_tmp_dir = canonical_tmp
+        self._tar_no_unquote = lines[2] == "1"
 
     async def _checked_exec(self, command: str, *, operation: str) -> ExecResultLike:
         result = await self.environment.exec(

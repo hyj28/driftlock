@@ -1864,6 +1864,38 @@ def test_native_phase_record_distinguishes_verified_from_affected(
     assert phase["self_verification"]["affected_outcome"] is False
 
 
+def test_native_run_record_exposes_unobservable_process_baseline(
+    tmp_path: Path,
+    harbor_agent_modules: tuple[Any, Any],
+) -> None:
+    _, native_agent = harbor_agent_modules
+    process_lifetime = {
+        "status": "absent",
+        "kernel": "Darwin",
+        "baseline_process_count": 0,
+        "observation_degraded": True,
+        "rollback_process_cleanup": "unavailable_recorded",
+    }
+    runtime = SimpleNamespace(
+        component_report=lambda: {
+            "active": ["compaction"],
+            "components": {"compaction": {"enabled": True}},
+            "process_lifetime": process_lifetime,
+        }
+    )
+    agent = object.__new__(native_agent.LHTBNativeDriftlockAgent)
+    agent.logs_dir = tmp_path
+    agent._native_runtime = runtime
+    agent._native_phases = []
+
+    agent._write_run_record()
+
+    record = json.loads(
+        (tmp_path / "driftlock-native-result.json").read_text(encoding="utf-8")
+    )
+    assert record["process_lifetime"] == process_lifetime
+
+
 def test_native_memory_unreadable_root_is_typed_configuration_failure(
     tmp_path: Path,
     harbor_agent_modules: tuple[Any, Any],
