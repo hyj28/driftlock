@@ -40,6 +40,11 @@ jobs:
 
       # The suite is offline by construction: it starts real subprocesses and real
       # loopback HTTP servers, and reaches no external host.
+      #
+      # No -q here: pyproject already sets addopts = "-q", and a second one makes it
+      # -qq, which suppresses the summary line entirely. A CI log that cannot show
+      # how many tests ran cannot distinguish a green suite from one that collected
+      # nothing.
       - name: pytest
         if: '!cancelled()'
-        run: uv run pytest -q
+        run: uv run pytest

@@ -88,6 +88,20 @@ Two rules keep this honest:
   change after" proves nothing unless it also shows the numbers moving *during*. A measurement that
   cannot fail is not a measurement.
 
+## A known unreproduced failure
+
+One run of the suite on `main` at commit `817b96d` reported `1 failed, 1259 passed`. Six subsequent
+runs were clean and the failing test's name was not captured, so it is recorded here rather than
+closed: *not reproduced* is not *does not exist*, and this repository does not let itself round one
+into the other.
+
+If CI goes red once and green on a retry, the failing test name is in the log — write it here.
+
+> Do not add `-q` when running the suite. `pyproject.toml` already sets `addopts = "-q"`, so a second
+> one becomes `-qq` and suppresses the summary line entirely. A log that cannot show how many tests
+> ran cannot distinguish a green suite from one that collected nothing — which is exactly what gate 2
+> above exists to catch.
+
 ## Environment
 
 Python 3.13, `uv`, project-local only.
