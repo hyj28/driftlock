@@ -228,7 +228,7 @@ class SkillRetrievalConfig:
             "context_policy": (
                 "At most three preventative skills and 6000 injected characters "
                 "by default. The cap is fixed rather than library-relative because "
-                "PLAN.md section 2.5 identifies context rot as a long-horizon "
+                "the design journal identifies context rot as a long-horizon "
                 "failure mode; library growth must not grow prompt context."
             ),
         }

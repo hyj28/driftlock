@@ -1,10 +1,19 @@
-# driftlock — Project Plan
+# driftlock — design journal
 
-> A self-evolving long-horizon coding agent that learns from its own scored checkpoints.
-> This is the working plan and gets updated as the project moves. For the
-> public-facing introduction, see `README.md`.
+> **This is a historical record, not current documentation.** It is the working plan as it stood on
+> **2026-08-30**, kept because how the design moved is part of what this project is about: several
+> decisions here were retired by measurement rather than by argument, and the reasoning is worth
+> preserving alongside the outcome.
+>
+> Fifty-one non-merge commits landed after this file was last revised — the whole agent-component
+> series. For what driftlock is today see [README](../README.md), for how it fits together see
+> [architecture](architecture.md), and for what was measured see [RESULTS](../RESULTS.md).
+>
+> Two decisions recorded below were later reversed by evidence: rollback events were dropped as the
+> distillation signal because the judged arm rolled back zero times in eight trials, and cross-task
+> validation was abandoned because measurement showed it would produce 140 zero deltas.
 
-**Last updated:** 2026-08-20
+**Frozen at:** 2026-08-30
 
 ### Implementation status
 
