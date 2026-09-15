@@ -1,0 +1,40 @@
+name: Experiment or reproduction report
+description: Share a reproducible measurement, replication, or negative result
+title: "experiment: "
+labels:
+  - experiment
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Research question
+      description: What claim or mechanism did the run test?
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration and provenance
+      description: Include commit, agent path, provider/model, active-component set, tasks, replicates, and relevant thresholds.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Method
+      description: Describe controls, pairing, exclusions, unavailable observations, and the exact analysis command.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result and limits
+      description: Report the result—including null or negative results—and what the run does not establish.
+    validations:
+      required: true
+  - type: input
+    id: artifact
+    attributes:
+      label: Reproduction artifact
+      description: Link to a non-sensitive archive, commit, or script when available.

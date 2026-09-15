@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose an agent component, runtime capability, or experiment improvement
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What long-horizon failure, blind observation channel, or experiment limitation should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the externally observable contract rather than only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants and non-guarantees
+      description: How is the behavior bounded, how are unavailable and empty distinguished, and what does it explicitly not guarantee?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence plan
+      description: What falsifiable test, runtime scenario, or paired measurement would show that this works?
+    validations:
+      required: true

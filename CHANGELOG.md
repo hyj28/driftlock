@@ -1,9 +1,10 @@
 # Changelog
 
 All notable changes to driftlock. The format follows [Keep a Changelog](https://keepachangelog.com);
-this project has not cut a tagged release yet, so everything below is the road to `0.1.0`.
+dates are the merge dates of the pull requests listed and versions name the repository state they
+describe.
 
-Dates are the merge dates of the pull requests listed; numbers in brackets are PR numbers.
+Numbers in brackets are PR numbers.
 
 ## [0.1.0] — first release
 

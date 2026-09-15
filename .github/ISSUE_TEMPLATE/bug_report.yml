@@ -1,0 +1,56 @@
+name: Bug report
+description: Report incorrect runtime, checkpoint, agent, validation, or analysis behavior
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: If this could expose credentials, escape a workspace, corrupt a restore, or silently falsify a measurement, use [private vulnerability reporting](https://github.com/hyj28/driftlock/security/advisories/new).
+  - type: input
+    id: version
+    attributes:
+      label: driftlock version
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python version, uv version, and the active driftlock components.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest offline reproduction you can. Redact prompts, credentials, and proprietary task data.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected observation or outcome
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual observation or outcome
+      description: State whether the result was wrong, unavailable, silently truncated, or incorrectly reported as empty/zero.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for this behavior.
+          required: true
+        - label: I removed credentials, private prompts, and proprietary data.
+          required: true
+        - label: I recorded whether the behavior reproduces or is currently unreproduced.
+          required: true
