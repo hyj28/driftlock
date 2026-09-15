@@ -1,12 +1,57 @@
 # driftlock
 
-**A long-horizon coding agent that checkpoints its own work, rolls back when it drifts, and distils
-what it learns into skills that must earn their place.**
+<p align="center">
+  <img src="docs/assets/driftlock-hero.svg" alt="driftlock — Checkpoint, detect drift, roll back, learn" width="100%">
+</p>
 
-[![CI](https://github.com/hyj28/driftlock/actions/workflows/ci.yml/badge.svg)](https://github.com/hyj28/driftlock/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.13-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-none-lightgrey)
+<p align="center">
+  <a href="https://github.com/hyj28/driftlock/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/hyj28/driftlock/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
+  <a href="https://github.com/hyj28/driftlock/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/hyj28/driftlock?display_name=tag&amp;sort=semver&amp;style=flat-square&amp;color=10b981"></a>
+  <a href="https://www.python.org/"><img alt="Python 3.13" src="https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white"></a>
+  <img alt="No runtime dependencies" src="https://img.shields.io/badge/runtime%20dependencies-none-0f766e?style=flat-square">
+  <a href="RESULTS.md"><img alt="170 archived trials" src="https://img.shields.io/badge/archived%20trials-170-a855f7?style=flat-square"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/hyj28/driftlock?style=flat-square&amp;color=22c55e"></a>
+  <a href="https://github.com/hyj28/driftlock/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/hyj28/driftlock?style=flat-square&amp;logo=github&amp;color=f59e0b"></a>
+</p>
+
+<p align="center">
+  <strong>A long-horizon coding agent that checkpoints its work, rolls back when it drifts,<br>and distils what it learns into skills that must earn their place.</strong>
+</p>
+
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="RESULTS.md">Results</a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="docs/usage.md">Usage</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+---
+
+| Checkpoint | Detect | Roll back | Learn |
+|:--|:--|:--|:--|
+| Snapshot filesystem and agent state together | Zero-token heuristics escalate to a trajectory-aware judge | Return to the last healthy state with bounded retries | Distil localized failures into skills, then admit only validated gains |
+
+> [!IMPORTANT]
+> The published 170-trial result measures **Terminus-2 wrapped in driftlock's checkpoint,
+> rollback, distillation, and validation machinery**. driftlock's native tool-calling agent
+> ships, but does not yet have a published measurement. The distinction is retained in every
+> run record and explained in [RESULTS.md](RESULTS.md).
+
+## Quick start
+
+Python 3.13 and [uv](https://docs.astral.sh/uv/) are required. The library itself is
+stdlib-only; development tools are optional extras.
+
+```bash
+git clone https://github.com/hyj28/driftlock
+cd driftlock
+uv sync --extra dev
+uv run pytest
+```
+
+Start with the [usage guide](docs/usage.md), inspect the measured evidence in
+[RESULTS.md](RESULTS.md), or jump directly to the runner API below.
 
 Agents fail differently on long tasks than on short ones. Frontier models solve near-100% of tasks a
 human expert finishes in under four minutes and **under 10%** of tasks that take a human more than
@@ -98,7 +143,7 @@ experiment replayable. Each carries a `driftlock_*` flag into the experiment har
 the run record's active-component set, so a trial can always be attributed to the configuration that
 produced it.
 
-## Install
+## Development setup
 
 ```bash
 git clone https://github.com/hyj28/driftlock
@@ -111,7 +156,7 @@ Python 3.13. **No runtime dependencies** — the library is stdlib-only. `pytest
 extras; `sentence-transformers` is optional and needed only for the pinned-embedder integration
 test.
 
-## Quick start
+## Runner API
 
 ```python
 from driftlock.runner import DriftlockRunner, RunnerConfig
