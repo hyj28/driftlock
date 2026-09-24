@@ -11,7 +11,6 @@
   <img alt="No runtime dependencies" src="https://img.shields.io/badge/runtime%20dependencies-none-0f766e?style=flat-square">
   <a href="RESULTS.md"><img alt="170 archived trials" src="https://img.shields.io/badge/archived%20trials-170-a855f7?style=flat-square"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/hyj28/driftlock?style=flat-square&amp;color=22c55e"></a>
-  <a href="https://github.com/hyj28/driftlock/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/hyj28/driftlock?style=flat-square&amp;logo=github&amp;color=f59e0b"></a>
 </p>
 
 <p align="center">
@@ -38,20 +37,7 @@
 > ships, but does not yet have a published measurement. The distinction is retained in every
 > run record and explained in [RESULTS.md](RESULTS.md).
 
-## Quick start
-
-Python 3.13 and [uv](https://docs.astral.sh/uv/) are required. The library itself is
-stdlib-only; development tools are optional extras.
-
-```bash
-git clone https://github.com/hyj28/driftlock
-cd driftlock
-uv sync --extra dev
-uv run pytest
-```
-
-Start with the [usage guide](docs/usage.md), inspect the measured evidence in
-[RESULTS.md](RESULTS.md), or jump directly to the runner API below.
+## The long-horizon problem
 
 Agents fail differently on long tasks than on short ones. Frontier models solve near-100% of tasks a
 human expert finishes in under four minutes and **under 10%** of tasks that take a human more than
@@ -62,6 +48,22 @@ Two failure modes dominate that regime. **Context rot** — relevant information
 retrieve as history grows. **Compounding error and goal drift** — small early mistakes snowball
 until the agent is working on the wrong thing. driftlock attacks the second, and turns what it
 learns there into skills it carries into the next task.
+
+## Quick start
+
+Python 3.13 and [uv](https://docs.astral.sh/uv/). The library is **stdlib-only** at runtime;
+`pytest` and `ruff` are dev extras, and `sentence-transformers` is optional — needed only by the
+pinned-embedder integration test.
+
+```bash
+git clone https://github.com/hyj28/driftlock
+cd driftlock
+uv sync --extra dev
+uv run pytest
+```
+
+From there: the [usage guide](docs/usage.md) for the agent and every optional component,
+[RESULTS.md](RESULTS.md) for the measured evidence, or the runner API below.
 
 ---
 
@@ -117,44 +119,36 @@ recoverable from its record.
 
 ## What is built
 
-| Component | Status |
+**The loop itself.** Checkpointing, progress-aware rollback and the two-tier judge; free
+checkpoint scoring through the task's own verifier; failure localization to a checkpoint segment;
+skill distillation, retrieval and once-per-task injection; paired validation and admission with a
+measured noise floor; resumable runs, bounded retries and degraded-observation reporting; and a
+tool-calling agent with five tools — `run_shell`, `read_file`, `write_file`, `search_files`,
+`complete`. Context compaction at checkpoint boundaries is always on, bounded by
+`driftlock_max_history_characters` rather than switched.
+
+**Optional components**, each behind its own flag:
+
+| | |
 |---|---|
-| Checkpointing, progress-aware rollback, two-tier judge | done |
-| Free checkpoint scoring via the task's own verifier | done |
-| Failure localization to a checkpoint segment | done |
-| Skill distillation, retrieval, once-per-task injection | done |
-| Paired validation and admission with a measured noise floor | done |
-| Resumable runs, bounded retries, degraded-observation reporting | done |
-| Tool-calling agent (`run_shell`, `read_file`, `write_file`, `search_files`, `complete`) | done |
-| Agentic RAG — retrieval as a tool, over code *and* skills | done |
-| Context compaction | done |
-| Planning / task decomposition | done |
-| Persistent memory across tasks | done |
-| Bounded sequential sub-agent delegation | done |
-| MCP client — stdio and Streamable HTTP, host-supplied authorization | done |
-| Bounded opt-in parallel workspace reads | done |
-| Prompt-cache management | done |
-| Output self-verification | done |
-| Bounded exact-string file edit | done |
+| `driftlock_agentic_retrieval` | Agentic RAG — retrieval as a tool, over code *and* skills |
+| `driftlock_planning` | Planning and task decomposition |
+| `driftlock_memory` | Memory that persists across runs |
+| `driftlock_delegation` | Bounded sequential sub-agent delegation |
+| `driftlock_parallel_reads` | Bounded parallel workspace reads |
+| `driftlock_self_verification` | Output self-verification |
+| `driftlock_edit_file` | Bounded exact-string file edit |
+| `driftlock_prompt_cache` | Prompt-cache management |
+
+The MCP client — stdio and Streamable HTTP, with host-supplied authorization — is available on the
+agent but deliberately has no harness flag: LHTB tasks provide no server, so an enabled arm would be
+indistinguishable from an empty one. The reason is asserted in the code, not just written here.
 
 Everything past the tool-calling loop is **opt-in**. An agent built without them offers exactly the
 five historical tools and sends a byte-identical request, which is what keeps the archived
 experiment replayable. Each carries a `driftlock_*` flag into the experiment harness and appears in
 the run record's active-component set, so a trial can always be attributed to the configuration that
 produced it.
-
-## Development setup
-
-```bash
-git clone https://github.com/hyj28/driftlock
-cd driftlock
-uv venv && uv pip install -e ".[dev]"
-uv run pytest
-```
-
-Python 3.13. **No runtime dependencies** — the library is stdlib-only. `pytest` and `ruff` are dev
-extras; `sentence-transformers` is optional and needed only for the pinned-embedder integration
-test.
 
 ## Runner API
 
