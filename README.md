@@ -62,6 +62,17 @@ uv sync --extra dev
 uv run pytest
 ```
 
+Then watch the thing the first line of this page claims — no API key, no network, 0.1 seconds:
+
+```bash
+uv run python examples/rollback_demo.py
+```
+
+A scripted stand-in drifts into a loop, the coarse detector names the signal, and the run
+returns to the last checkpoint still eligible under the detector's lookback — skipping one that
+captured the drifted workspace. The retried step prints what it found there, so the output is
+evidence rather than narration.
+
 From there: the [usage guide](docs/usage.md) for the agent and every optional component,
 [RESULTS.md](RESULTS.md) for the measured evidence, or the runner API below.
 
@@ -182,12 +193,16 @@ one-command LHTB harness — is in **[docs/usage.md](docs/usage.md)**.
 | **[docs/design-journal.md](docs/design-journal.md)** | The dated working plan, kept as a record of how the design moved |
 | **[CONTRIBUTING.md](CONTRIBUTING.md)** | The engineering discipline this repository holds itself to |
 | **[CHANGELOG.md](CHANGELOG.md)** | What landed, in order |
+| **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** | How review here treats work, and people |
 
 ## Repo layout
 
 ```
 src/driftlock/    # the library: runner, agent, checkpoints, judges, skills, components
 tests/            # no network: real subprocesses and real loopback servers
+examples/         # runnable with no provider key
+integrations/lhtb/  # the Terminus-2 adapter the published results came from
+scripts/          # round orchestration for a remote experiment server
 docs/             # architecture, usage, design journal
 RESULTS.md        # the measured run
 ```
