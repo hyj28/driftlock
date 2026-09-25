@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,83 @@ async def test_local_environment_exec_captures_exit_and_streams(
     assert result.return_code == 6
     assert result.stdout == "hello"
     assert result.stderr == "problem"
+
+
+async def test_local_environment_import_observes_same_timestamp_same_size_edit(
+    tmp_path: Path,
+) -> None:
+    module = tmp_path / "sample.py"
+    module.write_text("VALUE = 'old'\n", encoding="utf-8")
+    source_timestamp_ns = 1_700_000_000_123_456_789
+    os.utime(module, ns=(source_timestamp_ns, source_timestamp_ns))
+    environment = LocalEnvironment(tmp_path)
+    import_command = (
+        f"{shlex.quote(sys.executable)} -c 'import sample; print(sample.VALUE)'"
+    )
+
+    before = await environment.exec(import_command)
+    module.write_text("VALUE = 'new'\n", encoding="utf-8")
+    os.utime(module, ns=(source_timestamp_ns, source_timestamp_ns))
+    after = await environment.exec(import_command)
+
+    assert before.return_code == 0
+    assert before.stdout == "old\n"
+    assert after.return_code == 0
+    assert after.stdout == "new\n"
+
+
+async def test_local_environment_import_does_not_create_bytecode_cache(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sample.py").write_text("VALUE = 7\n", encoding="utf-8")
+    environment = LocalEnvironment(tmp_path)
+
+    result = await environment.exec(
+        f"{shlex.quote(sys.executable)} -c 'import sample; print(sample.VALUE)'"
+    )
+
+    assert result.return_code == 0
+    assert result.stdout == "7\n"
+    assert not (tmp_path / "__pycache__").exists()
+
+
+async def test_local_environment_exec_preserves_environment_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LANG", "contract-lang")
+    monkeypatch.setenv("LC_ALL", "contract-lc-all")
+    monkeypatch.setenv("PATH", "/contract/bin")
+    environment = LocalEnvironment(tmp_path)
+    script = """\
+import json
+import os
+
+owner = os.environ["DRIFTLOCK_PROCESS_OWNER"]
+print(json.dumps({
+    "home_is_set": bool(os.environ["HOME"]),
+    "lang": os.environ["LANG"],
+    "lc_all": os.environ["LC_ALL"],
+    "owner_is_hex_token": len(owner) == 64 and all(
+        character in "0123456789abcdef" for character in owner
+    ),
+    "path": os.environ["PATH"],
+    "python_dont_write_bytecode": os.environ["PYTHONDONTWRITEBYTECODE"],
+}))
+"""
+
+    result = await environment.exec(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    )
+
+    assert result.return_code == 0
+    assert json.loads(result.stdout) == {
+        "home_is_set": True,
+        "lang": "contract-lang",
+        "lc_all": "contract-lc-all",
+        "owner_is_hex_token": True,
+        "path": "/contract/bin",
+        "python_dont_write_bytecode": "1",
+    }
 
 
 async def test_local_environment_times_out_endless_output(tmp_path: Path) -> None:
