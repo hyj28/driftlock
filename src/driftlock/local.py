@@ -43,6 +43,10 @@ class LocalEnvironment:
     basis. Detached programs that replace their environment can outlive a call.
     Use a host-managed isolated environment when strict process lifetime or
     filesystem isolation is required.
+
+    Python bytecode cache writes are disabled, but pre-existing ``.pyc`` files
+    can still execute stale bytecode. Remote and Harbor environments are not
+    controlled by this backend and do not inherit this guarantee.
     """
 
     def __init__(
@@ -101,6 +105,7 @@ class LocalEnvironment:
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self._temporary),
         }
         return await self._exec_process(command, timeout, environment)
