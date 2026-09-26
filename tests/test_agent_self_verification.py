@@ -19,6 +19,7 @@ from driftlock.agent import (
     AgentProviderError,
     ToolCall,
     ToolCallingAgent,
+    conservative_prefill_estimate,
 )
 from driftlock.checkpoints import DirectoryCheckpointStore
 from driftlock.heuristics import HeuristicConfig, HeuristicJudge
@@ -27,7 +28,12 @@ from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
 from driftlock.models import RunStatus, StepContext, StepOutcome, VerificationRunStatus
 from driftlock.runner import DriftlockRunner, RunnerConfig
 from driftlock.verification import (
+    DEFAULT_MAX_VERIFICATION_ATTEMPTS,
+    DEFAULT_MAX_VERIFICATION_TOKENS,
     MAX_VERIFICATION_EVIDENCE_CHARACTERS,
+    VERIFICATION_ATTEMPT_TOKEN_FLOOR,
+    VERIFICATION_GOAL_SUMMARY_PREFILL_ALLOWANCE,
+    VERIFICATION_REQUEST_INVARIANT_PREFILL_TOKENS,
     SelfVerificationConfig,
     VerificationCheckpoint,
     VerificationStatus,
@@ -152,6 +158,135 @@ async def _bind_local_control(
             store.discard(scratch)
 
     agent.configure_verification_control(control)
+
+
+def test_default_verification_budget_covers_documented_variable_prompt() -> None:
+    assert DEFAULT_MAX_VERIFICATION_ATTEMPTS == 3
+    assert VERIFICATION_REQUEST_INVARIANT_PREFILL_TOKENS == 1_867
+    assert VERIFICATION_GOAL_SUMMARY_PREFILL_ALLOWANCE == 8_000
+    assert VERIFICATION_ATTEMPT_TOKEN_FLOOR == 10_123
+    assert DEFAULT_MAX_VERIFICATION_TOKENS == 30_369
+
+
+@pytest.mark.parametrize(
+    ("goal", "summary"),
+    [
+        pytest.param("fix", "ok", id="short"),
+        pytest.param("g" * 4_000, "s" * 4_000, id="documented-allowance"),
+    ],
+)
+async def test_isolated_verification_request_stays_within_attempt_floor(
+    tmp_path: Path, goal: str, summary: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = ScriptedProvider(
+        [
+            AgentCompletion(
+                tool_calls=(ToolCall("complete", {"summary": summary}, "complete"),),
+                tokens=3,
+            ),
+            _unverifiable(),
+        ]
+    )
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        self_verification=SelfVerificationConfig(),
+    )
+
+    await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(),
+        config=RunnerConfig(max_steps=2),
+    ).run(goal=goal, step=agent, initial_state=agent.initial_state())
+
+    verification_request = provider.requests[1]
+    measured_prefill = conservative_prefill_estimate(verification_request)
+    assert measured_prefill == (
+        VERIFICATION_REQUEST_INVARIANT_PREFILL_TOKENS
+        + len(goal.encode("utf-8"))
+        + len(summary.encode("utf-8"))
+    )
+
+
+@pytest.mark.parametrize(
+    ("goal", "summary"),
+    [
+        pytest.param("fix", "ok", id="short"),
+        pytest.param("g" * 4_000, "s" * 4_000, id="documented-allowance"),
+    ],
+)
+async def test_default_verification_budget_reaches_attempt_limit(
+    tmp_path: Path, goal: str, summary: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = SelfVerificationConfig()
+
+    class WorstCaseVerificationProvider:
+        def __init__(self) -> None:
+            self.completions = 0
+            self.verifications = 0
+
+        async def __call__(self, request: AgentCompletionRequest) -> AgentCompletion:
+            tool_names = tuple(tool.name for tool in request.tools)
+            if tool_names == ("run_verification", "report_unverifiable"):
+                self.verifications += 1
+                return AgentCompletion(
+                    tool_calls=(
+                        ToolCall(
+                            "run_verification",
+                            {"command": "true"},
+                            f"verify-{self.verifications}",
+                        ),
+                    ),
+                    tokens=(
+                        conservative_prefill_estimate(request)
+                        + config.max_output_tokens
+                    ),
+                )
+            self.completions += 1
+            return AgentCompletion(
+                tool_calls=(
+                    ToolCall(
+                        "complete",
+                        {"summary": summary},
+                        f"complete-{self.completions}",
+                    ),
+                ),
+                tokens=3,
+            )
+
+    provider = WorstCaseVerificationProvider()
+    agent = ToolCallingAgent(
+        LocalEnvironment(workspace),
+        LocalWorkspaceDeltaObserver(workspace),
+        provider,
+        self_verification=config,
+    )
+
+    result = await DriftlockRunner(
+        DirectoryCheckpointStore(workspace, tmp_path / "checkpoints"),
+        HeuristicJudge(
+            HeuristicConfig(
+                no_change_steps=10,
+                loop_window=10,
+                error_window=10,
+                reward_stall_steps=10,
+            )
+        ),
+        config=RunnerConfig(max_steps=10),
+    ).run(goal=goal, step=agent, initial_state=agent.initial_state())
+
+    assert result.status is VerificationRunStatus.VERIFICATION_LIMIT
+    assert [record.status for record in result.verification_records] == [
+        VerificationStatus.UNVERIFIABLE,
+        VerificationStatus.UNVERIFIABLE,
+        VerificationStatus.UNVERIFIABLE,
+    ]
+    assert result.verification_records[-1].attempt_limit_reached is True
 
 
 @pytest.mark.parametrize(
