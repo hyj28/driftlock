@@ -2671,6 +2671,10 @@ class ToolCallingAgent:
             )
             return self._verification_observation(call, summary, record)
 
+        # This isolated request shape is the source measured by
+        # VERIFICATION_ATTEMPT_TOKEN_FLOOR in ``verification.py``. It deliberately
+        # excludes the parent conversation, so its prefill does not grow with the
+        # primary agent history.
         request = AgentCompletionRequest(
             messages=(
                 {

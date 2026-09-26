@@ -18,9 +18,24 @@ DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS = 256
 # This floor avoids issuing provider calls too small to encode a usable tool call.
 DEFAULT_VERIFICATION_MIN_OUTPUT_TOKENS = 32
 
-# Two thousand forty-eight tokens cover the conservative request framing plus a
-# short check-selection response while fixing the total verification share per run.
-DEFAULT_MAX_VERIFICATION_TOKENS = 2_048
+# Before its variable goal and summary, the isolated request built in ``agent.py``
+# costs 1,867 tokens under ``conservative_prefill_estimate``. Reserve another
+# 8,000 UTF-8 bytes: 4,000 matches the repository's delegated parent-goal bound,
+# and 4,000 covers a substantial model-authored completion summary. This is a
+# documented default-budget guarantee, not an input cap; longer values stay legal.
+VERIFICATION_REQUEST_INVARIANT_PREFILL_TOKENS = 1_867
+VERIFICATION_GOAL_SUMMARY_PREFILL_ALLOWANCE = 8_000
+VERIFICATION_ATTEMPT_TOKEN_FLOOR = (
+    VERIFICATION_REQUEST_INVARIANT_PREFILL_TOKENS
+    + VERIFICATION_GOAL_SUMMARY_PREFILL_ALLOWANCE
+    + DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS
+)
+
+# Three default attempts at the 10,123-token per-attempt floor require 30,369
+# tokens. Keep this arithmetic explicit so the two defaults remain coherent.
+DEFAULT_MAX_VERIFICATION_TOKENS = (
+    DEFAULT_MAX_VERIFICATION_ATTEMPTS * VERIFICATION_ATTEMPT_TOKEN_FLOOR
+)
 
 # Eight is a defensive public configuration ceiling that also bounds every durable
 # per-attempt record without requiring lossy aggregation inside one task.
