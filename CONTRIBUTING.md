@@ -88,12 +88,19 @@ Two rules keep this honest:
   change after" proves nothing unless it also shows the numbers moving *during*. A measurement that
   cannot fail is not a measurement.
 
-## A known unreproduced failure
+## Intermittent failures, identified and not
 
-One run of the suite on `main` at commit `817b96d` reported `1 failed, 1259 passed`. Six subsequent
-runs were clean and the failing test's name was not captured, so it is recorded here rather than
-closed: *not reproduced* is not *does not exist*, and this repository does not let itself round one
-into the other.
+**Identified.** `tests/test_mcp_http.py::test_nonresponding_server_timeout_leaves_no_client_work`
+failed on Linux CI on 2026-09-26 with `assert 3 == 2`, having passed on macOS and on the same
+commit's pull-request run. It waited on one observable and asserted another: the loop polled the
+server's active-handler count to zero, but that counter is decremented from inside the handler,
+which then still has to unwind, so the thread it asserted on had not exited yet. The wait now polls
+the quantity the assertion reads. Fixed.
+
+**Still unidentified.** One run on `main` at commit `817b96d` reported `1 failed, 1259 passed`. Six
+subsequent runs were clean and the failing test's name was not captured. It is tempting to close
+that against the entry above, and this file will not do it: the name was never recorded, so whether
+the two are the same incident is unknown, and *not reproduced* is still not *does not exist*.
 
 If CI goes red once and green on a retry, the failing test name is in the log — write it here.
 
