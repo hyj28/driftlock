@@ -497,7 +497,7 @@ async def test_nonresponding_server_timeout_leaves_no_client_work(mode):
             for _ in range(50):
                 with server.active_lock:
                     active = server.active_handlers
-                if active == 0:
+                if active == 0 and threading.active_count() == before_threads:
                     break
                 await asyncio.sleep(0.01)
             after_tasks = {
