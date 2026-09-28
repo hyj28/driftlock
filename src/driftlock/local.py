@@ -17,7 +17,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from driftlock.lhtb import WorkspaceDelta, WorkspaceSnapshot
+from driftlock.lhtb import (
+    WorkspaceDelta,
+    WorkspaceSnapshot,
+    classify_tool_cache_paths,
+)
 
 _PROCESS_CLEANUP_TIMEOUT_SEC = 1.0
 # Give a child that immediately calls setsid time to leave its parent's group.
@@ -287,7 +291,13 @@ class LocalWorkspaceDeltaObserver:
                 lineterm="",
             )
         )
-        return WorkspaceDelta(changed_paths=changed_paths, diff=diff)
+        return WorkspaceDelta(
+            changed_paths=changed_paths,
+            diff=diff,
+            tool_cache_paths=classify_tool_cache_paths(
+                changed_paths, before=before, after=after
+            ),
+        )
 
 
 def _decode_capped(value: bytes, limit: int) -> str:

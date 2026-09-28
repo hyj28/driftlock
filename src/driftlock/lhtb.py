@@ -45,6 +45,15 @@ LHTB_LITELLM_VERSION = "1.83.14"
 DRIFTLOCK_HARBOR_PATCH_VERSION = 14
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
+# Keep this separate from agentic_retrieval.DEFAULT_IGNORED_DIRECTORY_NAMES.
+# Retrieval excludes dependencies and repository internals from a search corpus;
+# workspace observation instead retains every path and classifies only caches made
+# as a side effect of running tools. Sharing those sets would wrongly classify
+# dependency changes such as node_modules or .venv as cache churn.
+TOOL_CACHE_DIRECTORY_NAMES = frozenset(
+    {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox"}
+)
+
 # On 2026-08-23 the pinned agent provider's *shared* upstream pool was saturated
 # for at least 11 minutes and every trial then in flight died. These defaults cover
 # roughly 12 minutes of continuous 429s per step: 15 + 30 + 60 + 120 * 5.
@@ -244,10 +253,83 @@ class WorkspaceSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceDelta:
-    """Filesystem evidence attributable to one agent episode."""
+    """Filesystem evidence attributable to one agent episode.
+
+    ``changed_paths`` is the complete raw observation. ``tool_cache_paths`` is
+    the ordered subset classified as run-time tool-cache churn.
+    """
 
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    tool_cache_paths: tuple[str, ...] = ()
+
+
+def classify_tool_cache_paths(
+    changed_paths: tuple[str, ...],
+    *,
+    before: WorkspaceSnapshot | None = None,
+    after: WorkspaceSnapshot | None = None,
+) -> tuple[str, ...]:
+    """Return cache-classified paths without removing any raw observation.
+
+    Classification is deliberately a heuristic bounded by
+    :data:`TOOL_CACHE_DIRECTORY_NAMES`: if a task's actual goal is to modify a
+    path such as ``.pytest_cache/README.md``, that authored work is classified as
+    churn. The complete path remains in ``WorkspaceDelta.changed_paths``, so the
+    raw observation is always recoverable.
+
+    When snapshots identify changed directories, an ancestor is also cache churn
+    only if it has changed descendants and every one is already cache-classified.
+    This attributes directory metadata churn, including the workspace root ``.``,
+    without hiding standalone directory changes or parents of authored changes.
+    """
+
+    classified = {
+        path
+        for path in changed_paths
+        if any(part in TOOL_CACHE_DIRECTORY_NAMES for part in PurePosixPath(path).parts)
+    }
+    if before is not None and after is not None:
+        directory_path_set = {
+            path
+            for path in changed_paths
+            if _is_directory_manifest_entry(before.files.get(path))
+            or _is_directory_manifest_entry(after.files.get(path))
+        }
+        children: dict[str, list[str]] = {
+            directory: [] for directory in directory_path_set
+        }
+        for path in changed_paths:
+            parent = _nearest_changed_directory(path, directory_path_set)
+            if parent is not None:
+                children[parent].append(path)
+        directory_paths = sorted(
+            directory_path_set,
+            key=lambda path: len(PurePosixPath(path).parts),
+            reverse=True,
+        )
+        for directory in directory_paths:
+            changed_children = children[directory]
+            if changed_children and all(
+                path in classified for path in changed_children
+            ):
+                classified.add(directory)
+    return tuple(path for path in changed_paths if path in classified)
+
+
+def _is_directory_manifest_entry(value: str | None) -> bool:
+    return value is not None and value.startswith("d:")
+
+
+def _nearest_changed_directory(path: str, directory_paths: set[str]) -> str | None:
+    parts = PurePosixPath(path).parts
+    for length in range(len(parts) - 1, 0, -1):
+        candidate = PurePosixPath(*parts[:length]).as_posix()
+        if candidate in directory_paths:
+            return candidate
+    if path != "." and "." in directory_paths:
+        return "."
+    return None
 
 
 class _WorkspaceObservationUnavailable(RuntimeError):
@@ -460,7 +542,13 @@ PY
         )
         if not diff and changed_paths:
             diff = "\n".join(f"content changed: {path}" for path in changed_paths)
-        return WorkspaceDelta(changed_paths=changed_paths, diff=diff)
+        return WorkspaceDelta(
+            changed_paths=changed_paths,
+            diff=diff,
+            tool_cache_paths=classify_tool_cache_paths(
+                changed_paths, before=before, after=after
+            ),
+        )
 
 
 def is_rate_limit_rejection(error: BaseException) -> bool:
@@ -887,6 +975,7 @@ class LHTBTerminusRuntime:
                 observation_error = str(error)
                 changed_paths = ()
                 diff = ""
+                tool_cache_paths = ()
             else:
                 if before is None:  # pragma: no cover - guarded by observation_error
                     raise AssertionError(
@@ -895,9 +984,11 @@ class LHTBTerminusRuntime:
                 delta = self.observer.compare(before, after)
                 changed_paths = delta.changed_paths
                 diff = delta.diff
+                tool_cache_paths = delta.tool_cache_paths
         else:
             changed_paths = ()
             diff = ""
+            tool_cache_paths = ()
         next_prompt = _step_observation(step)
         conversation = self.bridge.capture(
             self.agent,
@@ -910,6 +1001,7 @@ class LHTBTerminusRuntime:
             action=_step_action(step),
             changed_paths=changed_paths,
             diff=diff,
+            tool_cache_paths=tool_cache_paths,
             workspace_delta_observed=observation_error is None,
             workspace_observation_error=observation_error,
             error=error,

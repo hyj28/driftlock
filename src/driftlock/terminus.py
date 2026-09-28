@@ -66,6 +66,7 @@ class TerminusBoundary:
     action: str
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    tool_cache_paths: tuple[str, ...] = ()
     workspace_delta_observed: bool = True
     workspace_observation_error: str | None = None
     error: str | None = None
@@ -85,6 +86,18 @@ class TerminusBoundary:
             raise TypeError("changed_paths must be a tuple of strings")
         if not isinstance(self.diff, str):
             raise TypeError("diff must be a string")
+        if not isinstance(self.tool_cache_paths, tuple) or any(
+            not isinstance(path, str) for path in self.tool_cache_paths
+        ):
+            raise TypeError("tool_cache_paths must be a tuple of strings")
+        tool_cache_path_set = set(self.tool_cache_paths)
+        ordered_subset = tuple(
+            path for path in self.changed_paths if path in tool_cache_path_set
+        )
+        if self.tool_cache_paths != ordered_subset:
+            raise ValueError(
+                "tool_cache_paths must be an ordered subset of changed_paths"
+            )
         if not isinstance(self.workspace_delta_observed, bool):
             raise TypeError("workspace_delta_observed must be a boolean")
         if self.workspace_observation_error is not None and not isinstance(
@@ -421,6 +434,7 @@ class TerminusStepAdapter:
             state=self.codec.encode(boundary.conversation),
             changed_paths=boundary.changed_paths,
             diff=boundary.diff,
+            tool_cache_paths=boundary.tool_cache_paths,
             workspace_delta_observed=boundary.workspace_delta_observed,
             workspace_observation_error=boundary.workspace_observation_error,
             error=boundary.error,

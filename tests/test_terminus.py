@@ -289,6 +289,13 @@ def test_conversation_codec_translates_deep_copy_recursion_errors() -> None:
         ({"completed": "false"}, "completed must be a boolean"),
         ({"reward": math.nan}, "reward must be a finite number"),
         ({"changed_paths": ["src/app.py"]}, "tuple of strings"),
+        (
+            {
+                "changed_paths": (".pytest_cache/one", ".pytest_cache/two"),
+                "tool_cache_paths": (".pytest_cache/two", ".pytest_cache/one"),
+            },
+            "ordered subset",
+        ),
         ({"workspace_delta_observed": "yes"}, "must be a boolean"),
         ({"workspace_observation_error": 7}, "must be a string or None"),
     ],

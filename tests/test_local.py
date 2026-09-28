@@ -11,7 +11,9 @@ from pathlib import Path
 
 import pytest
 
+from driftlock.heuristics import HeuristicConfig, HeuristicJudge
 from driftlock.local import LocalEnvironment, LocalWorkspaceDeltaObserver
+from driftlock.models import StepOutcome, StepRecord
 
 
 async def test_local_environment_exec_captures_exit_and_streams(
@@ -401,3 +403,51 @@ print(cache)
     assert tuple(tmp_path.iterdir()) == ()
     for rendered_path in result.stdout.splitlines():
         assert not Path(rendered_path).resolve().is_relative_to(tmp_path.resolve())
+
+
+async def test_pytest_cache_churn_is_retained_but_counts_as_no_authored_change(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "test_sample.py").write_text(
+        "def test_sample():\n    assert True\n", encoding="utf-8"
+    )
+    environment = LocalEnvironment(tmp_path)
+    observer = LocalWorkspaceDeltaObserver(tmp_path)
+    records: list[StepRecord] = []
+
+    for sequence in range(1, 5):
+        before = await observer.snapshot()
+        result = await environment.exec("python3 -m pytest -q")
+        after = await observer.snapshot()
+        delta = observer.compare(before, after)
+        records.append(
+            StepRecord(
+                sequence=sequence,
+                logical_step=sequence,
+                attempt=1,
+                outcome=StepOutcome(
+                    action=f"run pytest {sequence}",
+                    state={},
+                    changed_paths=delta.changed_paths,
+                    diff=delta.diff,
+                    tool_cache_paths=delta.tool_cache_paths,
+                ),
+            )
+        )
+        assert result.return_code == 0
+
+    expected_cache_paths = (
+        ".pytest_cache/.gitignore",
+        ".pytest_cache/CACHEDIR.TAG",
+        ".pytest_cache/README.md",
+        ".pytest_cache/v/cache/nodeids",
+    )
+    assert records[0].outcome.changed_paths == expected_cache_paths
+    assert records[0].outcome.tool_cache_paths == expected_cache_paths
+    assert [record.outcome.changed_paths for record in records[1:]] == [(), (), ()]
+    assert [
+        signal.kind
+        for signal in HeuristicJudge(HeuristicConfig(no_change_steps=4)).evaluate(
+            records
+        )
+    ] == ["no_file_change"]

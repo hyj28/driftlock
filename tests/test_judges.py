@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,6 +74,39 @@ async def test_callable_llm_judge_builds_evidence_and_parses_json() -> None:
     assert verdict.tokens == 17
     assert "fix the parser" in received
     assert "rewrite unrelated module" in received
+
+
+async def test_callable_llm_judge_reports_full_and_cache_path_evidence() -> None:
+    received = ""
+
+    async def complete(prompt: str) -> str:
+        nonlocal received
+        received = prompt
+        return '{"verdict":"healthy","reason":"cache churn is not authored work"}'
+
+    original = _context()
+    outcome = replace(
+        original.recent_steps[0].outcome,
+        changed_paths=(".pytest_cache/v/cache/nodeids", "src/parser.py"),
+        tool_cache_paths=(".pytest_cache/v/cache/nodeids",),
+    )
+    context = replace(
+        original,
+        recent_steps=(replace(original.recent_steps[0], outcome=outcome),),
+    )
+
+    verdict = await CallableLLMJudge(complete).judge(context)
+    evidence = json.loads(received.split("\n\n", 1)[1])
+
+    assert verdict.verdict is Verdict.HEALTHY
+    assert "tool_cache_paths is the cache-churn subset of changed_paths" in received
+    assert evidence["recent_trajectory"][0]["changed_paths"] == [
+        ".pytest_cache/v/cache/nodeids",
+        "src/parser.py",
+    ]
+    assert evidence["recent_trajectory"][0]["tool_cache_paths"] == [
+        ".pytest_cache/v/cache/nodeids"
+    ]
 
 
 async def test_callable_llm_judge_marks_invalid_output_as_failed() -> None:
