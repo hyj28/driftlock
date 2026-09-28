@@ -139,6 +139,70 @@ def test_no_file_change_alongside_another_signal_initiates_a_fine_review() -> No
     assert judge.initiates_review(signals) is True
 
 
+def test_no_file_change_uses_authored_subset_and_rejects_mixed_progress() -> None:
+    judge = HeuristicJudge(HeuristicConfig(no_change_steps=4))
+    cache_only = [
+        StepRecord(
+            sequence=sequence,
+            logical_step=sequence,
+            attempt=1,
+            outcome=StepOutcome(
+                action=f"test {sequence}",
+                state={},
+                changed_paths=(".pytest_cache/v/cache/nodeids",),
+                tool_cache_paths=(".pytest_cache/v/cache/nodeids",),
+            ),
+        )
+        for sequence in range(1, 5)
+    ]
+
+    assert [signal.kind for signal in judge.evaluate(cache_only)] == ["no_file_change"]
+
+    mixed = list(cache_only)
+    mixed[2] = StepRecord(
+        sequence=3,
+        logical_step=3,
+        attempt=1,
+        outcome=StepOutcome(
+            action="edit and test",
+            state={},
+            changed_paths=(".pytest_cache/v/cache/nodeids", "src/app.py"),
+            tool_cache_paths=(".pytest_cache/v/cache/nodeids",),
+        ),
+    )
+
+    assert judge.evaluate(mixed) == ()
+
+
+def test_unobservable_cache_delta_does_not_count_as_no_authored_change() -> None:
+    judge = HeuristicJudge(HeuristicConfig(no_change_steps=4))
+    steps = [
+        StepRecord(
+            sequence=sequence,
+            logical_step=sequence,
+            attempt=1,
+            outcome=StepOutcome(
+                action=f"test {sequence}",
+                state={},
+                workspace_delta_observed=sequence != 2,
+            ),
+        )
+        for sequence in range(1, 5)
+    ]
+
+    assert judge.evaluate(steps) == ()
+
+
+def test_step_outcome_requires_cache_paths_in_changed_path_order() -> None:
+    with pytest.raises(ValueError, match="ordered subset"):
+        StepOutcome(
+            action="test",
+            state={},
+            changed_paths=(".pytest_cache/one", ".pytest_cache/two"),
+            tool_cache_paths=(".pytest_cache/two", ".pytest_cache/one"),
+        )
+
+
 def test_the_corroborating_set_is_configurable() -> None:
     signals = HeuristicJudge(HeuristicConfig(no_change_steps=3)).evaluate(
         [

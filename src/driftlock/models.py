@@ -146,6 +146,8 @@ class StepOutcome:
 
     ``state`` must be JSON-serializable because it is stored with checkpoints.
     ``changed_paths`` and ``diff`` should describe only the just-finished step.
+    ``changed_paths`` remains complete; ``tool_cache_paths`` identifies its
+    ordered subset classified as run-time cache churn.
     ``tool_audits`` retains diagnostics that are deliberately not fed back into
     the agent conversation.
     ``context_compactions`` records lossy conversation rewrites at this step.
@@ -157,6 +159,7 @@ class StepOutcome:
     state: Mapping[str, Any]
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    tool_cache_paths: tuple[str, ...] = ()
     workspace_delta_observed: bool = True
     workspace_observation_error: str | None = None
     commands_run: int = 0
@@ -175,6 +178,18 @@ class StepOutcome:
     def __post_init__(self) -> None:
         if self.tokens < 0:
             raise ValueError("tokens cannot be negative")
+        if not isinstance(self.tool_cache_paths, tuple) or any(
+            not isinstance(path, str) for path in self.tool_cache_paths
+        ):
+            raise TypeError("tool_cache_paths must be a tuple of strings")
+        tool_cache_path_set = set(self.tool_cache_paths)
+        ordered_subset = tuple(
+            path for path in self.changed_paths if path in tool_cache_path_set
+        )
+        if self.tool_cache_paths != ordered_subset:
+            raise ValueError(
+                "tool_cache_paths must be an ordered subset of changed_paths"
+            )
         if not isinstance(self.workspace_delta_observed, bool):
             raise TypeError("workspace_delta_observed must be a boolean")
         if self.workspace_observation_error is not None and not isinstance(

@@ -130,6 +130,7 @@ def _build_prompt(context: DriftContext) -> str:
             "error": step.outcome.error,
             "reward": step.outcome.reward,
             "changed_paths": list(step.outcome.changed_paths),
+            "tool_cache_paths": list(step.outcome.tool_cache_paths),
             "workspace_delta_observed": step.outcome.workspace_delta_observed,
             "workspace_observation_error": step.outcome.workspace_observation_error,
         }
@@ -160,7 +161,9 @@ def _build_prompt(context: DriftContext) -> str:
         "Decide whether the current workspace remains a sound basis for continuing "
         "toward the original goal. Do not mark ordinary exploration as drift. Mark "
         "a trajectory drifted when continuing from it is less promising than "
-        "restoring the stated checkpoint. Return JSON only with keys verdict "
+        "restoring the stated checkpoint. In each trajectory entry, "
+        "tool_cache_paths is the cache-churn subset of changed_paths. Return JSON "
+        "only with keys verdict "
         "(healthy, drifted, or uncertain), reason, and confidence (0 to 1).\n\n"
         + json.dumps(evidence, indent=2, sort_keys=True)
     )

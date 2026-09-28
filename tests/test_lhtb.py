@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import driftlock
 import driftlock.lhtb as lhtb
 from driftlock.lhtb import (
     HarborWorkspaceDeltaObserver,
@@ -934,6 +935,91 @@ async def test_workspace_observer_reports_content_and_git_view_changes() -> None
         call for call in environment.calls if "python3" in call["command"]
     )
     assert manifest_call["cwd"] == "/app"
+
+
+def test_harbor_workspace_observer_attributes_cache_only_directory_churn() -> None:
+    before = WorkspaceSnapshot(
+        files=lhtb._parse_sha256_manifest(
+            "d\0.\0root-before:\0d\0./tests\0tests-before:\0"
+        )
+    )
+    after = WorkspaceSnapshot(
+        files=lhtb._parse_sha256_manifest(
+            "d\0.\0root-after:\0"
+            "d\0./.pytest_cache\0pytest-cache:\0"
+            f"f\0./.pytest_cache/CACHEDIR.TAG\0metadata:{'a' * 64}\0"
+            "d\0./tests\0tests-after:\0"
+            "d\0./tests/__pycache__\0pycache:\0"
+            f"f\0./tests/__pycache__/test_a.cpython-313.pyc\0metadata:{'b' * 64}\0"
+        )
+    )
+    delta = HarborWorkspaceDeltaObserver(
+        FakeEnvironment(), remote_workspace="/app", user="root"
+    ).compare(before, after)
+
+    expected_changed_paths = (
+        ".",
+        ".pytest_cache",
+        ".pytest_cache/CACHEDIR.TAG",
+        "tests",
+        "tests/__pycache__",
+        "tests/__pycache__/test_a.cpython-313.pyc",
+    )
+    assert delta.changed_paths == expected_changed_paths
+    assert delta.tool_cache_paths == expected_changed_paths
+    tool_cache_path_set = set(delta.tool_cache_paths)
+    assert (
+        tuple(path for path in delta.changed_paths if path not in tool_cache_path_set)
+        == ()
+    )
+
+
+def test_harbor_workspace_observer_keeps_mixed_directory_churn_authored() -> None:
+    before = WorkspaceSnapshot(
+        files={
+            ".": "d:root-before",
+            "scratch": "d:scratch-before",
+            "src": "d:src-before",
+        }
+    )
+    after = WorkspaceSnapshot(
+        files={
+            ".": "d:root-after",
+            "scratch": "d:scratch-after",
+            "src": "d:src-after",
+            "src/app.py": "f:authored",
+            "src/__pycache__": "d:cache",
+            "src/__pycache__/app.pyc": "f:cache",
+        }
+    )
+    delta = HarborWorkspaceDeltaObserver(
+        FakeEnvironment(), remote_workspace="/app", user="root"
+    ).compare(before, after)
+
+    assert delta.changed_paths == (
+        ".",
+        "scratch",
+        "src",
+        "src/__pycache__",
+        "src/__pycache__/app.pyc",
+        "src/app.py",
+    )
+    assert delta.tool_cache_paths == (
+        "src/__pycache__",
+        "src/__pycache__/app.pyc",
+    )
+
+
+def test_tool_cache_classifier_is_exported_from_the_public_package() -> None:
+    assert (
+        frozenset(
+            {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox"}
+        )
+        == driftlock.TOOL_CACHE_DIRECTORY_NAMES
+    )
+    assert driftlock.classify_tool_cache_paths(
+        (".pytest_cache/state", "src/app.py")
+    ) == (".pytest_cache/state",)
 
 
 def test_workspace_observer_rejects_root_or_relative_workspace() -> None:
